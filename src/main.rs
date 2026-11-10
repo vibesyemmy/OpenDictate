@@ -9,6 +9,7 @@ mod macos_look;
 mod settings;
 mod settings_view;
 mod stats;
+mod talking;
 mod tap;
 mod theme;
 mod tray;
