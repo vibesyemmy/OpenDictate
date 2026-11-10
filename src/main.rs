@@ -6,6 +6,7 @@ mod icon;
 mod meeting;
 #[cfg(target_os = "macos")]
 mod macos_look;
+mod search;
 mod settings;
 mod settings_view;
 mod stats;

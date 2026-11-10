@@ -517,6 +517,9 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         }
         TextEngine::Off => {}
     }
+    row(ui, "Brave Search key", "Lets Talking Points search the words you select. Leave empty to turn search off.", 300.0, |ui| {
+        changed |= ui.add(egui::TextEdit::singleline(&mut app.s.brave_key).password(true).desired_width(300.0)).changed();
+    });
     if let Some(url) = crate::talking::text_server(&app.s).map(str::to_owned) {
         let mut probe = app.s.clone();
         probe.talking_points = true;
