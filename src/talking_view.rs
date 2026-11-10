@@ -44,6 +44,7 @@ pub enum ViewAction {
     Search(String),
     Copy(String),
     RemoveChip(String),
+    OpenModels,
 }
 
 pub fn draw(ui: &mut egui::Ui, elapsed: f32, talking: &talking::Live, can_search: bool, vs: &mut ViewState) -> Option<ViewAction> {
@@ -193,7 +194,7 @@ fn transcript_with(ui: &mut egui::Ui, text: &str, can_search: bool, vs: &mut Vie
 
 fn off_reason(talking: &talking::Live) -> Option<Vec<String>> {
     Some(match talking.availability.as_ref()? {
-        Availability::Ready => vec![talking.status.clone()?],
+        Availability::Ready => vec![talking.status.clone().filter(|s| s == talking::UNREACHABLE)?],
         Availability::NeedsMemory => vec!["Needs 16 GB of memory to run the text model on this Mac".into()],
         Availability::NeedsCloudOptIn { host } => vec![
             format!("Turn on “Send meeting transcripts to {host}” in Models to use Talking Points."),
@@ -214,7 +215,12 @@ fn notes(ui: &mut egui::Ui, talking: &talking::Live, vs: &mut ViewState) -> Opti
         for line in lines {
             ui.label(para(line, 13.5, theme::MUTED()));
         }
-        return None;
+        ui.add_space(6.0);
+        return ui.button("Open Models").clicked().then_some(ViewAction::OpenModels);
+    }
+    if let Some(status) = &talking.status {
+        ui.label(para(status, 13.5, theme::MUTED()));
+        ui.add_space(6.0);
     }
     heading(ui, "So far");
     let summary = if talking.summary.is_empty() { "Nothing yet." } else { &talking.summary };
@@ -642,5 +648,46 @@ mod tests {
         h.get_by_label("Remove Linear pricing").click();
         h.run();
         assert_eq!(h.state().actions, vec![ViewAction::RemoveChip("Linear pricing".into())]);
+    }
+
+    #[test]
+    fn an_unreadable_reply_shows_above_the_notes_without_hiding_them() {
+        let unreadable = "The model's answer couldn't be read.";
+        let h = harness(talking::Live { status: Some(unreadable.into()), ..ready() }, ViewState::default());
+        h.get_by_label(unreadable);
+        h.get_by_label("So far");
+        h.get_by_label("Usage-based pricing for Q3; annual-contract migration unresolved.");
+    }
+
+    #[test]
+    fn a_search_error_shows_above_the_notes_without_hiding_them() {
+        let failed = "Search failed: check the Brave key in Models";
+        let h = harness(talking::Live { status: Some(failed.into()), ..ready() }, ViewState::default());
+        h.get_by_label(failed);
+        h.get_by_label("So far");
+        h.get_by_label("Raj: list renewing contracts");
+    }
+
+    #[test]
+    fn the_unreachable_message_links_to_models() {
+        let unreachable = "Can't reach the text model. Check it in Models.";
+        let mut h = harness(talking::Live { status: Some(unreachable.into()), ..ready() }, ViewState::default());
+        h.get_by_label("Open Models").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![ViewAction::OpenModels]);
+    }
+
+    #[test]
+    fn talking_points_being_off_links_to_models() {
+        let mut h = harness(talking::Live { availability: Some(Availability::Disabled), ..ready() }, ViewState::default());
+        h.get_by_label("Open Models").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![ViewAction::OpenModels]);
+    }
+
+    #[test]
+    fn the_notes_offer_no_models_link_when_talking_points_is_working() {
+        let h = harness(ready(), ViewState::default());
+        assert!(h.query_by_label("Open Models").is_none());
     }
 }

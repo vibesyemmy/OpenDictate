@@ -526,8 +526,12 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         let gate = crate::talking::availability(&probe, crate::talking::physical_memory());
         let needs_memory = gate == crate::talking::Availability::NeedsMemory;
         row(ui, "Talking Points", "Suggests what to say and keeps notes while a meeting runs.", 300.0, |ui| {
-            ui.add_enabled_ui(!needs_memory || app.s.talking_points, |ui| {
-                changed |= crate::views::kit_checkbox(ui, &mut app.s.talking_points).changed();
+            let (mut on, enabled) = talking_switch(app.s.talking_points, needs_memory);
+            ui.add_enabled_ui(enabled, |ui| {
+                if crate::views::kit_checkbox(ui, &mut on).changed() {
+                    app.s.talking_points = on;
+                    changed = true;
+                }
             });
             if needs_memory {
                 ui.label(t("Needs 16 GB of memory to run the text model on this Mac", 12.0, theme::MUTED()));
@@ -958,5 +962,26 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
                 Err(_) => app.notify(format!("{k} can't be used as a shortcut"), true),
             }
         }
+    }
+}
+
+fn talking_switch(saved: bool, needs_memory: bool) -> (bool, bool) {
+    (saved && !needs_memory, !needs_memory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_talking_points_switch_shows_off_and_locked_when_memory_is_too_low_even_if_saved_on() {
+        assert_eq!(talking_switch(true, true), (false, false));
+        assert_eq!(talking_switch(false, true), (false, false));
+    }
+
+    #[test]
+    fn the_talking_points_switch_shows_the_saved_value_when_memory_is_enough() {
+        assert_eq!(talking_switch(true, false), (true, true));
+        assert_eq!(talking_switch(false, false), (false, true));
     }
 }
