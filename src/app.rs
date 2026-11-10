@@ -1034,7 +1034,12 @@ impl DictateApp {
                 } else {
                     4.0 + ((t * 5.0 - i as f32 * 0.6).sin() * 0.5 + 0.5) * 10.0
                 };
-                let c = if listening { egui::Color32::WHITE } else { theme::ACCENT() };
+                // Not white: the pill is the surface colour, and in the
+                // light theme that is white too, so the level meter drew
+                // itself invisible. The bars are the same ink as the label
+                // beside them, which is what they are - a reading, not a
+                // highlight.
+                let c = if listening { theme::TEXT() } else { theme::ACCENT() };
                 p.rect_filled(egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(3.0, h)), 1.5, c);
             }
             let label = match action {
