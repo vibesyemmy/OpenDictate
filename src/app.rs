@@ -1075,6 +1075,7 @@ impl DictateApp {
             .with_min_inner_size([480.0, 320.0])
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
         let mut closed = false;
+        let brave_key = self.s.brave_key.trim().to_string();
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("talking"), builder, |ui, _| {
             closed = ui.input(|i| i.viewport().close_requested());
             let Some(elapsed) = session.live.lock().ok().map(|m| {
@@ -1084,8 +1085,11 @@ impl DictateApp {
                 return;
             };
             let Some(snapshot) = talking.lock().ok().map(|t| t.clone()) else { return };
-            // shortcut: Search stays off until Task 7 adds the Brave key; pass whether one is set then.
-            match crate::talking_view::draw(ui, elapsed, &snapshot, false, vs) {
+            match crate::talking_view::draw(ui, elapsed, &snapshot, !brave_key.is_empty(), vs) {
+                Some(crate::talking_view::ViewAction::Search(text)) => {
+                    let (live, key) = (talking.clone(), brave_key.clone());
+                    std::thread::spawn(move || crate::search::search_into(&live, &key, &text));
+                }
                 Some(crate::talking_view::ViewAction::Copy(text)) => ui.ctx().copy_text(text),
                 Some(crate::talking_view::ViewAction::RemoveChip(query)) => {
                     if let Ok(mut t) = talking.lock() {

@@ -456,6 +456,8 @@ pub struct Live {
     #[serde(skip)]
     pub status: Option<String>,
     #[serde(skip)]
+    pub searching: Vec<String>,
+    #[serde(skip)]
     pub updated_ms: Option<u64>,
     #[serde(skip)]
     pub availability: Option<Availability>,
