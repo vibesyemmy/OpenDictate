@@ -59,19 +59,75 @@ PLIST
 # like a brand new app and every permission reset. A real certificate keeps the
 # designated requirement stable, and the grants survive.
 #
-# Override with SIGN_ID=... to use another one. "Developer ID Application" is
-# the one to pick if this DMG is ever given to someone else; it also needs
-# notarizing for that.
-SIGN_ID="${SIGN_ID:-Apple Development: Opeyemi Ajagbe (34598C886Y)}"
+# The default is the "Developer ID Application" certificate, which is what
+# Gatekeeper accepts on other people's Macs (once the DMG is notarized below).
+# Override with SIGN_ID=... for local builds, e.g.
+#   SIGN_ID="Apple Development: Opeyemi Ajagbe (34598C886Y)" ./package-dmg.sh
+SIGN_ID="${SIGN_ID:-Developer ID Application: Voicify Limited (NDXPR623CF)}"
 if ! security find-identity -v -p codesigning | grep -qF "$SIGN_ID"; then
     echo "!!  signing identity not found: $SIGN_ID"
     echo "!!  falling back to ad-hoc; permissions will reset on every build"
     SIGN_ID="-"
 fi
 
+# The hardened runtime and a secure timestamp are both required by notarization.
+# Ad-hoc signatures can't carry a timestamp, so they skip it.
+SIGN_FLAGS=(--force --options runtime --entitlements assets/entitlements.plist)
+if [ "$SIGN_ID" != "-" ]; then
+    SIGN_FLAGS+=(--timestamp)
+fi
+
 echo "==> Signing as: $SIGN_ID"
-codesign --force --deep --sign "$SIGN_ID" "$BUNDLE"
-codesign --verify --verbose=1 "$BUNDLE"
+codesign "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" "$BUNDLE"
+codesign --verify --strict --verbose=1 "$BUNDLE"
+
+# Notarization is what lets Gatekeeper open the app without a warning. It
+# authenticates with an App Store Connect API key, given either as
+#   NOTARY_KEY=/path/AuthKey_XXXX.p8 NOTARY_KEY_ID=XXXX NOTARY_ISSUER=<issuer id>
+# or as a keychain profile (default name open-dictate-notary, override with
+# NOTARY_PROFILE=...), created once with `xcrun notarytool store-credentials`.
+if [ -n "${NOTARY_KEY:-}" ]; then
+    NOTARY_AUTH=(--key "$NOTARY_KEY" --key-id "${NOTARY_KEY_ID:?set NOTARY_KEY_ID}" --issuer "${NOTARY_ISSUER:?set NOTARY_ISSUER}")
+else
+    NOTARY_AUTH=(--keychain-profile "${NOTARY_PROFILE:-open-dictate-notary}")
+fi
+NOTARIZE=1
+if [ "$SIGN_ID" = "-" ] || [[ "$SIGN_ID" != Developer\ ID* ]]; then
+    echo "!!  not a Developer ID signature; skipping notarization"
+    NOTARIZE=0
+elif ! xcrun notarytool history "${NOTARY_AUTH[@]}" >/dev/null 2>&1; then
+    echo "!!  notary credentials not usable (${NOTARY_AUTH[*]}); skipping notarization"
+    echo "!!  this DMG will be blocked by Gatekeeper on other Macs"
+    NOTARIZE=0
+fi
+
+# The app is notarized and stapled before the DMG is built, so the copy
+# inside it carries its own ticket.
+#
+# Stapling only the DMG looked like it was enough - Gatekeeper accepted the
+# app and reported "Notarized Developer ID" - but that answer came from
+# asking Apple over the network. Dragged out of the DMG and opened on a Mac
+# that is offline, or behind a firewall that blocks the check, an unstapled
+# app has nothing local to prove itself with. The ticket has to be in the
+# bundle, and a UDZO image is read-only, so it has to go in before the image
+# is made. That costs a second notarization round trip: one for the app,
+# one for the finished DMG.
+if [ "$NOTARIZE" = 1 ]; then
+    ZIP="target/$BIN_OUT-notarize.zip"
+    rm -f "$ZIP"
+    # ditto, not zip: it is the only archiver that preserves a bundle's
+    # symlinks and extended attributes, which the signature covers.
+    ditto -c -k --keepParent "$BUNDLE" "$ZIP"
+
+    echo "==> Notarizing the app (this can take a few minutes)"
+    xcrun notarytool submit "$ZIP" "${NOTARY_AUTH[@]}" --wait
+    rm -f "$ZIP"
+
+    echo "==> Stapling the app"
+    xcrun stapler staple "$BUNDLE"
+    xcrun stapler validate "$BUNDLE"
+    spctl --assess --type exec --verbose=2 "$BUNDLE"
+fi
 
 echo "==> Building DMG"
 ln -s /Applications "$STAGE/Applications"
@@ -82,6 +138,20 @@ hdiutil create \
     -srcfolder "$STAGE" \
     -ov -format UDZO \
     "$DMG" >/dev/null
+
+# The DMG gets its own signature and ticket, so the download itself opens
+# without a warning too.
+if [ "$NOTARIZE" = 1 ]; then
+    echo "==> Signing DMG"
+    codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+
+    echo "==> Notarizing the DMG"
+    xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
+
+    echo "==> Stapling the DMG"
+    xcrun stapler staple "$DMG"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+fi
 
 # Leaving the staging bundle behind gives Spotlight a second "Open Dictate"
 # to offer, which is how you end up launching a stale build by accident.
