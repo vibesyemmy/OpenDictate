@@ -87,6 +87,32 @@ tone!(
     ON_FILL_DIM, c(0x4A, 0x49, 0x44), c(0xBE, 0xBD, 0xB9)
 );
 tone!(
+    /// --on-yellow. What goes on a yellow fill, in both themes.
+    ///
+    /// ON_FILL cannot do this job. It is paper, and paper flips with the
+    /// theme while the yellows do not - they are one value in both. On a
+    /// dark page paper is nearly black and reads on yellow at 11:1; on a
+    /// light page it is nearly white and reads at 1.5:1, which is how the
+    /// setup notice came to be white text on a yellow card. This is the
+    /// dark value in both themes, so it changes nothing in the dark and
+    /// gives the light theme the same 11:1.
+    ON_YELLOW, c(0x14, 0x14, 0x0F), c(0x14, 0x14, 0x0F)
+);
+tone!(
+    /// ON_YELLOW stepped back, for secondary copy on a yellow fill.
+    ON_YELLOW_DIM, c(0x4A, 0x49, 0x44), c(0x4A, 0x49, 0x44)
+);
+tone!(
+    /// Yellow where it is the mark itself rather than the fill behind it.
+    ///
+    /// AMBER is a fill colour and sits at the light end, so as a tick or a
+    /// word it lands at 1.67:1 on a white card - the same yellow that reads
+    /// at 10:1 on a dark one. The light theme takes it down to where it
+    /// clears 4.5:1 on both paper and surface while still reading as yellow
+    /// rather than brown.
+    WARN, c(0xF2, 0xC3, 0x1A), c(0x8A, 0x62, 0x00)
+);
+tone!(
     /// --soft-shadow. Still hard edged, but translucent rather than full ink.
     /// The kit reserves the ink shadow for things you press; content cards
     /// get this, which is why they do not shout.

@@ -87,7 +87,9 @@ fn setup_notice(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
             "SET UP DICTATION",
         )
     };
-    let fg = theme::PAPER();
+    // Yellow is one value in both themes, red is not, so what goes on top
+    // of them cannot be one token either.
+    let fg = if speech_ok { theme::ON_YELLOW() } else { theme::ON_FILL() };
     egui::Frame::new()
         .fill(fill)
         .stroke(Stroke::new(2.5, fg))
@@ -243,7 +245,7 @@ fn logo(ui: &mut egui::Ui) {
     let c = r.center();
     for (i, h) in [8.0, 14.0, 10.0].iter().enumerate() {
         let x = c.x - 5.0 + i as f32 * 5.0;
-        p.rect_filled(Rect::from_center_size(pos2(x, c.y), vec2(3.0, *h)), 1.5, theme::PAPER());
+        p.rect_filled(Rect::from_center_size(pos2(x, c.y), vec2(3.0, *h)), 1.5, theme::ON_YELLOW());
     }
 }
 
@@ -457,7 +459,7 @@ pub enum State {
 pub fn status(ui: &mut egui::Ui, state: State, text: impl Into<String>) {
     let (tint, glyph) = match state {
         State::Ok => (theme::GREEN(), "check"),
-        State::Warn => (theme::AMBER(), "bell"),
+        State::Warn => (theme::WARN(), "bell"),
         State::Bad => (theme::RED(), "x"),
     };
     ui.horizontal(|ui| {
@@ -1043,7 +1045,7 @@ fn right_column(app: &mut DictateApp, ui: &mut egui::Ui) {
             let all_ok = speech_ok && text_ok;
             let (r, _) = ui.allocate_exact_size(vec2(17.0, 17.0), Sense::hover());
             kit_icon_at(ui.painter(), if all_ok { "check" } else { "x" }, r.center(),
-                        if all_ok { theme::GREEN() } else if speech_ok { theme::AMBER() } else { theme::RED() }, 16.0);
+                        if all_ok { theme::GREEN() } else if speech_ok { theme::WARN() } else { theme::RED() }, 16.0);
             ui.add_space(3.0);
             ui.label(b(if speech_ok { "Ready" } else { "Not ready" }, 16.0, theme::TEXT()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1055,7 +1057,7 @@ fn right_column(app: &mut DictateApp, ui: &mut egui::Ui) {
         // A tick is a stronger claim than a dot: it says set up, not present.
         // Speech is required, so a gap there is wrong; text clean-up is
         // optional, so a gap there has only been noticed.
-        for (ok, name, missing) in [(speech_ok, speech, theme::RED()), (text_ok, text, theme::AMBER())] {
+        for (ok, name, missing) in [(speech_ok, speech, theme::RED()), (text_ok, text, theme::WARN())] {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
                 kit_icon_at(ui.painter(), if ok { "check" } else { "x" }, r.center(),
