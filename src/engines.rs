@@ -376,7 +376,7 @@ pub fn chat_as(
 }
 
 /// Reasoning models wrap their thoughts in <think>…</think>; never paste that.
-fn strip_thinking(text: &str) -> String {
+pub(crate) fn strip_thinking(text: &str) -> String {
     let mut t = text.to_string();
     while let (Some(a), Some(b)) = (t.find("<think>"), t.find("</think>")) {
         if b < a {

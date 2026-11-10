@@ -179,6 +179,10 @@ pub struct Settings {
     pub text_key: String,
     pub text_model: String,
 
+    pub talking_points: bool,
+    pub talking_cloud_host: String,
+    pub brave_key: String,
+
     pub tone: Tone,
     pub remove_fillers: bool,
     pub fix_corrections: bool,
@@ -296,6 +300,10 @@ impl Default for Settings {
             text_url: "http://localhost:1234/v1".into(),
             text_key: String::new(),
             text_model: String::new(),
+
+            talking_points: true,
+            talking_cloud_host: String::new(),
+            brave_key: String::new(),
 
             tone: Tone::Natural,
             remove_fillers: true,
