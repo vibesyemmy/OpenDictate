@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn agent(timeout_secs: u64) -> ureq::Agent {
+pub(crate) fn agent(timeout_secs: u64) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
@@ -17,7 +17,7 @@ fn agent(timeout_secs: u64) -> ureq::Agent {
         .into()
 }
 
-fn read_json(mut resp: ureq::http::Response<ureq::Body>) -> Result<Value, String> {
+pub(crate) fn read_json(mut resp: ureq::http::Response<ureq::Body>) -> Result<Value, String> {
     let status = resp.status();
     let text = resp
         .body_mut()
@@ -66,7 +66,7 @@ pub fn text_model_label(s: &Settings) -> String {
 }
 
 /// Words from the dictionary steer whisper towards the right spellings.
-fn dictionary_prompt(s: &Settings) -> String {
+pub(crate) fn dictionary_prompt(s: &Settings) -> String {
     if s.dictionary.is_empty() {
         String::new()
     } else {
@@ -123,7 +123,7 @@ fn transcribe_local(s: &Settings, wav: &[u8]) -> Result<String, String> {
     Ok(clean_transcript(&text))
 }
 
-fn clean_transcript(text: &str) -> String {
+pub(crate) fn clean_transcript(text: &str) -> String {
     let joined = text
         .lines()
         .map(str::trim)
@@ -144,20 +144,11 @@ fn clean_transcript(text: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn transcribe_remote(s: &Settings, wav: &[u8]) -> Result<String, String> {
+pub(crate) fn multipart(fields: &[(&str, &str)], wav: &[u8]) -> (String, Vec<u8>) {
     let boundary = format!("----opendictate{}", crate::settings::now_secs());
     let mut body = Vec::new();
-    let mut field = |name: &str, value: &str| {
+    for (name, value) in fields {
         write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").unwrap();
-    };
-    field("model", s.speech_model.trim());
-    field("response_format", "json");
-    if !s.language.trim().is_empty() && s.language.trim() != "auto" {
-        field("language", s.language.trim());
-    }
-    let prompt = dictionary_prompt(s);
-    if !prompt.is_empty() {
-        field("prompt", &prompt);
     }
     write!(
         body,
@@ -166,10 +157,29 @@ fn transcribe_remote(s: &Settings, wav: &[u8]) -> Result<String, String> {
     .unwrap();
     body.extend_from_slice(wav);
     write!(body, "\r\n--{boundary}--\r\n").unwrap();
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+fn remote_fields<'a>(s: &'a Settings, prompt: &'a str) -> Vec<(&'static str, &'a str)> {
+    let lang = s.language.trim();
+    let mut fields = vec![("model", s.speech_model.trim()), ("response_format", "json")];
+    if !lang.is_empty() && lang != "auto" {
+        fields.push(("language", lang));
+    }
+    if !prompt.is_empty() {
+        fields.push(("prompt", prompt));
+    }
+    fields
+}
+
+fn transcribe_remote(s: &Settings, wav: &[u8]) -> Result<String, String> {
+    let prompt = dictionary_prompt(s);
+    let fields = remote_fields(s, &prompt);
+    let (content_type, body) = multipart(&fields, wav);
 
     let mut req = agent(180)
         .post(format!("{}/audio/transcriptions", trim_url(&s.speech_url)))
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"));
+        .header("Content-Type", content_type);
     if !s.speech_key.trim().is_empty() {
         req = req.header("Authorization", format!("Bearer {}", s.speech_key.trim()));
     }
@@ -531,4 +541,37 @@ pub fn start_ollama() -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multipart_body_carries_fields_and_wav() {
+        let (content_type, body) = multipart(&[("response_format", "json")], b"RIFFdata");
+        let boundary = content_type.strip_prefix("multipart/form-data; boundary=").unwrap();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let field = text.find("name=\"response_format\"").unwrap();
+        let value = text.find("json").unwrap();
+        let wav = text.find("RIFFdata").unwrap();
+        assert!(field < value && value < wav);
+        assert!(text.contains("name=\"file\""));
+        assert!(text.ends_with(&format!("\r\n--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn remote_transcription_sends_model_format_language_prompt_then_the_file() {
+        let mut s = Settings::default();
+        s.speech_model = "whisper-1".into();
+        s.language = "fr".into();
+        let fields = remote_fields(&s, "Vocabulary: Zed.");
+        let (_, body) = multipart(&fields, b"RIFF");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        let at: Vec<usize> = ["model", "response_format", "language", "prompt", "file"]
+            .iter()
+            .map(|n| text.find(&format!("name=\"{n}\"")).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+    }
 }

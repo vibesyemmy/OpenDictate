@@ -13,6 +13,7 @@ mod tap;
 mod theme;
 mod tray;
 mod views;
+mod whisper_server;
 
 #[cfg(target_os = "macos")]
 mod macos_bundle {
