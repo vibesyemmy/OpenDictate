@@ -3,7 +3,8 @@
 //! noticed the bundle's icon.
 
 use objc2::rc::Retained;
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::{sel, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBox, NSBoxType, NSColor, NSImage, NSTitlePosition,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
@@ -11,6 +12,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSData;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// The wash of paper over the blur. Kept so a theme change can retint it
@@ -110,6 +112,70 @@ fn ns_color(rgba: [f64; 4]) -> Retained<NSColor> {
 /// with no window open means the same thing.
 pub fn app_is_active() -> bool {
     MainThreadMarker::new().is_some_and(|mtm| NSApplication::sharedApplication(mtm).isActive())
+}
+
+/// Set by AppKit when the Dock icon is clicked.
+static REOPEN: AtomicBool = AtomicBool::new(false);
+
+extern "C-unwind" fn handle_reopen(_this: &AnyObject, _cmd: Sel, _sender: *mut AnyObject, _visible: Bool) -> Bool {
+    REOPEN.store(true, Ordering::Relaxed);
+    Bool::YES
+}
+
+/// Teaches eframe's application delegate to answer the Dock.
+///
+/// Clicking a running app's icon makes macOS send
+/// applicationShouldHandleReopen: to the delegate, and that is the only
+/// honest signal that the user wants the window back. eframe owns the
+/// delegate and does not answer it, so the method is added to its class at
+/// runtime. Everything read from the outside instead - whether the app was
+/// active, whether it had just been deactivated - missed the ordinary case
+/// where the app is already in front with nothing on screen.
+///
+/// Returns false if the delegate already answers it, in which case nothing
+/// is touched and the caller is no worse off than before.
+pub fn install_reopen_hook() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else { return false };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else { return false };
+    let object: &AnyObject = unsafe { &*Retained::as_ptr(&delegate).cast::<AnyObject>() };
+    let class = object.class();
+    let selector = sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+    if class.instance_method(selector).is_some() {
+        return false;
+    }
+    // "B@:@B": returns BOOL, takes self, _cmd, the application, and whether
+    // it has visible windows.
+    unsafe {
+        objc2::ffi::class_addMethod(
+            (class as *const AnyClass).cast_mut(),
+            selector,
+            std::mem::transmute::<
+                extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject, Bool) -> Bool,
+                unsafe extern "C-unwind" fn(),
+            >(handle_reopen),
+            c"B@:@B".as_ptr(),
+        )
+        .as_bool()
+    }
+}
+
+/// Whether the Dock has been clicked since this was last asked.
+pub fn take_reopen() -> bool {
+    REOPEN.swap(false, Ordering::Relaxed)
+}
+
+/// Brings the app to the front.
+///
+/// Showing a hidden window does not activate the app, and a status-menu
+/// click does not either, so "Show Open Dictate" could put the window back
+/// behind whatever the user was looking at - indistinguishable, from the
+/// outside, from nothing happening.
+pub fn activate() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    }
 }
 
 /// Steps the app out of the foreground.

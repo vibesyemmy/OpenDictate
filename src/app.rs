@@ -155,6 +155,11 @@ pub struct DictateApp {
     blurred_window: Option<isize>,
     /// Whether the app was in front last frame, for spotting a Dock click.
     was_active: bool,
+    /// Whether the Dock's reopen message is being answered, and how many
+    /// frames have been spent trying. eframe's delegate does not exist on
+    /// the first frame, so this is attempted until it takes.
+    hooked: bool,
+    hook_tries: u16,
     /// What the window's visibility was last set to, so it is only sent when
     /// it changes.
     window_shown: Option<bool>,
@@ -248,6 +253,8 @@ impl DictateApp {
             summary_rx: None,
             blurred_window: None,
             was_active: true,
+            hooked: false,
+            hook_tries: 0,
             window_shown: None,
             resign_at: None,
             window_since: None,
@@ -304,13 +311,29 @@ impl DictateApp {
                 }
             }
         }
-        // Clicking the Dock icon brings an app's window back on macOS. The
-        // delegate that normally does it belongs to eframe, so the same
-        // thing is read from the app coming to the front with nothing open.
+        // Clicking the Dock icon brings an app's window back on macOS, and
+        // the message that says so is applicationShouldHandleReopen. eframe
+        // owns the delegate and ignores it, so the method is added to the
+        // delegate's class the first time it exists.
         #[cfg(target_os = "macos")]
         {
+            if !self.hooked && self.hook_tries < 600 {
+                self.hook_tries += 1;
+                self.hooked = crate::macos_look::install_reopen_hook();
+                if self.hooked {
+                    crate::macos_look::log_backdrop(&format!("reopen hook after {} frames", self.hook_tries));
+                }
+            }
+            if crate::macos_look::take_reopen() && self.shot.is_none() {
+                self.window_open = true;
+                self.focus_main = true;
+            }
+            // Fallback while the hook has not taken: the app coming to the
+            // front with nothing open means the same thing. It only catches
+            // a Dock click made from another app, which is why it is not
+            // enough on its own.
             let active = crate::macos_look::app_is_active();
-            if active && !self.was_active && !self.window_open && self.shot.is_none() {
+            if !self.hooked && active && !self.was_active && !self.window_open && self.shot.is_none() {
                 self.window_open = true;
                 self.focus_main = true;
             }
@@ -885,7 +908,13 @@ impl DictateApp {
                 // frame though: done while the window is still going away,
                 // AppKit puts the app straight back in front.
                 #[cfg(target_os = "macos")]
-                if !want_visible {
+                if want_visible {
+                    crate::macos_look::activate();
+                } else if !self.hooked {
+                    // Only needed by the fallback that reads activation.
+                    // With the delegate answering the Dock directly, pushing
+                    // the app into the background buys nothing and costs the
+                    // menu-bar path its chance to come forward.
                     self.resign_at = Some(std::time::Instant::now());
                 }
             }
