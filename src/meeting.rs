@@ -188,6 +188,10 @@ pub struct Session {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+fn should_start_lm_studio(s: &Settings, memory: u64, lms_found: bool) -> bool {
+    lms_found && crate::lms::is_lm_studio(s) && crate::talking::availability(s, memory) == crate::talking::Availability::Ready
+}
+
 impl Session {
     pub fn start(s: &Settings) -> Result<Self, String> {
         let cap = SystemCapture::start(crate::tap::default_input())?;
@@ -213,7 +217,7 @@ impl Session {
             let settings = s.clone();
             move || run(cap, dir, live, stop, settings)
         });
-        if s.talking_points && crate::lms::is_lm_studio(s) && crate::lms::find().is_some() {
+        if should_start_lm_studio(s, crate::talking::physical_memory(), crate::lms::find().is_some()) {
             let (dir, s) = (dir.clone(), s.clone());
             std::thread::spawn(move || {
                 if let Err(e) = crate::lms::ensure(&s, &|l| log(&dir, &format!("lm studio: {l}"))) {
@@ -700,5 +704,31 @@ mod tests {
         assert_eq!(r.unwrap_err(), "boom");
         assert!(!dir.join("audio/000.wav").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn lm_studio_settings() -> Settings {
+        Settings {
+            talking_points: true,
+            text_engine: settings::TextEngine::OpenAiCompatible,
+            text_url: "http://localhost:1234/v1".into(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn lm_studio_is_not_started_on_a_mac_under_16_gb() {
+        assert!(!should_start_lm_studio(&lm_studio_settings(), 8 * 1024 * 1024 * 1024, true));
+    }
+
+    #[test]
+    fn lm_studio_is_started_when_talking_points_is_ready_and_lms_is_installed() {
+        assert!(should_start_lm_studio(&lm_studio_settings(), 16 * 1024 * 1024 * 1024, true));
+        assert!(!should_start_lm_studio(&lm_studio_settings(), 16 * 1024 * 1024 * 1024, false));
+    }
+
+    #[test]
+    fn lm_studio_is_not_started_when_talking_points_is_off() {
+        let s = Settings { talking_points: false, ..lm_studio_settings() };
+        assert!(!should_start_lm_studio(&s, 16 * 1024 * 1024 * 1024, true));
     }
 }

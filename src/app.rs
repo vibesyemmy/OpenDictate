@@ -1076,6 +1076,7 @@ impl DictateApp {
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
         let mut closed = false;
         let brave_key = self.s.brave_key.trim().to_string();
+        let mut open_models = false;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("talking"), builder, |ui, _| {
             closed = ui.input(|i| i.viewport().close_requested());
             let Some(elapsed) = session.live.lock().ok().map(|m| {
@@ -1096,9 +1097,16 @@ impl DictateApp {
                         t.chips.retain(|c| c.query != query);
                     }
                 }
-                _ => {}
+                Some(crate::talking_view::ViewAction::OpenModels) => open_models = true,
+                None => {}
             }
         });
+        if open_models {
+            self.settings_tab = Some(SettingsTab::Models);
+            self.window_open = true;
+            self.focus_main = true;
+            self.refresh_health(ctx);
+        }
         if closed {
             self.talking_view = None;
         }

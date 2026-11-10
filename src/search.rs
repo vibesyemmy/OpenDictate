@@ -8,7 +8,6 @@ const QUERY_CAP: usize = 400;
 const FAILED: &str = "Search failed: ";
 const BAD_KEY: &str = "check the Brave key in Models";
 const RESULTS: usize = 3;
-const CHIP_TEXT: usize = 1_600;
 
 fn encode(s: &str) -> String {
     s.bytes()
@@ -49,7 +48,7 @@ pub fn chip_from_response(query: &str, body: &Value) -> Result<Chip, String> {
     if lines.is_empty() {
         return Err("no results".into());
     }
-    Ok(Chip { query: query.split_whitespace().collect::<Vec<_>>().join(" "), text: lines.join("\n").chars().take(CHIP_TEXT).collect() })
+    Ok(Chip { query: query.split_whitespace().collect::<Vec<_>>().join(" "), text: lines.join("\n").chars().take(talking::CHIP_TEXT_CAP).collect() })
 }
 
 fn brave_at(base: &str, key: &str, query: &str) -> Result<Chip, String> {

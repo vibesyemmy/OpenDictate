@@ -51,16 +51,14 @@ pub struct Tracked {
 
 const RECENT_MS: u64 = 180_000;
 const BUNDLE_CAP: usize = 12_000;
-#[allow(dead_code)]
 const CHIP_CAP: usize = 4;
 const HEADER_CAP: usize = BUNDLE_CAP - 6_000;
 const BUNDLE_ACTIONS: usize = 15;
 const TRACKED_CAP: usize = 30;
-#[allow(dead_code)]
-const CHIP_TEXT_CAP: usize = 1_600;
+pub const CHIP_TEXT_CAP: usize = 1_600;
 const MIN_MEMORY: u64 = 16 * 1024 * 1024 * 1024;
 const NOTES_INTERVAL_MS: u64 = 30_000;
-const UNREACHABLE: &str = "Can't reach the text model. Check it in Models.";
+pub const UNREACHABLE: &str = "Can't reach the text model. Check it in Models.";
 const UNREADABLE: &str = "The model's answer couldn't be read.";
 const NOTES_STARVED_MS: u64 = 60_000;
 const IDLE_CHECK: Duration = Duration::from_secs(2);
@@ -302,7 +300,6 @@ pub fn merge_actions(list: &mut Vec<Tracked>, incoming: Vec<Action>) {
     }
 }
 
-#[allow(dead_code)]
 pub fn add_chip(chips: &mut Vec<Chip>, mut chip: Chip) {
     chip.text.truncate(floor_boundary(&chip.text, CHIP_TEXT_CAP));
     chips.push(chip);

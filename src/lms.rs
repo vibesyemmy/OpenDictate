@@ -20,12 +20,9 @@ pub fn is_lm_studio(s: &Settings) -> bool {
     s.text_engine == TextEngine::OpenAiCompatible && crate::talking::is_local(&s.text_url) && port_of(&s.text_url) == Some(PORT)
 }
 
-pub fn steps(server_running: bool, loaded: &[String], model: &str) -> Vec<Vec<String>> {
+pub fn steps(loaded: &[String], model: &str) -> Vec<Vec<String>> {
     let model = model.trim();
     let mut out = Vec::new();
-    if !server_running {
-        out.push(vec!["server".into(), "start".into()]);
-    }
     if !model.is_empty() && !loaded.iter().any(|l| l == model) {
         out.push(vec!["load".into(), model.into(), "-y".into()]);
     }
@@ -53,7 +50,7 @@ fn ensure_with(s: &Settings, run: &dyn Fn(&[String]) -> Result<String, String>, 
         log("started the server");
     }
     let loaded = parse_loaded(&ps_with_retry(run, Duration::from_millis(500))?);
-    for step in steps(true, &loaded, model) {
+    for step in steps(&loaded, model) {
         run(&step)?;
         log(&format!("loaded {model}"));
     }
@@ -168,23 +165,18 @@ mod tests {
     }
 
     #[test]
-    fn starts_the_server_and_loads_the_model_when_neither_is_running() {
-        assert_eq!(steps(false, &[], "phi"), vec![strs(&["server", "start"]), strs(&["load", "phi", "-y"])]);
-    }
-
-    #[test]
-    fn only_loads_the_model_when_the_server_is_already_up() {
-        assert_eq!(steps(true, &strs(&["other"]), "phi"), vec![strs(&["load", "phi", "-y"])]);
+    fn loads_the_model_when_another_one_is_loaded() {
+        assert_eq!(steps(&strs(&["other"]), "phi"), vec![strs(&["load", "phi", "-y"])]);
     }
 
     #[test]
     fn does_nothing_when_the_model_is_already_loaded() {
-        assert!(steps(true, &strs(&["phi"]), "phi").is_empty());
+        assert!(steps(&strs(&["phi"]), "phi").is_empty());
     }
 
     #[test]
     fn loads_nothing_when_no_model_is_chosen() {
-        assert_eq!(steps(false, &[], " "), vec![strs(&["server", "start"])]);
+        assert!(steps(&[], " ").is_empty());
     }
 
     #[test]
