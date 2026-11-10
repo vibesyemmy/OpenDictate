@@ -6,7 +6,7 @@ use crate::engines;
 use crate::settings::{Action, Appearance, SpeechEngine, TextEngine, Tone, Trigger};
 use crate::theme::{self, b, d, m, para, t};
 use crate::views::{VERSION, icon_button, kbd, nav_item};
-use eframe::egui::{self, Align, Align2, Color32, CornerRadius, Layout, Margin, Sense, Stroke, vec2};
+use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Sense, Stroke, vec2};
 
 /// Each tab's title and standfirst. They belong to the sheet, not to the
 /// tab's body: inside the scroll area they scrolled away from the close
@@ -810,6 +810,33 @@ fn personal_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     let n = Tone::ALL.len() as f32;
     let card_chrome = 12.0 * 2.0 + 2.5 * 2.0;
     let w = ((ui.available_width() - GAP * (n - 1.0)) / n - card_chrome).max(56.0);
+    // The four cards sit in one row, so they have to end level. egui sizes
+    // each to its own content, and "Short and to the point." fits on one line
+    // where the other three wrap onto two - which left whichever card carried
+    // the short blurb visibly stunted beside its neighbours.
+    //
+    // The blurb is the only part that varies, so reserve the same box for it
+    // in every card: lay each one out at the width a card actually gets, and
+    // take the tallest. Measuring beats hard-coding two lines - the blurbs
+    // can be reworded, and a longer one would knock its own card out of line
+    // again. The job has to carry `para`'s line height, or the box comes back
+    // shorter than the label that goes in it.
+    const BLURB: f32 = 12.0;
+    let blurb_h = Tone::ALL
+        .iter()
+        .map(|tone| {
+            let mut job = egui::text::LayoutJob::simple(
+                tone.blurb().to_string(),
+                FontId::proportional(BLURB),
+                theme::MUTED(),
+                w,
+            );
+            for section in &mut job.sections {
+                section.format.line_height = Some(BLURB * 1.5);
+            }
+            ui.painter().layout_job(job).size().y
+        })
+        .fold(0.0_f32, f32::max);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         for tone in Tone::ALL {
@@ -830,9 +857,6 @@ fn personal_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                     // here is horizontal: without this the label and blurb sit
                     // side by side and each card demands its full text width,
                     // which ran the row off the edge of the sheet.
-                    // Frame::show inherits the parent layout, and the parent
-                    // here is horizontal: without this the label and blurb sit
-                    // side by side and each card demands its full text width.
                     ui.vertical(|ui| {
                         ui.set_width(w);
                         ui.set_min_height(56.0);
@@ -849,7 +873,12 @@ fn personal_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                             }
                             ui.label(m(tone.label(), 14.0, fg));
                         });
-                        ui.label(para(tone.blurb(), 12.0, if active { theme::ON_FILL_DIM() } else { theme::MUTED() }));
+                        // Fixed box, so a one-line blurb leaves the same
+                        // gap a two-line one fills and the cards end level.
+                        ui.allocate_ui_with_layout(vec2(w, blurb_h), Layout::top_down(Align::LEFT), |ui| {
+                            ui.set_min_height(blurb_h);
+                            ui.label(para(tone.blurb(), BLURB, if active { theme::ON_FILL_DIM() } else { theme::MUTED() }));
+                        });
                     });
                 });
             if ui.interact(resp.response.rect, ui.id().with(tone.label()), Sense::click()).clicked() {
