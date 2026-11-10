@@ -128,12 +128,22 @@ fn main() -> eframe::Result<()> {
                 println!("recording {secs}s: {}", session.source);
                 let dir = session.dir.clone();
                 std::thread::sleep(std::time::Duration::from_secs(secs));
+                let talking = session.talking.clone();
                 let id = session.stop();
+                if let Some(t) = talking {
+                    let began = std::time::Instant::now();
+                    while !t.lock().map_or(true, |l| l.done) && began.elapsed() < std::time::Duration::from_secs(35) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
                 let levels = std::fs::read_to_string(dir.join("levels.log")).unwrap_or_default();
                 let _ = std::fs::write(&report, format!("meeting {id}\n{levels}"));
                 println!("\n{levels}");
                 for seg in meeting::transcript(&id) {
                     println!("[{:>7}ms {:4.1}s] {}", seg.at_ms, seg.secs, seg.text);
+                }
+                if let Ok(points) = std::fs::read_to_string(dir.join("talking_points.json")) {
+                    println!("\n--- talking points ---\n{points}");
                 }
                 if !meeting::transcript(&id).is_empty() {
                     let progress = std::sync::Mutex::new(String::new());

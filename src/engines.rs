@@ -327,6 +327,32 @@ pub fn chat_as(
     shots: &[(String, &'static str)],
     user: &str,
 ) -> Result<String, String> {
+    let (url, key, model, body) = chat_request(s, model_override, system, shots, user)?;
+    let mut req = agent(180).post(url);
+    if !key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send_json(&body).map_err(|_| not_running(s))?;
+    let v = read_json(resp).map_err(|e| {
+        if s.text_engine == TextEngine::Ollama && e.contains("not found") {
+            format!(
+                "The text model “{}” isn't downloaded in Ollama yet. Download it in Models › Text clean-up, or turn clean-up Off.",
+                model
+            )
+        } else {
+            e
+        }
+    })?;
+    Ok(reply_text(&v))
+}
+
+fn chat_request(
+    s: &Settings,
+    model_override: Option<&str>,
+    system: &str,
+    shots: &[(String, &'static str)],
+    user: &str,
+) -> Result<(String, String, String, Value), String> {
     let (base, key, model) = match s.text_engine {
         TextEngine::Ollama => (format!("{}/v1", trim_url(&s.ollama_url)), String::new(), s.ollama_model.clone()),
         TextEngine::OpenAiCompatible => (trim_url(&s.text_url), s.text_key.trim().to_string(), s.text_model.clone()),
@@ -334,9 +360,9 @@ pub fn chat_as(
     };
     let model = match model_override.map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => m.to_string(),
-        None => model,
+        None => model.trim().to_string(),
     };
-    if model.trim().is_empty() {
+    if model.is_empty() {
         return Err("No text model chosen. Pick one in Models.".into());
     }
     let mut messages = vec![json!({"role": "system", "content": system})];
@@ -346,33 +372,24 @@ pub fn chat_as(
     }
     messages.push(json!({"role": "user", "content": user}));
     let body = json!({
-        "model": model.trim(),
+        "model": model,
         "temperature": 0.2,
         "stream": false,
         "messages": messages,
     });
-    let mut req = agent(180).post(format!("{base}/chat/completions"));
-    if !key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let not_running = if s.text_engine == TextEngine::Ollama {
+    Ok((format!("{base}/chat/completions"), key, model, body))
+}
+
+fn not_running(s: &Settings) -> String {
+    if s.text_engine == TextEngine::Ollama {
         "Ollama isn't running. Open the Ollama app, or turn text clean-up Off in Models.".to_string()
     } else {
         "Your text server can't be reached. Check its address in Models.".to_string()
-    };
-    let resp = req.send_json(&body).map_err(|_| not_running)?;
-    let v = read_json(resp).map_err(|e| {
-        if s.text_engine == TextEngine::Ollama && e.contains("not found") {
-            format!(
-                "The text model “{}” isn't downloaded in Ollama yet. Download it in Models › Text clean-up, or turn clean-up Off.",
-                model.trim()
-            )
-        } else {
-            e
-        }
-    })?;
-    let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-    Ok(strip_thinking(text).trim().to_string())
+    }
+}
+
+fn reply_text(v: &Value) -> String {
+    strip_thinking(v["choices"][0]["message"]["content"].as_str().unwrap_or_default()).trim().to_string()
 }
 
 /// Reasoning models wrap their thoughts in <think>…</think>; never paste that.
@@ -543,9 +560,191 @@ pub fn start_ollama() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn chat_json(
+    s: &Settings,
+    model_override: Option<&str>,
+    system: &str,
+    user: &str,
+    name: &str,
+    schema: &Value,
+    still_allowed: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    chat_json_with(s, model_override, system, user, name, schema, still_allowed, ureq::Proxy::try_from_env())
+}
+
+fn chat_json_with(
+    s: &Settings,
+    model_override: Option<&str>,
+    system: &str,
+    user: &str,
+    name: &str,
+    schema: &Value,
+    still_allowed: &dyn Fn() -> bool,
+    env_proxy: Option<ureq::Proxy>,
+) -> Result<String, String> {
+    let (url, key, _, mut body) = chat_request(s, model_override, system, &[], user)?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(60)))
+        .max_redirects(0)
+        .proxy(env_proxy.filter(|_| !crate::talking::is_local(&url)))
+        .build()
+        .into();
+    let send = |body: &Value| {
+        let mut req = agent.post(&url);
+        if !key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        req.send_json(body).map_err(|_| not_running(s))
+    };
+    body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": true}});
+    let mut resp = send(&body)?;
+    if matches!(resp.status().as_u16(), 400 | 422) && still_allowed() {
+        if let Some(o) = body.as_object_mut() {
+            o.remove("response_format");
+        }
+        resp = send(&body)?;
+    }
+    Ok(reply_text(&read_json(resp)?))
+}
+
+#[cfg(test)]
+pub(crate) fn http_reply(status: &str, headers: &str, body: &str) -> String {
+    format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len())
+}
+
+#[cfg(test)]
+pub(crate) fn fake_server(replies: Vec<String>) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().flatten().enumerate() {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                head += &line;
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let len = head
+                .lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                .unwrap_or(0);
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send(head + &String::from_utf8_lossy(&body));
+            let _ = reader.get_mut().write_all(replies[n.min(replies.len() - 1)].as_bytes());
+        }
+    });
+    (port, rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn local_text(port: u16) -> Settings {
+        Settings { text_engine: TextEngine::OpenAiCompatible, text_url: format!("http://127.0.0.1:{port}/v1"), text_model: "m".into(), ..Settings::default() }
+    }
+
+    fn completion(content: &str) -> String {
+        http_reply("200 OK", "", &json!({"choices":[{"message":{"content": content}}]}).to_string())
+    }
+
+    fn body_of(request: &str) -> Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn chat_json_retries_without_a_schema_when_the_server_rejects_it() {
+        let (port, requests) = fake_server(vec![
+            http_reply("400 Bad Request", "", r#"{"error":"response_format is not supported"}"#),
+            completion(r#"{"summary":"s","actions":[]}"#),
+        ]);
+        let schema = json!({"type":"object"});
+        let out = chat_json_with(&local_text(port), None, "sys", "user", "notes", &schema, &|| true, None);
+        assert_eq!(out.unwrap(), r#"{"summary":"s","actions":[]}"#);
+        let first = body_of(&requests.recv().unwrap());
+        assert_eq!(first["response_format"]["type"], "json_schema");
+        assert_eq!(first["response_format"]["json_schema"]["name"], "notes");
+        assert_eq!(first["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(first["response_format"]["json_schema"]["schema"], schema);
+        let second = body_of(&requests.recv().unwrap());
+        assert!(second.get("response_format").is_none());
+        assert_eq!(second["messages"][1]["content"], "user");
+    }
+
+    #[test]
+    fn chat_json_resends_without_the_schema_only_when_the_server_rejects_the_request_shape() {
+        for (status, resent) in [("400 Bad Request", true), ("422 Unprocessable Entity", true), ("401 Unauthorized", false), ("403 Forbidden", false), ("404 Not Found", false), ("429 Too Many Requests", false)] {
+            let (port, requests) = fake_server(vec![http_reply(status, "", "{}"), completion("{}")]);
+            let out = chat_json_with(&local_text(port), None, "sys", "the meeting transcript", "notes", &json!({}), &|| true, None);
+            assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+            let second = requests.recv_timeout(Duration::from_millis(300)).is_ok();
+            assert_eq!((second, out.is_ok()), (resent, resent), "{status}");
+        }
+    }
+
+    #[test]
+    fn chat_json_does_not_resend_once_consent_is_withdrawn() {
+        let (port, requests) = fake_server(vec![http_reply("400 Bad Request", "", "{}"), completion("{}")]);
+        let out = chat_json_with(&local_text(port), None, "sys", "the meeting transcript", "notes", &json!({}), &|| false, None);
+        assert!(out.is_err());
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.recv_timeout(Duration::from_millis(300)).is_err(), "the transcript was sent again");
+    }
+
+    #[test]
+    fn chat_json_never_follows_a_redirect_to_another_server() {
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let (other, reached_other) = fake_server(vec![completion("{}")]);
+            let location = format!("Location: http://127.0.0.1:{other}/v1/chat/completions\r\n");
+            let (port, requests) = fake_server(vec![http_reply(status, &location, "")]);
+            let out = chat_json_with(&local_text(port), None, "sys", "the meeting transcript", "notes", &json!({}), &|| true, None);
+            assert!(out.is_err(), "{status}: {out:?}");
+            assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+            assert!(reached_other.recv_timeout(Duration::from_millis(500)).is_err(), "{status}: a request followed the redirect");
+        }
+    }
+
+    #[test]
+    fn chat_json_never_sends_a_local_server_through_a_proxy() {
+        let (proxy_port, reached_proxy) = fake_server(vec![http_reply("502 Bad Gateway", "", "")]);
+        let (port, requests) = fake_server(vec![completion("{}")]);
+        let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{proxy_port}")).unwrap();
+        let out = chat_json_with(&local_text(port), None, "sys", "user", "notes", &json!({}), &|| true, Some(proxy));
+        assert_eq!(out.unwrap(), "{}");
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(reached_proxy.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    #[ignore = "needs LM Studio serving phi-4-mini-instruct-chat-mlx on 127.0.0.1:1234"]
+    fn lm_studio_answers_both_talking_points_schemas() {
+        let s = Settings {
+            text_engine: TextEngine::OpenAiCompatible,
+            text_url: "http://127.0.0.1:1234/v1".into(),
+            text_model: "phi-4-mini-instruct-chat-mlx".into(),
+            ..Settings::default()
+        };
+        let user = "Recent transcript:\n[them] Can you send me the beta build by Friday?\n[you] Sure, I'll send it Thursday.\n";
+        for (name, system, schema) in [
+            ("suggestions", crate::talking::SUGGEST_SYSTEM, crate::talking::suggestions_schema()),
+            ("notes", crate::talking::NOTES_SYSTEM, crate::talking::notes_schema(true)),
+        ] {
+            let began = Instant::now();
+            let out = chat_json(&s, None, system, user, name, &schema, &|| true);
+            println!("{name}: {:?} -> {out:?}", began.elapsed());
+            assert!(out.is_ok());
+        }
+    }
 
     #[test]
     fn multipart_body_carries_fields_and_wav() {

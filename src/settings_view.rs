@@ -517,6 +517,36 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         }
         TextEngine::Off => {}
     }
+    if let Some(url) = crate::talking::text_server(&app.s).map(str::to_owned) {
+        let mut probe = app.s.clone();
+        probe.talking_points = true;
+        let gate = crate::talking::availability(&probe, crate::talking::physical_memory());
+        let needs_memory = gate == crate::talking::Availability::NeedsMemory;
+        row(ui, "Talking Points", "Suggests what to say and keeps notes while a meeting runs.", 300.0, |ui| {
+            ui.add_enabled_ui(!needs_memory || app.s.talking_points, |ui| {
+                changed |= crate::views::kit_checkbox(ui, &mut app.s.talking_points).changed();
+            });
+            if needs_memory {
+                ui.label(t("Needs 16 GB of memory to run the text model on this Mac", 12.0, theme::MUTED()));
+            }
+        });
+        if !crate::talking::is_local(&url) {
+            let host = crate::talking::host_of(&url);
+            let mut on = !matches!(gate, crate::talking::Availability::NeedsCloudOptIn { .. });
+            row(
+                ui,
+                &format!("Send meeting transcripts to {host}"),
+                &format!("While Talking Points runs, the meeting transcript is sent to {host} every few seconds."),
+                300.0,
+                |ui| {
+                    if crate::views::kit_checkbox(ui, &mut on).changed() {
+                        crate::talking::set_cloud_opt_in(&mut app.s, on);
+                        changed = true;
+                    }
+                },
+            );
+        }
+    }
 
     section(ui, crate::icon::FLASK, "Try it");
     ui.label(para("Type something messy, the way people talk, and see what your text model makes of it.", 13.5, theme::MUTED()));
