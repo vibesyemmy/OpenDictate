@@ -3,6 +3,7 @@ mod audio;
 mod cut;
 mod engines;
 mod icon;
+mod lms;
 mod meeting;
 #[cfg(target_os = "macos")]
 mod macos_look;
