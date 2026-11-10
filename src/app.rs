@@ -262,11 +262,13 @@ impl DictateApp {
             window_since: None,
             icon_tries: 0,
         };
-        // Lets a screenshot start on another screen: --page history|dictionary|models|settings|personal
+        // Lets a screenshot start on another screen:
+        // --page history|meetings|dictionary|models|settings|audio|personal
         let args: Vec<String> = std::env::args().collect();
         if let Some(p) = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)) {
             match p.as_str() {
                 "history" => app.page = Page::History,
+                "meetings" => app.page = Page::Meetings,
                 "dictionary" => app.page = Page::Dictionary,
                 "models" => app.settings_tab = Some(SettingsTab::Models),
                 "settings" => app.settings_tab = Some(SettingsTab::General),

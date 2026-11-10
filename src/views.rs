@@ -20,25 +20,33 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
         .show(ui, |ui| sidebar(app, ui));
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG_SHEER())).show(ui, |ui| {
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            let full = ui.available_width();
-            let width = (full - 80.0).clamp(560.0, 1080.0);
-            let pad = ((full - width) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.vertical(|ui| {
-                    ui.set_width(width);
+        let full = ui.available_width();
+        let width = (full - 80.0).clamp(560.0, 1080.0);
+        let pad = ((full - width) / 2.0).max(0.0);
+        // Home is one piece of reading, so the whole page moves together.
+        // The three list pages pin their own headings and scroll only the
+        // list underneath, which means they must NOT sit inside a scroll
+        // area of their own - nested scrolling gives the heading nothing to
+        // stay still against, and it scrolls away with everything else.
+        if app.page == Page::Home {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                column(ui, pad, width, |ui| {
                     ui.add_space(36.0);
-                    match app.page {
-                        Page::Home => home(app, ui, width),
-                        Page::History => history(app, ui),
-                        Page::Meetings => meetings(app, ui, width),
-                        Page::Dictionary => dictionary(app, ui),
-                    }
+                    home(app, ui, width);
                     ui.add_space(40.0);
                 });
             });
-        });
+        } else {
+            column(ui, pad, width, |ui| {
+                ui.add_space(36.0);
+                match app.page {
+                    Page::History => history(app, ui),
+                    Page::Meetings => meetings(app, ui, width),
+                    Page::Dictionary => dictionary(app, ui),
+                    Page::Home => unreachable!("handled above"),
+                }
+            });
+        }
     });
 
     if app.settings_tab.is_some() {
@@ -46,6 +54,20 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
     }
     crate::settings_view::capture_shortcut(app, &ctx);
     toast(app, &ctx);
+}
+
+/// The centred reading column every page sits in.
+///
+/// Full height, so a page that scrolls only part of itself has something to
+/// measure its scroll area against.
+fn column(ui: &mut egui::Ui, pad: f32, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(pad);
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            add(ui);
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,41 +1253,47 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
     ui.add_space(14.0);
 
     let items: Vec<_> = app.history.iter().rev().filter(|e| app.hist_filter.is_none_or(|f| f == e.action)).cloned().collect();
-    if items.is_empty() {
-        ui.add_space(30.0);
-        let key = app.s.dictate_keys.first().map(|k| pretty_key(k)).unwrap_or_else(|| "your shortcut".into());
-        ui.vertical_centered(|ui| {
-            ui.label(m("Nothing here yet", 18.0, theme::TEXT()));
-            ui.label(t(format!("Press {key} anywhere, speak, and your words show up here."), 14.0, theme::MUTED()));
-        });
-        return;
-    }
 
     let ctx = ui.ctx().clone();
     let mut action: Option<(RowAction, u64)> = None;
-    let mut i = 0;
-    while i < items.len() {
-        let day = stats::local_date(items[i].when);
-        ui.label(t(stats::day_heading(day), 13.0, theme::MUTED()));
-        ui.add_space(2.0);
-        theme::soft(theme::SURFACE(), 12, 2.0, 2).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let mut first = true;
-            while i < items.len() && stats::local_date(items[i].when) == day {
-                let e = &items[i];
-                if !first {
-                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                    ui.painter().rect_filled(r, 0.0, theme::TRACK());
+    // Everything above stays put; only the entries move. The filter you
+    // picked and the retention you set are what you steer the list with, so
+    // they are no use scrolled off the top of it.
+    egui::ScrollArea::vertical().auto_shrink(false).id_salt("history_list").show(ui, |ui| {
+        if items.is_empty() {
+            ui.add_space(30.0);
+            let key = app.s.dictate_keys.first().map(|k| pretty_key(k)).unwrap_or_else(|| "your shortcut".into());
+            ui.vertical_centered(|ui| {
+                ui.label(m("Nothing here yet", 18.0, theme::TEXT()));
+                ui.label(t(format!("Press {key} anywhere, speak, and your words show up here."), 14.0, theme::MUTED()));
+            });
+            return;
+        }
+        let mut i = 0;
+        while i < items.len() {
+            let day = stats::local_date(items[i].when);
+            ui.label(t(stats::day_heading(day), 13.0, theme::MUTED()));
+            ui.add_space(2.0);
+            theme::soft(theme::SURFACE(), 12, 2.0, 2).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let mut first = true;
+                while i < items.len() && stats::local_date(items[i].when) == day {
+                    let e = &items[i];
+                    if !first {
+                        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter().rect_filled(r, 0.0, theme::TRACK());
+                    }
+                    first = false;
+                    if let Some(a) = history_row(app, ui, e) {
+                        action = Some((a, e.when));
+                    }
+                    i += 1;
                 }
-                first = false;
-                if let Some(a) = history_row(app, ui, e) {
-                    action = Some((a, e.when));
-                }
-                i += 1;
-            }
-        });
-        ui.add_space(12.0);
-    }
+            });
+            ui.add_space(12.0);
+        }
+        ui.add_space(28.0);
+    });
     match action {
         Some((RowAction::Retry, w)) => app.retry(&ctx, w),
         Some((RowAction::Delete, w)) => app.delete_entry(w),
@@ -1391,176 +1419,182 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
     });
     ui.add_space(16.0);
 
-    // While one is running, it is the only thing worth looking at.
-    if let Some(session) = &app.meeting {
-        let (elapsed, segments, warning) = session
-            .live
-            .lock()
-            .map(|l| (l.elapsed, l.segments.clone(), l.warning.clone()))
-            .unwrap_or((0.0, Vec::new(), None));
-        let mut stop = false;
-        theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
-            ui.set_width(w - 36.0);
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 5.0, theme::RED());
-                ui.label(b(format!("Recording · {}", hhmmss(elapsed)), 19.0, theme::TEXT()));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    stop = btn(ui, "Stop").clicked();
-                });
-            });
-            ui.label(t(&session.source, 13.0, theme::MUTED()));
-            if let Some(warn) = &warning {
-                ui.add_space(6.0);
-                status(ui, State::Warn, warn);
-            }
-        });
-        ui.add_space(14.0);
-        if segments.is_empty() {
-            ui.label(para(
-                "The transcript appears here about half a minute behind the room.",
-                14.0,
-                theme::FAINT(),
-            ));
-        }
-        for seg in segments.iter().rev() {
-            transcript_line(ui, seg, w);
-        }
-        if stop {
-            app.toggle_meeting();
-        }
-        return;
-    }
-
-    // One stored meeting, opened.
-    if let Some(id) = app.open_meeting.clone() {
-        let Some(meta) = app.open_meta.clone() else {
-            app.open_meeting = None;
-            return;
-        };
-        let mut delete = false;
-        ui.horizontal(|ui| {
-            if link(ui, "All meetings").clicked() {
-                app.open_meeting = None;
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                delete = btn(ui, "Delete").clicked();
-            });
-        });
-        ui.add_space(12.0);
-        ui.label(b(&meta.title, 24.0, theme::TEXT()));
-        let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
-        ui.label(t(format!("{} · {length}", meta.source), 13.0, theme::MUTED()));
-        ui.add_space(16.0);
-
-        // What it came to, before what was said.
-        if app.summarising.as_deref() == Some(id.as_str()) {
-            let step = app.summary_progress.lock().map(|p| p.clone()).unwrap_or_default();
-            theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
-                ui.set_width(w - 32.0);
-                status(ui, State::Warn, if step.is_empty() { "Summarising…".into() } else { step });
-            });
-            ui.add_space(14.0);
-        } else if let Some(sum) = app.open_summary.clone() {
+    // The heading stays; everything under it - a live transcript, an opened
+    // meeting, or the list - is what moves. A transcript runs to hundreds of
+    // lines, and scrolling it used to take the page's name with it.
+    egui::ScrollArea::vertical().auto_shrink(false).id_salt("meetings_body").show(ui, |ui| {
+        // While one is running, it is the only thing worth looking at.
+        if let Some(session) = &app.meeting {
+            let (elapsed, segments, warning) = session
+                .live
+                .lock()
+                .map(|l| (l.elapsed, l.segments.clone(), l.warning.clone()))
+                .unwrap_or((0.0, Vec::new(), None));
+            let mut stop = false;
             theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
                 ui.set_width(w - 36.0);
-                ui.label(b("Summary", 19.0, theme::TEXT()));
-                ui.add_space(6.0);
-                ui.label(para(&sum.overview, 14.0, theme::TEXT()));
-                for (title, items, empty) in [
-                    ("Decided", &sum.decisions, "Nothing was settled."),
-                    ("To do", &sum.actions, "Nobody took anything on."),
-                    ("Still open", &sum.questions, "Nothing was left hanging."),
-                ] {
-                    ui.add_space(14.0);
-                    ui.label(m(title, 13.0, theme::MUTED()));
-                    ui.add_space(4.0);
-                    if items.is_empty() {
-                        ui.label(t(empty, 13.0, theme::FAINT()));
-                    } else {
-                        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                        bullets(ui, &refs, 14.0, theme::TEXT());
-                    }
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.0, theme::RED());
+                    ui.label(b(format!("Recording · {}", hhmmss(elapsed)), 19.0, theme::TEXT()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        stop = btn(ui, "Stop").clicked();
+                    });
+                });
+                ui.label(t(&session.source, 13.0, theme::MUTED()));
+                if let Some(warn) = &warning {
+                    ui.add_space(6.0);
+                    status(ui, State::Warn, warn);
                 }
-                ui.add_space(12.0);
-                ui.label(t(format!("Written by {}", sum.model), 12.0, theme::FAINT()));
             });
             ui.add_space(14.0);
-        } else if !app.open_segments.is_empty() {
-            if btn(ui, "Summarise").clicked() {
-                app.start_summary(id.clone());
+            if segments.is_empty() {
+                ui.label(para(
+                    "The transcript appears here about half a minute behind the room.",
+                    14.0,
+                    theme::FAINT(),
+                ));
             }
-            ui.add_space(14.0);
+            for seg in segments.iter().rev() {
+                transcript_line(ui, seg, w);
+            }
+            if stop {
+                app.toggle_meeting();
+            }
+            return;
         }
 
-        let segs = app.open_segments.clone();
-        if segs.is_empty() {
-            let why = if meta.peak < 0.001 {
-                "Nothing reached the recorder at all. The meeting may have been on a device Open Dictate could not tap.".to_string()
-            } else {
-                format!(
-                    "Nothing was loud enough to transcribe. The loudest moment was {:.3} out of 1.0, which is about the level of a quiet room.",
-                    meta.peak
-                )
+        // One stored meeting, opened.
+        if let Some(id) = app.open_meeting.clone() {
+            let Some(meta) = app.open_meta.clone() else {
+                app.open_meeting = None;
+                return;
             };
-            ui.label(para(why, 14.0, theme::MUTED()));
-            ui.add_space(6.0);
-            ui.label(t("Levels for every chunk are in levels.log beside this transcript.", 12.5, theme::FAINT()));
-        }
-        for seg in &segs {
-            transcript_line(ui, seg, w);
-        }
-        if delete {
-            crate::meeting::delete(&id);
-            app.open_meeting = None;
-            app.open_segments.clear();
-            app.open_meta = None;
-            app.meetings_dirty = true;
-            app.notify("Meeting deleted", false);
-        }
-        return;
-    }
-
-    // The list, read when it changed rather than every frame.
-    if app.meetings_dirty {
-        app.refresh_meetings();
-    }
-    let all = app.meeting_list.clone();
-    if all.is_empty() {
-        theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
-            ui.set_width(w - 36.0);
-            ui.label(b("No meetings yet", 19.0, theme::TEXT()));
-            ui.add_space(4.0);
-            let key = app.s.meeting_keys.first().cloned().unwrap_or_else(|| "F16".into());
-            ui.label(para(
-                format!(
-                    "Press {} to start one. Open Dictate records what your Mac is playing along with your microphone, so everyone on the call is in the transcript, and writes it down as the meeting runs.",
-                    pretty_key(&key)
-                ),
-                14.0,
-                theme::MUTED(),
-            ));
-        });
-        return;
-    }
-    for m in all {
-        let resp = theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
-            ui.set_width(w - 32.0);
+            let mut delete = false;
             ui.horizontal(|ui| {
-                ui.label(b(&m.title, 17.0, theme::TEXT()));
+                if link(ui, "All meetings").clicked() {
+                    app.open_meeting = None;
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let length = m.ended.map(|e| hhmmss((e - m.started) as f32)).unwrap_or_else(|| "unfinished".into());
-                    ui.label(t(length, 13.0, theme::MUTED()));
+                    delete = btn(ui, "Delete").clicked();
                 });
             });
-            ui.label(t(&m.source, 12.5, theme::FAINT()));
-        });
-        let click = ui.interact(resp.response.rect, ui.id().with(&m.id), Sense::click());
-        if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            app.open_meeting(m.id.clone());
+            ui.add_space(12.0);
+            ui.label(b(&meta.title, 24.0, theme::TEXT()));
+            let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
+            ui.label(t(format!("{} · {length}", meta.source), 13.0, theme::MUTED()));
+            ui.add_space(16.0);
+
+            // What it came to, before what was said.
+            if app.summarising.as_deref() == Some(id.as_str()) {
+                let step = app.summary_progress.lock().map(|p| p.clone()).unwrap_or_default();
+                theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                    ui.set_width(w - 32.0);
+                    status(ui, State::Warn, if step.is_empty() { "Summarising…".into() } else { step });
+                });
+                ui.add_space(14.0);
+            } else if let Some(sum) = app.open_summary.clone() {
+                theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
+                    ui.set_width(w - 36.0);
+                    ui.label(b("Summary", 19.0, theme::TEXT()));
+                    ui.add_space(6.0);
+                    ui.label(para(&sum.overview, 14.0, theme::TEXT()));
+                    for (title, items, empty) in [
+                        ("Decided", &sum.decisions, "Nothing was settled."),
+                        ("To do", &sum.actions, "Nobody took anything on."),
+                        ("Still open", &sum.questions, "Nothing was left hanging."),
+                    ] {
+                        ui.add_space(14.0);
+                        ui.label(m(title, 13.0, theme::MUTED()));
+                        ui.add_space(4.0);
+                        if items.is_empty() {
+                            ui.label(t(empty, 13.0, theme::FAINT()));
+                        } else {
+                            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                            bullets(ui, &refs, 14.0, theme::TEXT());
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.label(t(format!("Written by {}", sum.model), 12.0, theme::FAINT()));
+                });
+                ui.add_space(14.0);
+            } else if !app.open_segments.is_empty() {
+                if btn(ui, "Summarise").clicked() {
+                    app.start_summary(id.clone());
+                }
+                ui.add_space(14.0);
+            }
+
+            let segs = app.open_segments.clone();
+            if segs.is_empty() {
+                let why = if meta.peak < 0.001 {
+                    "Nothing reached the recorder at all. The meeting may have been on a device Open Dictate could not tap.".to_string()
+                } else {
+                    format!(
+                        "Nothing was loud enough to transcribe. The loudest moment was {:.3} out of 1.0, which is about the level of a quiet room.",
+                        meta.peak
+                    )
+                };
+                ui.label(para(why, 14.0, theme::MUTED()));
+                ui.add_space(6.0);
+                ui.label(t("Levels for every chunk are in levels.log beside this transcript.", 12.5, theme::FAINT()));
+            }
+            for seg in &segs {
+                transcript_line(ui, seg, w);
+            }
+            if delete {
+                crate::meeting::delete(&id);
+                app.open_meeting = None;
+                app.open_segments.clear();
+                app.open_meta = None;
+                app.meetings_dirty = true;
+                app.notify("Meeting deleted", false);
+            }
+            return;
         }
-        ui.add_space(10.0);
-    }
+
+        // The list, read when it changed rather than every frame.
+        if app.meetings_dirty {
+            app.refresh_meetings();
+        }
+        let all = app.meeting_list.clone();
+        if all.is_empty() {
+            theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
+                ui.set_width(w - 36.0);
+                ui.label(b("No meetings yet", 19.0, theme::TEXT()));
+                ui.add_space(4.0);
+                let key = app.s.meeting_keys.first().cloned().unwrap_or_else(|| "F16".into());
+                ui.label(para(
+                    format!(
+                        "Press {} to start one. Open Dictate records what your Mac is playing along with your microphone, so everyone on the call is in the transcript, and writes it down as the meeting runs.",
+                        pretty_key(&key)
+                    ),
+                    14.0,
+                    theme::MUTED(),
+                ));
+            });
+            return;
+        }
+        for m in all {
+            let resp = theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(w - 32.0);
+                ui.horizontal(|ui| {
+                    ui.label(b(&m.title, 17.0, theme::TEXT()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let length = m.ended.map(|e| hhmmss((e - m.started) as f32)).unwrap_or_else(|| "unfinished".into());
+                        ui.label(t(length, 13.0, theme::MUTED()));
+                    });
+                });
+                ui.label(t(&m.source, 12.5, theme::FAINT()));
+            });
+            let click = ui.interact(resp.response.rect, ui.id().with(&m.id), Sense::click());
+            if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                app.open_meeting(m.id.clone());
+            }
+            ui.add_space(10.0);
+        }
+        ui.add_space(28.0);
+    });
 }
 
 fn transcript_line(ui: &mut egui::Ui, seg: &crate::meeting::Segment, w: f32) {
@@ -1676,41 +1710,47 @@ fn dictionary(app: &mut DictateApp, ui: &mut egui::Ui) {
         })
         .filter(|(_, d)| q.is_empty() || d.word.to_lowercase().contains(&q))
         .collect();
-    if words.is_empty() {
-        ui.add_space(30.0);
-        ui.vertical_centered(|ui| {
-            ui.label(m("No words yet", 18.0, theme::TEXT()));
-            ui.label(para("Add names and terms here, or correct a dictation in History and new words are learned automatically.", 14.0, theme::MUTED()));
-        });
-        return;
-    }
-    let cols = 3;
-    let gap = 8.0;
-    let w = (ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32;
     let mut remove = None;
-    for row in words.chunks(cols) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for (idx, d) in row {
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(r, 6.0, theme::SURFACE());
-                p.rect_stroke(r, 6.0, Stroke::new(1.0, theme::LINE()), StrokeKind::Inside);
-                let (icon, c) = if d.auto { (crate::icon::SPARKLES, theme::GREEN()) } else { (crate::icon::PENCIL, theme::FAINT()) };
-                p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(11.0), c);
-                p.text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, &d.word, FontId::new(14.0, theme::medium()), theme::TEXT());
-                if resp.hovered() {
-                    let x = Rect::from_center_size(pos2(r.right() - 18.0, r.center().y), Vec2::splat(20.0));
-                    let xr = ui.interact(x, ui.id().with(("del", *idx)), Sense::click());
-                    draw_icon(ui.painter(), "close", x.center(), if xr.hovered() { theme::TEXT() } else { theme::MUTED() });
-                    if xr.clicked() {
-                        remove = Some(*idx);
+    // The heading, the filter, the search box and the add form all stay put:
+    // they are how you narrow the list, and searching a long dictionary used
+    // to push the very box you were typing in off the top of the page.
+    egui::ScrollArea::vertical().auto_shrink(false).id_salt("dictionary_words").show(ui, |ui| {
+        if words.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(m("No words yet", 18.0, theme::TEXT()));
+                ui.label(para("Add names and terms here, or correct a dictation in History and new words are learned automatically.", 14.0, theme::MUTED()));
+            });
+            return;
+        }
+        let cols = 3;
+        let gap = 8.0;
+        let w = (ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32;
+        for row in words.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (idx, d) in row {
+                    let (r, resp) = ui.allocate_exact_size(vec2(w, 38.0), Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(r, 6.0, theme::SURFACE());
+                    p.rect_stroke(r, 6.0, Stroke::new(1.0, theme::LINE()), StrokeKind::Inside);
+                    let (icon, c) = if d.auto { (crate::icon::SPARKLES, theme::GREEN()) } else { (crate::icon::PENCIL, theme::FAINT()) };
+                    p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(11.0), c);
+                    p.text(pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, &d.word, FontId::new(14.0, theme::medium()), theme::TEXT());
+                    if resp.hovered() {
+                        let x = Rect::from_center_size(pos2(r.right() - 18.0, r.center().y), Vec2::splat(20.0));
+                        let xr = ui.interact(x, ui.id().with(("del", *idx)), Sense::click());
+                        draw_icon(ui.painter(), "close", x.center(), if xr.hovered() { theme::TEXT() } else { theme::MUTED() });
+                        if xr.clicked() {
+                            remove = Some(*idx);
+                        }
                     }
                 }
-            }
-        });
-        ui.add_space(4.0);
-    }
+            });
+            ui.add_space(4.0);
+        }
+        ui.add_space(28.0);
+    });
     if let Some(i) = remove {
         app.s.dictionary.remove(i);
         app.changed();
