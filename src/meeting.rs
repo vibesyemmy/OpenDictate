@@ -213,6 +213,14 @@ impl Session {
             let settings = s.clone();
             move || run(cap, dir, live, stop, settings)
         });
+        if s.talking_points && crate::lms::is_lm_studio(s) && crate::lms::find().is_some() {
+            let (dir, s) = (dir.clone(), s.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = crate::lms::ensure(&s, &|l| log(&dir, &format!("lm studio: {l}"))) {
+                    log(&dir, &format!("lm studio: {e}"));
+                }
+            });
+        }
         let talking_ended = Arc::new(AtomicBool::new(false));
         let talking = s.talking_points.then(|| crate::talking::spawn(s.clone(), live.clone(), talking_ended.clone(), dir.clone()));
         Ok(Self { id, dir, source: source.to_string(), live, talking, talking_ended, stop, worker: Some(worker) })
