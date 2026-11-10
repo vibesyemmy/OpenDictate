@@ -1,17 +1,20 @@
-#![allow(dead_code)]
-
 const FRAME_SECS: f64 = 0.02;
-const VOICED_RMS: f32 = 0.01;
+const VOICED_RMS: f32 = 0.004;
 const PAUSE_FRAMES: usize = 25;
 const FORCED_CUT_FRAMES: usize = 750;
 const TURN_FRAMES: usize = 15;
 const SIDE_RATIO: f32 = 2.5;
+const NOISE_K: f32 = 1.5;
+const FLOOR_RISE: f32 = 1.014;
+const FLOOR_MAX: f32 = 0.02;
+const MIN_RUN: usize = 3;
 
 pub struct Stretch {
     pub voice: &'static str,
     pub samples: Vec<f32>,
     pub secs: f32,
     pub voiced_secs: f32,
+    pub start_secs: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -34,10 +37,18 @@ pub struct Cutter {
     side: Option<Side>,
     turn_run: usize,
     split_ok: bool,
+    consumed: usize,
+    floors: [f32; 2],
+    run: usize,
 }
 
 fn rms(v: &[f32]) -> f32 {
     (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+}
+
+fn clears_floor(floor: &mut f32, r: f32) -> bool {
+    *floor = if r < *floor { r } else { (floor.max(VOICED_RMS / NOISE_K) * FLOOR_RISE).min(FLOOR_MAX) };
+    r >= (*floor * NOISE_K).max(VOICED_RMS)
 }
 
 fn side_of(you_rms: f32, them_rms: f32) -> Side {
@@ -65,6 +76,9 @@ impl Cutter {
             side: None,
             turn_run: 0,
             split_ok: true,
+            consumed: 0,
+            floors: [FLOOR_MAX; 2],
+            run: 0,
         }
     }
 
@@ -104,7 +118,10 @@ impl Cutter {
         self.theirs.extend_from_slice(fb);
         self.frames += 1;
 
-        if you_rms.max(them_rms) < VOICED_RMS {
+        let you_voiced = clears_floor(&mut self.floors[0], you_rms);
+        let them_voiced = clears_floor(&mut self.floors[1], them_rms);
+        if !you_voiced && !them_voiced {
+            self.run = 0;
             self.quiet_run += 1;
             self.turn_run = 0;
             if self.quiet_run >= PAUSE_FRAMES {
@@ -113,7 +130,12 @@ impl Cutter {
             return;
         }
         self.quiet_run = 0;
-        self.voiced += 1;
+        self.run += 1;
+        self.voiced += match self.run {
+            MIN_RUN => MIN_RUN,
+            r if r > MIN_RUN => 1,
+            _ => 0,
+        };
 
         let side = side_of(you_rms, them_rms);
         if let Some(at) = self.turn_cut_at(side) {
@@ -146,6 +168,8 @@ impl Cutter {
 
     fn take_stretch(&mut self, upto_frames: usize) -> Option<Stretch> {
         let at = (upto_frames * self.frame).min(self.mine.len());
+        let start_secs = self.consumed as f64 / self.rate;
+        self.consumed += at;
         let tail_mine = self.mine.split_off(at);
         let tail_theirs = self.theirs.split_off(at);
         let mine = std::mem::replace(&mut self.mine, tail_mine);
@@ -178,13 +202,14 @@ impl Cutter {
             voice,
             secs: (samples.len() as f64 / self.rate) as f32,
             voiced_secs: (voiced as f64 * FRAME_SECS) as f32,
+            start_secs,
             samples,
         })
     }
 }
 
 pub fn worth_transcribing(peak: f32, rms: f32, voiced_secs: f32) -> bool {
-    peak >= 0.03 && rms >= 0.002 && (peak >= 0.10 || voiced_secs >= 1.0)
+    peak >= 0.03 && rms >= 0.002 && (peak >= 0.10 || (peak >= 0.05 && voiced_secs >= 0.15) || voiced_secs >= 1.0)
 }
 
 #[cfg(test)]
@@ -308,8 +333,8 @@ mod tests {
     #[test]
     fn flush_keeps_the_tail_of_the_longer_side() {
         let mut c = Cutter::new(RATE);
-        c.push(&speech(1.0)[..2_000], &silence(1.0)[..1_000], true);
-        assert_eq!(c.flush().expect("stretch").samples.len(), 2_000);
+        c.push(&speech(1.0)[..9_600], &silence(1.0)[..8_600], true);
+        assert_eq!(c.flush().expect("stretch").samples.len(), 9_600);
     }
 
     #[test]
@@ -369,5 +394,135 @@ mod tests {
         assert!(!worth_transcribing(0.021, 0.002, 0.0));
         assert!(worth_transcribing(0.08, 0.01, 1.2));
         assert!(!worth_transcribing(0.02, 0.01, 2.0));
+    }
+
+    fn fixture(name: &str, peak: f32) -> Vec<f32> {
+        let bytes = std::fs::read(format!("{}/tests/fixtures/{name}.wav", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let at = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let raw: Vec<f32> = bytes[at..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32).collect();
+        let loudest = raw.iter().fold(0f32, |m, x| m.max(x.abs()));
+        raw.iter().map(|x| x / loudest * peak).collect()
+    }
+
+    fn stretches_of_quiet_speech(name: &str) -> Vec<Stretch> {
+        let mut c = Cutter::new(16_000.0);
+        let theirs = [fixture(name, 0.06), vec![0.0; 16_000]].concat();
+        let silent = vec![0.0; theirs.len()];
+        let mut out = c.push(&silent, &theirs, true);
+        out.extend(c.flush());
+        out
+    }
+
+    fn assert_one_stretch_worth_transcribing(name: &str) {
+        let out = stretches_of_quiet_speech(name);
+        assert_eq!(out.len(), 1);
+        assert_worth_transcribing(&out[0]);
+    }
+
+    fn assert_worth_transcribing(st: &Stretch) {
+        let peak = st.samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(worth_transcribing(peak, rms(&st.samples), st.voiced_secs), "voiced {}", st.voiced_secs);
+    }
+
+    #[test]
+    fn a_quiet_spoken_question_comes_out_as_one_stretch_worth_transcribing() {
+        assert_one_stretch_worth_transcribing("question");
+    }
+
+    #[test]
+    fn every_stretch_of_a_quiet_spoken_short_answer_is_worth_transcribing() {
+        let out = stretches_of_quiet_speech("yes");
+        assert!(!out.is_empty());
+        out.iter().for_each(assert_worth_transcribing);
+    }
+
+    fn fan(secs: f64) -> Vec<f32> {
+        let mut seed = 12345u32;
+        (0..(secs * 16_000.0) as usize)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.0173
+            })
+            .collect()
+    }
+
+    fn clicks(v: &mut [f32], every_secs: f64, peaks: &[f32]) {
+        let (every, click) = ((every_secs * 16_000.0) as usize, 80);
+        for (n, at) in (every / 2..v.len().saturating_sub(click)).step_by(every).enumerate() {
+            let p = peaks[n % peaks.len()];
+            v[at..at + click].iter_mut().enumerate().for_each(|(i, x)| *x += if i % 2 == 0 { p } else { -p });
+        }
+    }
+
+    fn mic_stretches(mic: &[f32]) -> Vec<Stretch> {
+        let mut c = Cutter::new(16_000.0);
+        let mut out = c.push(mic, &vec![0.0; mic.len()], true);
+        out.extend(c.flush());
+        out
+    }
+
+    fn over_fan(speech: &[f32]) -> Vec<f32> {
+        speech.iter().zip(fan(speech.len() as f64 / 16_000.0)).map(|(s, n)| s + n).collect()
+    }
+
+    #[test]
+    fn steady_fan_noise_does_not_stop_pause_cuts() {
+        let q = fixture("question", 0.06);
+        let mic = over_fan(&[vec![0.0; 16_000], q.clone(), vec![0.0; 32_000], q, vec![0.0; 16_000]].concat());
+        let out = mic_stretches(&mic);
+        let secs: Vec<_> = out.iter().map(|s| (s.secs, s.voiced_secs)).collect();
+        assert_eq!(out.len(), 2, "{secs:?}");
+        out.iter().for_each(assert_worth_transcribing);
+    }
+
+    #[test]
+    fn a_quiet_sentence_over_fan_noise_is_still_worth_transcribing() {
+        for name in ["question", "yes"] {
+            let out = mic_stretches(&over_fan(&[vec![0.0; 16_000], fixture(name, 0.06), vec![0.0; 16_000]].concat()));
+            assert!(!out.is_empty(), "{name}");
+            out.iter().for_each(assert_worth_transcribing);
+        }
+    }
+
+    #[test]
+    fn fan_noise_alone_is_never_sent_to_whisper() {
+        let mut mic = fan(20.0);
+        clicks(&mut mic, 1.3, &[0.03, 0.06, 0.045]);
+        assert!(mic_stretches(&mic).is_empty());
+    }
+
+    #[test]
+    fn a_burst_of_typing_is_not_worth_transcribing() {
+        let mut mic = vec![0.0; 32_000];
+        clicks(&mut mic, 0.2, &[0.06]);
+        assert!(mic_stretches(&mic).is_empty());
+    }
+
+    fn starts(mine: &[f32], theirs: &[f32]) -> Vec<f64> {
+        cut_all(mine, theirs, true).iter().map(|s| s.start_secs).collect()
+    }
+
+    #[test]
+    fn a_stretch_after_dropped_silence_starts_where_it_was_spoken() {
+        let theirs = cat(&[silence(3.0), speech(1.0), silence(1.0)]);
+        let got = starts(&vec![0.0; theirs.len()], &theirs);
+        assert_eq!(got.len(), 1);
+        assert!((got[0] - 3.0).abs() < 0.05, "{got:?}");
+    }
+
+    #[test]
+    fn a_stretch_after_a_turn_cut_starts_where_the_new_turn_began() {
+        let (mine, theirs) = (cat(&[silence(2.0), speech(2.0)]), cat(&[speech(2.0), silence(2.0)]));
+        let got = starts(&mine, &theirs);
+        assert_eq!(got.len(), 2);
+        assert!((got[1] - 2.0).abs() < 0.05, "{got:?}");
+    }
+
+    #[test]
+    fn a_stretch_after_a_forced_cut_starts_where_the_cut_fell() {
+        let theirs = speech(20.0);
+        let got = starts(&vec![0.0; theirs.len()], &theirs);
+        assert_eq!(got.len(), 2);
+        assert!((got[1] - 15.0).abs() < 0.05, "{got:?}");
     }
 }
