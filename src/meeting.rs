@@ -2,19 +2,19 @@
 //! runs and kept on disk.
 //!
 //! A meeting is too long to hold in memory and too long to transcribe in one
-//! go, so it is cut into chunks that are written, transcribed and thrown away
+//! go, so it is cut into stretches at pauses and turns that are written, transcribed and thrown away
 //! while the next one fills. That keeps memory flat however long the meeting
 //! runs, puts a transcript on screen before it ends, and costs at most one
-//! chunk if the app dies.
+//! stretch if the app dies.
 //!
 //! ```text
 //! meetings/<started>/
 //!   meta.json         title, started, ended, source
-//!   transcript.jsonl  one line per chunk: { at_ms, secs, text }
+//!   transcript.jsonl  one line per stretch: { at_ms, secs, text }
 //!   audio/000.wav     deleted as each one is transcribed
 //! ```
 //!
-//! JSONL because a meeting in progress is appended to every half minute: a
+//! JSONL because a meeting in progress is appended to every few seconds: a
 //! crash truncates one line instead of corrupting the file.
 
 use crate::settings::{self, Settings};
@@ -24,10 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// How much audio goes into one chunk. Long enough that whisper has context
-/// to work with, short enough that the transcript keeps up with the room.
-const CHUNK_SECS: f32 = 30.0;
-/// What whisper.cpp wants, and what the chunks are written as.
 const OUT_RATE: u32 = 16_000;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -62,11 +58,11 @@ pub struct Live {
     pub segments: Vec<Segment>,
     /// Set when a chunk failed to transcribe; the recording carries on.
     pub warning: Option<String>,
-    /// Loudest sample seen since the meeting started. Zero after the first
-    /// chunk means nothing is reaching the recorder at all, which is a very
+    /// Loudest sample seen since the meeting started. Still zero once samples
+    /// have arrived means nothing is reaching the recorder at all, which is a very
     /// different problem from a quiet room and has to be said differently.
     pub peak: f32,
-    pub chunks: usize,
+    pub samples: usize,
     /// Whether the microphone ever contributed anything. The aggregate can
     /// report a microphone and then deliver nothing from it, and a meeting
     /// that says "you and everyone on the call" when your side was never
@@ -234,7 +230,7 @@ impl Session {
             m.ended = Some(now());
             if let Ok(l) = self.live.lock() {
                 m.peak = l.peak;
-                if !l.heard_you && l.chunks > 0 {
+                if !l.heard_you && !no_audio_reached(l.samples) {
                     m.source = "Everyone on the call · your microphone was not captured".into();
                 }
             }
@@ -251,140 +247,52 @@ impl Drop for Session {
     }
 }
 
-/// Drain, chunk, write, transcribe, repeat. One worker: transcription is the
-/// slow part and running several at once only starves the machine the meeting
-/// is happening on.
 fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<AtomicBool>, s: Settings) {
     let rate = cap.rate;
-    let per_chunk = (rate * CHUNK_SECS as f64) as usize;
-    let mut mine: Vec<f32> = Vec::with_capacity(per_chunk);
-    let mut theirs: Vec<f32> = Vec::with_capacity(per_chunk);
+    let mut cutter = crate::cut::Cutter::new(rate);
     let mut index = 0usize;
-    let mut at_ms = 0u64;
     let started = std::time::Instant::now();
+    let transcribe = |wav: &[u8]| crate::engines::transcribe(&s, wav);
 
-    loop {
-        let ending = stop.load(Ordering::Relaxed);
-        let got = cap.drain();
-        mine.extend(got.mine);
-        theirs.extend(got.theirs);
-        if let Ok(mut l) = live.lock() {
-            l.elapsed = started.elapsed().as_secs_f32();
-        }
-
-        // Ending means ending: stop the device before collecting the rest,
-        // or every pass picks up another quarter second and writes another
-        // chunk for it - 133 of them, in the first run of this.
-        if ending {
-            cap.pause();
-            let last = cap.drain();
-            mine.extend(last.mine);
-            theirs.extend(last.theirs);
-        }
-        let have = mine.len().max(theirs.len());
-        let full = have >= per_chunk;
-        if full || (ending && have > 0) {
-            let take = if full { per_chunk } else { have };
-            let a: Vec<f32> = mine.drain(..take.min(mine.len())).collect();
-            let b: Vec<f32> = theirs.drain(..take.min(theirs.len())).collect();
-            let secs = take as f32 / rate as f32;
-
-            let you = to_16k(&a, rate);
-            let them = to_16k(&b, rate);
-            let level = |v: &[f32]| {
-                let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt();
-                let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-                (peak, rms)
-            };
-            let (you_peak, you_rms) = level(&you);
-            let (them_peak, them_rms) = level(&them);
-
-            // Two sides only when there really are two. The device can stop
-            // handing over the layout it was opened with - a microphone
-            // dropping out of the aggregate mid-meeting - and the channels
-            // then carry the same audio twice. Measured, not assumed: if the
-            // two are identical there is nothing to tell apart, whatever the
-            // channel count says.
-            let identical = !you.is_empty()
-                && you.len() == them.len()
-                && you.iter().zip(them.iter()).all(|(a, b)| (a - b).abs() < 1e-9);
-            if identical || !cap.split_ok() {
-                log(&dir, "    one source only: not splitting this chunk");
-            }
-            // Transcribe whichever side was talking rather than the mix. On
-            // speakers the microphone hears the call a few milliseconds
-            // late, so a mixed track carries everything twice and whisper
-            // sometimes writes it twice; one side alone does not.
-            let (voice, samples) = if identical || !cap.split_ok() {
-                ("both", if them.is_empty() { you } else { them })
-            } else if you_rms > them_rms * 2.5 {
-                ("you", you)
-            } else if them_rms > you_rms * 2.5 {
-                ("them", them)
-            } else {
-                let n = you.len().min(them.len());
-                ("both", (0..n).map(|i| (you[i] + them[i]) * 0.5).collect())
-            };
-            let (peak, rms) = level(&samples);
-
-            let path = dir.join("audio").join(format!("{index:03}.wav"));
-            let wav = wav_16k_mono(&samples);
-            let _ = std::fs::write(&path, &wav);
-            log(
-                &dir,
-                &format!(
-                    "{index:03} {secs:5.1}s {voice:<4} you {you_peak:.3}/{you_rms:.4}  them {them_peak:.3}/{them_rms:.4}"
-                ),
-            );
-            if let Ok(mut l) = live.lock() {
-                l.peak = l.peak.max(peak);
-                l.chunks += 1;
-                l.heard_you |= you_rms > 0.001;
-            }
-            // Two conditions, because one threshold could not separate the
-            // cases seen so far: speech at peak 0.43, a noisy tail at 0.036
-            // that hallucinated "Akuipito", a quieter one at 0.021 that
-            // hallucinated a whole sentence. Anything below 0.03 is the noise
-            // floor, and a short tail has to be obviously speech to count -
-            // that is where the inventions live.
-            if peak < 0.03 || rms < 0.002 || (secs < 5.0 && peak < 0.10) {
-                log(&dir, "    skipped: too quiet to be speech");
-                let _ = std::fs::remove_file(&path);
-                at_ms += (secs * 1000.0) as u64;
-                index += 1;
-                if ending && mine.is_empty() && theirs.is_empty() {
-                    break;
-                }
-                continue;
-            }
-
-            match crate::engines::transcribe(&s, &wav) {
-                Ok(text) if !text.trim().is_empty() => {
-                    log(&dir, &format!("    {voice}: {}", text.trim().chars().take(60).collect::<String>()));
-                    let seg = Segment { at_ms, secs, text: text.trim().to_string(), voice: voice.to_string() };
-                    append_segment(&dir, &seg);
+    let mut process = |stretches: Vec<crate::cut::Stretch>| {
+        for st in stretches {
+            match handle_stretch(&dir, index, &st, rate, &transcribe) {
+                Ok(Some(seg)) => {
                     if let Ok(mut l) = live.lock() {
                         l.segments.push(seg);
                     }
                 }
-                Ok(text) => log(&dir, &format!("    transcribed to nothing ({} chars raw)", text.len())),
+                Ok(None) => {}
                 Err(e) => {
-                    log(&dir, &format!("    failed: {e}"));
                     if let Ok(mut l) = live.lock() {
                         l.warning = Some(e);
                     }
                 }
             }
-            // The transcript is the thing worth keeping; the audio is 1.9 MB
-            // a minute and a week of meetings would fill a disk.
-            let _ = std::fs::remove_file(&path);
-            at_ms += (secs * 1000.0) as u64;
             index += 1;
-            continue;
         }
+    };
+
+    loop {
+        let ending = stop.load(Ordering::Relaxed);
+        let mut got = cap.drain();
         if ending {
+            cap.pause();
+            let last = cap.drain();
+            got.mine.extend(last.mine);
+            got.theirs.extend(last.theirs);
+        }
+        if let Ok(mut l) = live.lock() {
+            l.elapsed = started.elapsed().as_secs_f32();
+            l.samples += got.mine.len().max(got.theirs.len());
+            l.heard_you |= rms(&got.mine) > 0.001;
+            l.peak = l.peak.max(peak(&got.mine)).max(peak(&got.theirs));
+        }
+        process(cutter.push(&got.mine, &got.theirs, cap.split_ok()));
+        if ending {
+            process(cutter.flush().into_iter().collect());
             if let Ok(mut l) = live.lock() {
-                if l.chunks == 0 {
+                if no_audio_reached(l.samples) {
                     l.warning = Some("No audio reached the recorder.".into());
                     log(&dir, "no audio arrived at all");
                 }
@@ -392,6 +300,56 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn no_audio_reached(samples: usize) -> bool {
+    samples == 0
+}
+
+fn peak(v: &[f32]) -> f32 {
+    v.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+fn rms(v: &[f32]) -> f32 {
+    (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+}
+
+fn handle_stretch(
+    dir: &Path,
+    index: usize,
+    st: &crate::cut::Stretch,
+    rate: f64,
+    transcribe: &dyn Fn(&[u8]) -> Result<String, String>,
+) -> Result<Option<Segment>, String> {
+    let samples = to_16k(&st.samples, rate);
+    let (loudest, level) = (peak(&samples), rms(&samples));
+    log(dir, &format!("{index:03} {:5.1}s {:<4} peak {loudest:.3} rms {level:.4} voiced {:.1}s", st.secs, st.voice, st.voiced_secs));
+    if !crate::cut::worth_transcribing(loudest, level, st.voiced_secs) {
+        log(dir, "    skipped: too quiet to be speech");
+        return Ok(None);
+    }
+
+    let path = dir.join("audio").join(format!("{index:03}.wav"));
+    let wav = wav_16k_mono(&samples);
+    let _ = std::fs::write(&path, &wav);
+    let result = transcribe(&wav);
+    let _ = std::fs::remove_file(&path);
+    match result {
+        Ok(text) if !text.trim().is_empty() => {
+            log(dir, &format!("    {}: {}", st.voice, text.trim().chars().take(60).collect::<String>()));
+            let seg = Segment { at_ms: (st.start_secs * 1000.0).round() as u64, secs: st.secs, text: text.trim().to_string(), voice: st.voice.to_string() };
+            append_segment(dir, &seg);
+            Ok(Some(seg))
+        }
+        Ok(text) => {
+            log(dir, &format!("    transcribed to nothing ({} chars raw)", text.len()));
+            Ok(None)
+        }
+        Err(e) => {
+            log(dir, &format!("    failed: {e}"));
+            Err(e)
+        }
     }
 }
 
@@ -639,4 +597,74 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
     };
     let _ = std::fs::write(summary_path(id), serde_json::to_string_pretty(&out).unwrap_or_default());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cut::Stretch;
+
+    const RATE: f64 = 48_000.0;
+
+    fn temp_meeting(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opendictate-meeting-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        dir
+    }
+
+    fn stretch(amplitude: f32, voiced_secs: f32) -> Stretch {
+        let samples = (0..(2.0 * RATE) as usize)
+            .map(|i| amplitude * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / RATE as f32).sin())
+            .collect();
+        Stretch { voice: "them", samples, secs: 2.0, voiced_secs, start_secs: 1.5 }
+    }
+
+    #[test]
+    fn appends_a_segment_with_the_stretch_voice_to_the_transcript() {
+        let dir = temp_meeting("appends");
+        let seg = handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!((seg.text.as_str(), seg.voice.as_str(), seg.at_ms), ("hello", "them", 1_500));
+        let line = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        let parsed: Segment = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!((parsed.text.as_str(), parsed.voice.as_str()), ("hello", "them"));
+        assert!(!dir.join("audio/000.wav").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_a_stretch_too_quiet_to_be_speech_without_calling_whisper() {
+        let dir = temp_meeting("quiet");
+        let r = handle_stretch(&dir, 0, &stretch(0.01, 2.0), RATE, &|_| panic!("whisper was called"));
+        assert!(matches!(r, Ok(None)));
+        assert!(!dir.join("audio/000.wav").exists());
+        assert!(!dir.join("transcript.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_silent_meeting_is_not_reported_as_no_audio() {
+        assert!(!no_audio_reached(48_000 * 60));
+    }
+
+    #[test]
+    fn a_meeting_where_no_samples_arrive_is_reported_as_no_audio() {
+        assert!(no_audio_reached(0));
+    }
+
+    #[test]
+    fn reports_a_transcription_failure_and_still_deletes_the_audio() {
+        let dir = temp_meeting("fails");
+        let wav = dir.join("audio/000.wav");
+        let r = handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| {
+            assert!(wav.exists(), "audio was not written before transcribing");
+            Err("boom".into())
+        });
+        assert_eq!(r.unwrap_err(), "boom");
+        assert!(!dir.join("audio/000.wav").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
