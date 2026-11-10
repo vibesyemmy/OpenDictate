@@ -10,6 +10,7 @@ mod settings;
 mod settings_view;
 mod stats;
 mod talking;
+mod talking_view;
 mod tap;
 mod theme;
 mod tray;

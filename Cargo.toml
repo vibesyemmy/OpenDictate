@@ -29,3 +29,6 @@ objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDictio
 objc2-core-audio = { version = "0.3", features = ["AudioHardware", "objc2", "objc2-core-audio-types", "objc2-foundation", "std"] }
 objc2-core-audio-types = { version = "0.3", features = ["CoreAudioBaseTypes"] }
 objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFString", "CFBase"] }
+
+[dev-dependencies]
+egui_kittest = "0.37"

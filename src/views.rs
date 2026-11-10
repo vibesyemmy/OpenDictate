@@ -1367,7 +1367,7 @@ fn history_row(app: &mut DictateApp, ui: &mut egui::Ui, e: &crate::settings::Ent
 // ---------------------------------------------------------------------------
 // Meetings
 
-fn hhmmss(secs: f32) -> String {
+pub fn hhmmss(secs: f32) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
