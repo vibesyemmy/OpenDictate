@@ -2,28 +2,30 @@
 """Does a downmixed call separate into speakers?
 
 This answers one question and then should be thrown away: when the far side
-of a meeting arrives as a single mixed stream, do speaker embeddings cluster
-by who was talking, or by nothing in particular? Everything else about
-speaker names - storing a signature, matching it next week, letting a model
-guess who "Priya" is - is cheap once that is known and worthless if the
-answer is no.
+of a meeting arrives as a single mixed stream, can it be told apart by voice?
+Everything else about speaker names - storing a signature, matching it next
+week, letting a model guess who "Priya" is - is cheap once that is known and
+worthless if the answer is no.
 
 It needs a meeting recorded with "Keep meeting audio" switched on in
 Settings > Audio input, because the app deletes each stretch the moment it
-has been transcribed and there is no way to run this on a meeting whose
-audio has gone.
+has been transcribed.
 
-Run:
-
-    uv run --with sherpa-onnx --with numpy \
+    uv run --python 3.12 --with sherpa-onnx --with numpy \
         experiments/speaker-clusters.py \
         --meeting ~/Library/Application\\ Support/Open\\ Dictate/meetings/<id> \
-        --model /path/to/embedding.onnx
+        --segmentation .../sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
+        --embedding   .../3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
 
-Models live at
-https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models
-- 3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx is a reasonable first
-try for English. Nothing is downloaded by this script.
+Both models come from https://github.com/k2-fsa/sherpa-onnx/releases
+(tags speaker-segmentation-models and speaker-recongition-models). Nothing
+is downloaded by this script.
+
+A first version of this took an embedding per fixed 1.5 s window and
+clustered those by hand. It reported two speakers - and fifteen at a 2 s
+window, and one at 3 s. Fixed windows straddle turns, so they measure the
+grid rather than the conversation. This uses the segmentation model to find
+where the turns actually are first, which is what that model is for.
 """
 
 import argparse
@@ -37,26 +39,23 @@ import numpy as np
 
 
 def read_wav(path):
-    """16 kHz mono float32, which is what the app writes and what the model wants."""
+    """16 kHz mono float32, which is what the app writes and the models want."""
     with wave.open(str(path), "rb") as w:
         if w.getsampwidth() != 2 or w.getnchannels() != 1:
             raise SystemExit(f"{path.name}: expected 16-bit mono, got {w.getsampwidth()*8}-bit {w.getnchannels()}ch")
-        rate = w.getframerate()
-        raw = w.readframes(w.getnframes())
-    return rate, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        return w.getframerate(), np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
 
 
 def labels_from_levels(meeting):
-    """index -> (voice, seconds, text), read out of the app's own levels.log.
+    """index -> {voice, secs, text}, out of the app's own levels.log.
 
-    The log is the only place the stretch index and the side it was assigned
-    to appear together, and the index is what the audio files are named by.
+    The only place the stretch index and the side it was assigned to appear
+    together, and the index is what the audio files are named by.
     """
-    out = {}
+    out, index = {}, None
     path = meeting / "levels.log"
     if not path.is_file():
         return out
-    index = None
     for line in path.read_text(errors="replace").splitlines():
         head = re.match(r"^(\d{3})\s+([\d.]+)s\s+(\S+)\s", line)
         if head:
@@ -69,67 +68,17 @@ def labels_from_levels(meeting):
     return out
 
 
-def embed_all(model, wavs):
-    import sherpa_onnx
-
-    config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model, num_threads=2, debug=False)
-    if not config.validate():
-        raise SystemExit(f"sherpa-onnx rejected the model at {model}")
-    extractor = sherpa_onnx.SpeakerEmbeddingExtractor(config)
-
-    vectors, kept = [], []
-    for path in wavs:
-        rate, samples = read_wav(path)
-        stream = extractor.create_stream()
-        stream.accept_waveform(sample_rate=rate, waveform=samples)
-        stream.input_finished()
-        if not extractor.is_ready(stream):
-            print(f"  {path.name}: too short for the model, skipped")
-            continue
-        v = np.asarray(extractor.compute(stream), dtype=np.float32)
-        n = np.linalg.norm(v)
-        if n == 0:
-            print(f"  {path.name}: empty embedding, skipped")
-            continue
-        vectors.append(v / n)
-        kept.append(path)
-    return np.vstack(vectors) if vectors else np.zeros((0, 0)), kept
-
-
-def cluster(sim, threshold):
-    """Average-linkage agglomerative clustering on a cosine similarity matrix.
-
-    Written out rather than pulled from scikit-learn: it is twenty lines, and
-    one fewer dependency on a machine that has to install them to run this.
-    """
-    groups = [[i] for i in range(sim.shape[0])]
-    while len(groups) > 1:
-        best, pair = -1.0, None
-        for a in range(len(groups)):
-            for b in range(a + 1, len(groups)):
-                s = float(np.mean(sim[np.ix_(groups[a], groups[b])]))
-                if s > best:
-                    best, pair = s, (a, b)
-        if best < threshold:
-            break
-        a, b = pair
-        groups[a] = groups[a] + groups[b]
-        groups.pop(b)
-    labels = np.zeros(sim.shape[0], dtype=int)
-    for n, g in enumerate(sorted(groups, key=len, reverse=True)):
-        for i in g:
-            labels[i] = n
-    return labels
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--meeting", required=True, type=pathlib.Path)
-    ap.add_argument("--model", required=True, type=pathlib.Path)
-    ap.add_argument("--side", default="them", choices=["them", "you", "both", "all"],
-                    help="which side to cluster; the far side is the one that needs it")
-    ap.add_argument("--threshold", type=float, default=0.5, help="stop merging below this cosine similarity")
+    ap.add_argument("--segmentation", required=True, type=pathlib.Path)
+    ap.add_argument("--embedding", required=True, type=pathlib.Path)
+    ap.add_argument("--side", default="them", choices=["them", "you", "both", "all"])
+    ap.add_argument("--speakers", type=int, default=0, help="how many people, if you know; 0 lets it decide")
+    ap.add_argument("--threshold", type=float, default=0.5, help="used only when --speakers is 0")
     args = ap.parse_args()
+
+    import sherpa_onnx
 
     audio = args.meeting / "audio"
     if not audio.is_dir() or not any(audio.glob("*.wav")):
@@ -145,38 +94,68 @@ def main():
     if not wavs:
         raise SystemExit(f"No stretches on the '{args.side}' side in this meeting.")
 
-    print(f"{len(wavs)} stretches on the '{args.side}' side")
-    vectors, kept = embed_all(str(args.model), wavs)
-    if len(kept) < 2:
-        raise SystemExit("Fewer than two usable stretches; nothing to compare.")
+    # One timeline, stretches in order, so the segmentation model sees a
+    # conversation rather than a pile of clips. Where each stretch landed is
+    # kept so its speakers can be read back against its transcript line.
+    rate, pieces, spans = None, [], []
+    for path in wavs:
+        r, samples = read_wav(path)
+        rate = rate or r
+        if r != rate:
+            raise SystemExit(f"{path.name}: {r} Hz among {rate} Hz")
+        start = sum(len(p) for p in pieces) / rate
+        pieces.append(samples)
+        spans.append((path.stem, start, start + len(samples) / rate))
+    joined = np.concatenate(pieces)
+    print(f"{len(wavs)} stretches on the '{args.side}' side, {len(joined)/rate:.0f}s in all")
 
-    sim = vectors @ vectors.T
-    groups = cluster(sim, args.threshold)
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=str(args.segmentation)),
+            num_threads=2,
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(args.embedding), num_threads=2),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=args.speakers if args.speakers > 0 else -1,
+            threshold=args.threshold,
+        ),
+        min_duration_on=0.3,
+        min_duration_off=0.5,
+    )
+    if not config.validate():
+        raise SystemExit("sherpa-onnx rejected the configuration; check both model paths")
 
-    print(f"\n{groups.max() + 1} cluster(s) at threshold {args.threshold}\n")
-    for path, g in zip(kept, groups):
-        meta = labels.get(int(path.stem), {})
-        print(f"  speaker {g}  {path.stem}  {meta.get('secs', 0):5.1f}s  {meta.get('text', '')[:58]}")
+    sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+    if sd.sample_rate != rate:
+        raise SystemExit(f"the models want {sd.sample_rate} Hz, the meeting is {rate} Hz")
 
-    same = np.array([sim[i, j] for i in range(len(kept)) for j in range(i + 1, len(kept)) if groups[i] == groups[j]])
-    diff = np.array([sim[i, j] for i in range(len(kept)) for j in range(i + 1, len(kept)) if groups[i] != groups[j]])
-    print("\nhow well it separated")
-    print(f"  within a speaker : {same.mean():.3f}" if same.size else "  within a speaker : n/a")
-    print(f"  between speakers : {diff.mean():.3f}" if diff.size else "  between speakers : n/a (one cluster)")
-    if same.size and diff.size:
-        print(f"  gap              : {same.mean() - diff.mean():.3f}   (bigger is better; under ~0.1 is not separation)")
+    result = sd.process(joined).sort_by_start_time()
+    segments = [(s.start, s.end, s.speaker) for s in result]
+    if not segments:
+        raise SystemExit("No speech segments came back at all.")
 
-    weak = [(kept[i].stem, float(np.max(np.delete(sim[i], i)))) for i in range(len(kept))]
-    weak = [w for w in weak if w[1] < args.threshold]
-    if weak:
-        print(f"\n{len(weak)} stretch(es) matched nothing above the threshold - overlapping speech, or a speaker heard once:")
-        for stem, s in weak:
-            print(f"  {stem}  best match {s:.3f}")
+    speakers = sorted({s for _, _, s in segments})
+    talk = {s: sum(e - b for b, e, who in segments if who == s) for s in speakers}
+    total = sum(talk.values())
+    print(f"\n{len(speakers)} speaker(s), {len(segments)} turns\n")
+    for s in speakers:
+        print(f"  speaker {s}: {talk[s]:6.1f}s  {talk[s]/total:4.0%} of the talking")
 
+    print("\nturns, against what was transcribed\n")
+    for stem, begin, end in spans:
+        inside = [(max(b, begin), min(e, end), who) for b, e, who in segments if e > begin and b < end]
+        who = "".join(f"{w}" for _, _, w in inside) or "-"
+        said = labels.get(int(stem), {}).get("text", "")
+        print(f"  {stem}  {begin:6.1f}-{end:6.1f}s  speakers {who}")
+        print(f"         {said[:72]}")
+
+    changes = sum(1 for i in range(1, len(segments)) if segments[i][2] != segments[i - 1][2])
+    print(f"\n{changes} speaker changes across {len(joined)/rate:.0f}s "
+          f"(about one every {len(joined)/rate/max(changes,1):.1f}s)")
     print(
-        "\nNow compare the speaker numbers above against who actually spoke.\n"
-        "If they line up, storing a signature per speaker is worth building.\n"
-        "If they do not, nothing downstream of this will work either."
+        "\nRead the turns above against the recording. If the speaker numbers\n"
+        "track who was actually talking, a stored signature per speaker is\n"
+        "worth building. If they do not, nothing downstream of this works."
     )
 
 
