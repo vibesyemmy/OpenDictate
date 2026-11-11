@@ -538,6 +538,15 @@ impl DictateApp {
                 if self.open_meeting.as_deref() == Some(id.as_str()) {
                     self.open_summary = Some(summary);
                 }
+                // The last step of a summary renames the meeting on disk, so
+                // the list and the open header are both out of date the
+                // moment it lands. Without this the new title only appeared
+                // after leaving Meetings and coming back, which is the one
+                // thing you would not think to do.
+                self.refresh_meetings();
+                if self.open_meeting.as_deref() == Some(id.as_str()) {
+                    self.open_meta = self.meeting_list.iter().find(|m| m.id == id).cloned();
+                }
                 self.notify("Meeting summarised", false);
             }
             Err(e) => self.notify(e, true),
