@@ -207,6 +207,10 @@ pub struct Settings {
     pub auto_paste: bool,
     pub restore_clipboard: bool,
     pub show_indicator: bool,
+    /// Open at login. Off for anyone upgrading: a background app that starts
+    /// itself without being asked is the sort of thing people uninstall over.
+    #[serde(default)]
+    pub start_at_login: bool,
     /// Set when someone declines the optional text model, so the notice about
     /// it stops asking. The notice that blocks dictation is not dismissible.
     pub hide_text_model_notice: bool,
@@ -322,6 +326,7 @@ impl Default for Settings {
             auto_paste: true,
             restore_clipboard: true,
             show_indicator: true,
+            start_at_login: false,
             hide_text_model_notice: false,
             typing_wpm: 40.0,
             keep_history: KeepHistory::Forever,

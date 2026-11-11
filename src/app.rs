@@ -277,6 +277,13 @@ impl DictateApp {
                 _ => {}
             }
         }
+        // Started by the login item, not by a person: come up in the menu
+        // bar with no window. Logging in is not a request to be shown
+        // anything, and a window across the desktop at every boot is the
+        // reason people turn a login item back off.
+        if args.iter().any(|a| a == "--hidden") {
+            app.window_open = false;
+        }
         app.prune_history();
         app.refresh_mics();
         if app.shot.is_none() {
@@ -288,6 +295,13 @@ impl DictateApp {
             }
         }
         app.check_health_and_start(&cc.egui_ctx);
+        // The login item carries the path to this binary, so it goes stale
+        // the moment the app is moved - out of Downloads into Applications,
+        // most often. Rewriting it on every launch keeps it pointing here.
+        #[cfg(target_os = "macos")]
+        if app.shot.is_none() {
+            crate::login_item::sync(app.s.start_at_login);
+        }
         app
     }
 
@@ -852,7 +866,6 @@ impl DictateApp {
             }
         });
     }
-
 
     /// (ready, short label) for the speech model.
     pub fn speech_ready(&self) -> (bool, String) {
