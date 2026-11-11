@@ -287,7 +287,7 @@ impl DictateApp {
                 app.tray_rx = Some(rx);
             }
         }
-        app.refresh_health(&cc.egui_ctx);
+        app.check_health_and_start(&cc.egui_ctx);
         app
     }
 
@@ -812,6 +812,20 @@ impl DictateApp {
     // Model health
 
     pub fn refresh_health(&self, ctx: &egui::Context) {
+        self.check_health(ctx, false);
+    }
+
+    /// The launch-time check, which also starts Ollama if it is not up.
+    ///
+    /// Ollama does not run on its own, so the first dictation after a reboot
+    /// used to fail - or the Models tab sat on "Ollama not running" until you
+    /// found the Start Ollama button and pressed it yourself. The app knows
+    /// it needs the server, so it asks for it.
+    pub fn check_health_and_start(&self, ctx: &egui::Context) {
+        self.check_health(ctx, true);
+    }
+
+    fn check_health(&self, ctx: &egui::Context, autostart: bool) {
         let s = self.s.clone();
         let health = self.health.clone();
         let ctx = ctx.clone();
@@ -823,10 +837,22 @@ impl DictateApp {
                     .then(|| engines::openai_models(&s.text_url, &s.text_key)),
                 checked: true,
             };
+            // Publish what we found before going off to start anything: the
+            // wait below can run for seconds, and the rest of this - the
+            // speech model, a remote endpoint - is known now and the window
+            // is already asking for it.
+            let down = s.text_engine == TextEngine::Ollama && matches!(h.ollama, Some(Err(_)));
             *health.lock().unwrap() = h;
             ctx.request_repaint();
+
+            if autostart && down {
+                let started = engines::start_ollama_and_wait(&s.ollama_url);
+                health.lock().unwrap().ollama = Some(started);
+                ctx.request_repaint();
+            }
         });
     }
+
 
     /// (ready, short label) for the speech model.
     pub fn speech_ready(&self) -> (bool, String) {
