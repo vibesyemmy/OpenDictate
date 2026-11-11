@@ -350,7 +350,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
 
     let mut process = |stretches: Vec<crate::cut::Stretch>| {
         for st in stretches {
-            match handle_stretch(&dir, index, &st, rate, &transcribe) {
+            match handle_stretch(&dir, index, &st, rate, &transcribe, s.keep_meeting_audio) {
                 Ok(Some(seg)) => {
                     if let Ok(mut l) = live.lock() {
                         l.segments.push(seg);
@@ -425,6 +425,7 @@ fn handle_stretch(
     st: &crate::cut::Stretch,
     rate: f64,
     transcribe: &dyn Fn(&[u8]) -> Result<String, String>,
+    keep_audio: bool,
 ) -> Result<Option<Segment>, String> {
     let samples = to_16k(&st.samples, rate);
     let (loudest, level) = (peak(&samples), rms(&samples));
@@ -438,7 +439,13 @@ fn handle_stretch(
     let wav = wav_16k_mono(&samples);
     let _ = std::fs::write(&path, &wav);
     let result = transcribe(&wav);
-    let _ = std::fs::remove_file(&path);
+    // Normally this is where a stretch's audio goes: 1.9 MB a minute, and a
+    // week of meetings would fill a disk. Kept only when asked for, and only
+    // so speaker separation can be tried against a real call - there is no
+    // way to try it on a meeting whose audio has already gone.
+    if !keep_audio {
+        let _ = std::fs::remove_file(&path);
+    }
     match result {
         Ok(text) if !text.trim().is_empty() => {
             log(dir, &format!("    {}: {}", st.voice, text.trim().chars().take(60).collect::<String>()));
@@ -1127,6 +1134,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn keeping_the_audio_leaves_the_stretch_on_disk() {
+        let dir = temp_meeting("keep-audio");
+        handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()), true).unwrap();
+        assert!(dir.join("audio/000.wav").exists(), "the stretch was deleted despite being asked for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn temp_meeting(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("opendictate-meeting-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1144,7 +1159,7 @@ mod tests {
     #[test]
     fn appends_a_segment_with_the_stretch_voice_to_the_transcript() {
         let dir = temp_meeting("appends");
-        let seg = handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()))
+        let seg = handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()), false)
             .unwrap()
             .unwrap();
         assert_eq!((seg.text.as_str(), seg.voice.as_str(), seg.at_ms), ("hello", "them", 1_500));
@@ -1159,7 +1174,7 @@ mod tests {
     #[test]
     fn skips_a_stretch_too_quiet_to_be_speech_without_calling_whisper() {
         let dir = temp_meeting("quiet");
-        let r = handle_stretch(&dir, 0, &stretch(0.01, 2.0), RATE, &|_| panic!("whisper was called"));
+        let r = handle_stretch(&dir, 0, &stretch(0.01, 2.0), RATE, &|_| panic!("whisper was called"), false);
         assert!(matches!(r, Ok(None)));
         assert!(!dir.join("audio/000.wav").exists());
         assert!(!dir.join("transcript.jsonl").exists());
@@ -1180,10 +1195,17 @@ mod tests {
     fn reports_a_transcription_failure_and_still_deletes_the_audio() {
         let dir = temp_meeting("fails");
         let wav = dir.join("audio/000.wav");
-        let r = handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| {
-            assert!(wav.exists(), "audio was not written before transcribing");
-            Err("boom".into())
-        });
+        let r = handle_stretch(
+            &dir,
+            0,
+            &stretch(0.3, 2.0),
+            RATE,
+            &|_| {
+                assert!(wav.exists(), "audio was not written before transcribing");
+                Err("boom".into())
+            },
+            false,
+        );
         assert_eq!(r.unwrap_err(), "boom");
         assert!(!dir.join("audio/000.wav").exists());
         let _ = std::fs::remove_dir_all(&dir);

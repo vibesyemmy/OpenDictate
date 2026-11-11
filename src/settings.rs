@@ -207,6 +207,12 @@ pub struct Settings {
     pub auto_paste: bool,
     pub restore_clipboard: bool,
     pub show_indicator: bool,
+    /// Keeps each meeting stretch's audio instead of deleting it once it has
+    /// been transcribed. Off, and meant to be put back off: a meeting is
+    /// 1.9 MB a minute. It exists so speaker separation can be tried against
+    /// real calls, which cannot be done on a meeting whose audio is gone.
+    #[serde(default)]
+    pub keep_meeting_audio: bool,
     /// Open at login. Off for anyone upgrading: a background app that starts
     /// itself without being asked is the sort of thing people uninstall over.
     #[serde(default)]
@@ -326,6 +332,7 @@ impl Default for Settings {
             auto_paste: true,
             restore_clipboard: true,
             show_indicator: true,
+            keep_meeting_audio: false,
             start_at_login: false,
             hide_text_model_notice: false,
             typing_wpm: 40.0,

@@ -802,6 +802,20 @@ fn audio_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             app.toggle_mic_test();
         }
     }
+    section(ui, crate::icon::FLASK, "Speaker testing");
+    row(
+        ui,
+        "Keep meeting audio",
+        "Normally a meeting's audio is deleted the moment it has been transcribed. Keeping it lets speaker separation be tried against a real call - there is no way to try it on a meeting whose audio has gone. It is 1.9 MB a minute, so turn it back off afterwards.",
+        260.0,
+        |ui| {
+            if crate::views::kit_checkbox(ui, &mut app.s.keep_meeting_audio).changed() {
+                app.changed();
+            }
+        },
+    );
+    ui.add_space(14.0);
+
     section(ui, crate::icon::LOCK, "Permission");
     row(
         ui,
