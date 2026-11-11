@@ -471,39 +471,51 @@ pub struct Progress {
 
 pub type SharedProgress = Arc<Mutex<Progress>>;
 
+/// Streams `url` into `part`, reporting (bytes so far, bytes in all) as it
+/// goes. Leaves the file where it is for the caller to check and rename:
+/// whisper models are trusted as they come, but the speaker models are loaded
+/// by native code and are hashed before they are let in.
+pub(crate) fn fetch_part(url: &str, part: &Path, mut on_bytes: impl FnMut(u64, u64)) -> Result<(), String> {
+    let resp = agent(3600).get(url).call().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Download failed ({})", resp.status()));
+    }
+    let total = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    on_bytes(0, total);
+    let mut out = std::fs::File::create(part).map_err(|e| e.to_string())?;
+    let mut reader = resp.into_body().into_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        done += n as u64;
+        on_bytes(done, total);
+    }
+    Ok(())
+}
+
 pub fn download_whisper(file: &str, progress: SharedProgress, ctx: eframe::egui::Context) {
     let file = file.to_string();
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
-            let resp = agent(3600).get(&url).call().map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("Download failed ({})", resp.status()));
-            }
-            let total = resp
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            progress.lock().unwrap().total = total;
             let dest = crate::settings::models_dir().join(&file);
             let part = dest.with_extension("part");
-            let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-            let mut reader = resp.into_body().into_reader();
-            let mut buf = vec![0u8; 1 << 16];
-            let mut done = 0u64;
-            loop {
-                let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-                done += n as u64;
-                progress.lock().unwrap().done = done;
+            fetch_part(&url, &part, |done, total| {
+                let mut p = progress.lock().unwrap();
+                p.total = total;
+                p.done = done;
                 ctx.request_repaint();
-            }
-            drop(out);
+            })?;
             std::fs::rename(part, dest).map_err(|e| e.to_string())?;
             Ok(())
         })();

@@ -213,6 +213,15 @@ pub struct Settings {
     /// real calls, which cannot be done on a meeting whose audio is gone.
     #[serde(default)]
     pub keep_meeting_audio: bool,
+    /// Tells the people on the far side of a meeting apart. Off until asked
+    /// for, because it needs a 30 MB voice model, holds a meeting's audio
+    /// until the meeting is over, and spends a few minutes of CPU after it.
+    #[serde(default)]
+    pub label_speakers: bool,
+    /// How many people are on the far side. The model cannot count - it found
+    /// fourteen in a recording of two - so this is said, per meeting if need be.
+    #[serde(default = "two_speakers")]
+    pub speaker_count: u8,
     /// Open at login. Off for anyone upgrading: a background app that starts
     /// itself without being asked is the sort of thing people uninstall over.
     #[serde(default)]
@@ -226,6 +235,10 @@ pub struct Settings {
     pub appearance: Appearance,
 
     pub dictionary: Vec<DictWord>,
+}
+
+fn two_speakers() -> u8 {
+    2
 }
 
 fn meeting_default() -> Vec<String> {
@@ -333,6 +346,8 @@ impl Default for Settings {
             restore_clipboard: true,
             show_indicator: true,
             keep_meeting_audio: false,
+            label_speakers: false,
+            speaker_count: 2,
             start_at_login: false,
             hide_text_model_notice: false,
             typing_wpm: 40.0,

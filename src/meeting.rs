@@ -11,7 +11,8 @@
 //! meetings/<started>/
 //!   meta.json         title, started, ended, source
 //!   transcript.jsonl  one line per stretch: { at_ms, secs, text }
-//!   audio/000.wav     deleted as each one is transcribed
+//!   audio/<ms>.wav    deleted as each one is transcribed, or once its
+//!                     speakers are told apart if that is switched on
 //! ```
 //!
 //! JSONL because a meeting in progress is appended to every few seconds: a
@@ -113,6 +114,40 @@ pub fn transcript(id: &str) -> Vec<Segment> {
         .lines()
         .filter_map(|l| serde_json::from_str::<Segment>(l).ok())
         .collect()
+}
+
+/// What a kept stretch's audio file is called: when it began, in
+/// milliseconds, padded so a directory listing is in time order. A transcript
+/// line carries the same number, which is how a line finds its own audio
+/// without the transcript having to remember a file name.
+pub fn stretch_file(at_ms: u64) -> String {
+    format!("{at_ms:09}.wav")
+}
+
+/// Deletes the audio kept for a meeting. The folder stays: it is where the
+/// next recording of anything would expect to write.
+pub fn clear_audio(id: &str) {
+    if id.contains('/') || id.contains("..") {
+        return;
+    }
+    let Ok(files) = std::fs::read_dir(root().join(id).join("audio")) else { return };
+    for f in files.filter_map(|f| f.ok()).map(|f| f.path()) {
+        if f.extension().is_some_and(|x| x == "wav") {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+/// Deletes audio left behind by meetings that have finished, at 1.9 MB a
+/// minute. A meeting only holds on to it between its last word and its
+/// speakers being told apart, so anything still there when the app starts is
+/// from one that did not get as far - a crash, a quit mid-labelling.
+pub fn sweep_audio() {
+    for m in list() {
+        if m.ended.is_some() {
+            clear_audio(&m.id);
+        }
+    }
 }
 
 /// Rewrites one line of a transcript.
@@ -336,6 +371,11 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
     let mut index = 0usize;
     let started = std::time::Instant::now();
     let server = std::cell::RefCell::new(start_server(&s, &dir, &stop));
+    // Audio is kept past its transcription in two cases: for good, if asked
+    // for, or until the meeting is over, so that its far side can be told
+    // apart then. The second is only worth doing if there is a model to do it
+    // with - holding 1.9 MB a minute for nothing is not a favour.
+    let retain = s.keep_meeting_audio || (s.label_speakers && crate::speakers::model_path().is_some());
     let transcribe = |wav: &[u8]| {
         let mut server = server.borrow_mut();
         let text = crate::whisper_server::transcribe_stretch(
@@ -350,7 +390,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
 
     let mut process = |stretches: Vec<crate::cut::Stretch>| {
         for st in stretches {
-            match handle_stretch(&dir, index, &st, rate, &transcribe, s.keep_meeting_audio) {
+            match handle_stretch(&dir, index, &st, rate, &transcribe, retain) {
                 Ok(Some(seg)) => {
                     if let Ok(mut l) = live.lock() {
                         l.segments.push(seg);
@@ -425,7 +465,7 @@ fn handle_stretch(
     st: &crate::cut::Stretch,
     rate: f64,
     transcribe: &dyn Fn(&[u8]) -> Result<String, String>,
-    keep_audio: bool,
+    retain: bool,
 ) -> Result<Option<Segment>, String> {
     let samples = to_16k(&st.samples, rate);
     let (loudest, level) = (peak(&samples), rms(&samples));
@@ -435,21 +475,22 @@ fn handle_stretch(
         return Ok(None);
     }
 
-    let path = dir.join("audio").join(format!("{index:03}.wav"));
+    let at_ms = (st.start_secs * 1000.0).round() as u64;
+    let path = dir.join("audio").join(stretch_file(at_ms));
     let wav = wav_16k_mono(&samples);
     let _ = std::fs::write(&path, &wav);
     let result = transcribe(&wav);
     // Normally this is where a stretch's audio goes: 1.9 MB a minute, and a
-    // week of meetings would fill a disk. Kept only when asked for, and only
-    // so speaker separation can be tried against a real call - there is no
-    // way to try it on a meeting whose audio has already gone.
-    if !keep_audio {
+    // week of meetings would fill a disk. It is kept only while the meeting
+    // is being recorded, if its speakers are to be told apart afterwards, or
+    // for good if asked for.
+    if !retain {
         let _ = std::fs::remove_file(&path);
     }
     match result {
         Ok(text) if !text.trim().is_empty() => {
             log(dir, &format!("    {}: {}", st.voice, text.trim().chars().take(60).collect::<String>()));
-            let seg = Segment { at_ms: (st.start_secs * 1000.0).round() as u64, secs: st.secs, text: text.trim().to_string(), voice: st.voice.to_string() };
+            let seg = Segment { at_ms, secs: st.secs, text: text.trim().to_string(), voice: st.voice.to_string() };
             append_segment(dir, &seg);
             Ok(Some(seg))
         }
@@ -1271,7 +1312,7 @@ mod tests {
     fn keeping_the_audio_leaves_the_stretch_on_disk() {
         let dir = temp_meeting("keep-audio");
         handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()), true).unwrap();
-        assert!(dir.join("audio/000.wav").exists(), "the stretch was deleted despite being asked for");
+        assert!(dir.join("audio").join(stretch_file(1500)).exists(), "the stretch was deleted despite being asked for");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1337,7 +1378,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
         let parsed: Segment = serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!((parsed.text.as_str(), parsed.voice.as_str()), ("hello", "them"));
-        assert!(!dir.join("audio/000.wav").exists());
+        assert!(!dir.join("audio").join(stretch_file(1500)).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1346,7 +1387,7 @@ mod tests {
         let dir = temp_meeting("quiet");
         let r = handle_stretch(&dir, 0, &stretch(0.01, 2.0), RATE, &|_| panic!("whisper was called"), false);
         assert!(matches!(r, Ok(None)));
-        assert!(!dir.join("audio/000.wav").exists());
+        assert!(!dir.join("audio").join(stretch_file(1500)).exists());
         assert!(!dir.join("transcript.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1364,7 +1405,7 @@ mod tests {
     #[test]
     fn reports_a_transcription_failure_and_still_deletes_the_audio() {
         let dir = temp_meeting("fails");
-        let wav = dir.join("audio/000.wav");
+        let wav = dir.join("audio").join(stretch_file(1500));
         let r = handle_stretch(
             &dir,
             0,
@@ -1377,7 +1418,7 @@ mod tests {
             false,
         );
         assert_eq!(r.unwrap_err(), "boom");
-        assert!(!dir.join("audio/000.wav").exists());
+        assert!(!dir.join("audio").join(stretch_file(1500)).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

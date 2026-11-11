@@ -10,6 +10,7 @@ mod meeting;
 mod macos_look;
 mod search;
 mod settings;
+mod speakers;
 mod settings_view;
 mod stats;
 mod talking;
@@ -166,6 +167,10 @@ fn main() -> eframe::Result<()> {
                 }
             }
         }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--speakers-check") {
+        print!("{}", speakers::check(&args));
         return Ok(());
     }
     if args.iter().any(|a| a == "--tap-check") {
