@@ -236,12 +236,66 @@ unsafe fn device_uid(device: AudioObjectID) -> String {
     if uid.is_null() { String::new() } else { (*uid).to_string() }
 }
 
-/// The Core Audio id of the system's default input, for putting the
-/// microphone inside the same device as the tap.
+unsafe fn device_name(device: AudioObjectID) -> String {
+    let mut name: *const CFString = std::ptr::null();
+    get(device, kAudioObjectPropertyName, &mut name);
+    if name.is_null() { String::new() } else { (*name).to_string() }
+}
+
+/// Every Core Audio device that can record, with the name it shows under.
+fn input_devices() -> Vec<(AudioObjectID, String)> {
+    unsafe {
+        let a = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size = 0u32;
+        if AudioObjectGetPropertyDataSize(kAudioObjectSystemObject as u32, NonNull::from(&a), 0, std::ptr::null(), NonNull::from(&mut size)) != 0 {
+            return Vec::new();
+        }
+        let mut ids = vec![0 as AudioObjectID; size as usize / std::mem::size_of::<AudioObjectID>()];
+        if ids.is_empty()
+            || AudioObjectGetPropertyData(
+                kAudioObjectSystemObject as u32,
+                NonNull::from(&a),
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut size),
+                NonNull::new(ids.as_mut_ptr() as *mut c_void).unwrap(),
+            ) != 0
+        {
+            return Vec::new();
+        }
+        ids.into_iter().filter(|d| input_channels(*d) > 0).map(|d| (d, device_name(d))).collect()
+    }
+}
+
+/// The Core Audio id of the microphone named in Audio input.
 ///
-/// The app's own microphone setting names a cpal device, and mapping that
-/// name onto a Core Audio id is a job of its own, so a meeting records
-/// whichever input the system is set to.
+/// cpal takes its device names straight from Core Audio, so the name stored
+/// in settings is the name this matches on. Nothing clever if it misses: a
+/// microphone that has been unplugged since it was chosen is simply not
+/// there, and the caller falls back.
+pub fn input_named(name: &str) -> Option<AudioObjectID> {
+    let want = name.trim();
+    if want.is_empty() {
+        return None;
+    }
+    input_devices().into_iter().find(|(_, n)| n == want).map(|(d, _)| d)
+}
+
+/// The microphone a meeting should record.
+///
+/// Audio input first, the system default second. Until now a meeting always
+/// took the system default, which is how a Mac set to record from a chosen
+/// microphone produced a meeting with nobody in it: the default input here
+/// was a device that hands over silence, while the chosen one worked.
+pub fn meeting_input(configured: &str) -> Option<AudioObjectID> {
+    input_named(configured).or_else(default_input)
+}
+
+/// The Core Audio id of the system's default input.
 pub fn default_input() -> Option<AudioObjectID> {
     unsafe {
         let mut dev: AudioObjectID = 0;
@@ -441,9 +495,15 @@ impl Drop for SystemCapture {
 /// can be told from one that works. Only a run from the installed bundle
 /// means anything about the permission: a bare binary inherits the TCC
 /// identity of whatever launched it.
-pub fn check(secs: u64) -> String {
+pub fn check(secs: u64, microphone: &str) -> String {
     let mut r = String::new();
-    match SystemCapture::start(default_input()) {
+    r.push_str(&format!(
+        "inputs: {:?}\nasked for: {microphone:?}\n",
+        input_devices().iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()
+    ));
+    // The same choice a meeting makes, or the check proves nothing about
+    // meetings.
+    match SystemCapture::start(meeting_input(microphone)) {
         Err(e) => r.push_str(&format!("{e}\nVERDICT: no system audio.\n")),
         Ok(cap) => {
             r.push_str(&format!("opened at {} Hz\n", cap.rate));
