@@ -104,6 +104,9 @@ pub struct DictateApp {
     pub hist_filter: Option<Action>,
     pub expanded: Option<u64>,
     pub editing: Option<(u64, String)>,
+    /// The transcript line being corrected, keyed by its start in
+    /// milliseconds: (at_ms, the text as it is being typed).
+    pub editing_line: Option<(u64, String)>,
 
     pub toast: Option<Toast>,
     told_no_cleanup: bool,
@@ -230,6 +233,7 @@ impl DictateApp {
             hist_filter: None,
             expanded: None,
             editing: None,
+            editing_line: None,
             toast: None,
             told_no_cleanup: false,
             dirty: false,
@@ -555,6 +559,8 @@ impl DictateApp {
 
     /// Opens a stored meeting, reading it from disk once.
     pub fn open_meeting(&mut self, id: String) {
+        // A half-typed correction belongs to the meeting it was started in.
+        self.editing_line = None;
         self.open_summary = crate::meeting::summary(&id);
         self.open_segments = crate::meeting::transcript(&id);
         self.refresh_meetings();

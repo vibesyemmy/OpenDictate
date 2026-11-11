@@ -1456,7 +1456,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ));
             }
             for seg in segments.iter().rev() {
-                transcript_line(ui, seg, w);
+                transcript_line(app, ui, seg, w, false);
             }
             if stop {
                 app.toggle_meeting();
@@ -1520,6 +1520,18 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                     ui.add_space(12.0);
                     ui.label(t(format!("Written by {}", sum.model), 12.0, theme::FAINT()));
                 });
+                ui.add_space(8.0);
+                // A summary written from text that has since been corrected
+                // is quietly wrong, and the person who corrected it is the
+                // one who would never know.
+                ui.horizontal(|ui| {
+                    if btn(ui, "Summarise again").clicked() {
+                        app.start_summary(id.clone());
+                    }
+                    if crate::meeting::summary_is_stale(&id) {
+                        status(ui, State::Warn, "The transcript was corrected after this was written");
+                    }
+                });
                 ui.add_space(14.0);
             } else if !app.open_segments.is_empty() {
                 if btn(ui, "Summarise").clicked() {
@@ -1542,8 +1554,20 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ui.add_space(6.0);
                 ui.label(t("Levels for every chunk are in levels.log beside this transcript.", 12.5, theme::FAINT()));
             }
+            let mut correction = None;
             for seg in &segs {
-                transcript_line(ui, seg, w);
+                if transcript_line(app, ui, seg, w, true) {
+                    correction = app.editing_line.take();
+                }
+            }
+            if let Some((at, text)) = correction {
+                match crate::meeting::edit_segment(&id, at, text.trim()) {
+                    Ok(()) => {
+                        app.open_segments = crate::meeting::transcript(&id);
+                        app.notify("Line corrected", false);
+                    }
+                    Err(e) => app.notify(e, true),
+                }
             }
             if delete {
                 crate::meeting::delete(&id);
@@ -1606,7 +1630,16 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
     });
 }
 
-fn transcript_line(ui: &mut egui::Ui, seg: &crate::meeting::Segment, w: f32) {
+/// One line of a transcript, correctable when the meeting is a stored one.
+///
+/// Returns true when Save was pressed, leaving the edited text in
+/// `app.editing_line` for the caller to write: this is inside a loop over a
+/// clone of the transcript, and the write reloads it.
+///
+/// A live meeting is not editable. Its lines are still arriving, and the
+/// file is being appended to underneath them.
+fn transcript_line(app: &mut DictateApp, ui: &mut egui::Ui, seg: &crate::meeting::Segment, w: f32, editable: bool) -> bool {
+    let mut saved = false;
     ui.horizontal_top(|ui| {
         ui.add_space(2.0);
         let (r, _) = ui.allocate_exact_size(vec2(88.0, 20.0), Sense::hover());
@@ -1634,10 +1667,47 @@ fn transcript_line(ui: &mut egui::Ui, seg: &crate::meeting::Segment, w: f32) {
                 colour,
             );
         }
-        ui.add(egui::Label::new(para(&seg.text, 14.0, theme::TEXT())).wrap());
+        let editing = app.editing_line.as_ref().is_some_and(|(at, _)| *at == seg.at_ms);
+        if editing {
+            ui.vertical(|ui| {
+                let width = ui.available_width();
+                if let Some((_, text)) = app.editing_line.as_mut() {
+                    let r = ui.add(egui::TextEdit::multiline(text).desired_width(width).desired_rows(2));
+                    // Enter saves, since a transcript line is one line and
+                    // nobody wants to reach for a button to fix a name.
+                    // Shift-Enter still breaks the line.
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+                        saved = true;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if btn(ui, "Save").clicked() {
+                        saved = true;
+                    }
+                    if btn(ui, "Cancel").clicked() {
+                        app.editing_line = None;
+                    }
+                    ui.label(t("Enter saves · Esc cancels", 12.0, theme::FAINT()));
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    app.editing_line = None;
+                }
+            });
+        } else {
+            let label = egui::Label::new(para(&seg.text, 14.0, theme::TEXT())).wrap();
+            let r = ui.add(if editable { label.sense(Sense::click()) } else { label });
+            if editable
+                && r.on_hover_cursor(egui::CursorIcon::Text)
+                    .on_hover_text("Click to correct this line")
+                    .clicked()
+            {
+                app.editing_line = Some((seg.at_ms, seg.text.clone()));
+            }
+        }
     });
     ui.add_space(10.0);
     let _ = w;
+    saved
 }
 
 // ---------------------------------------------------------------------------
