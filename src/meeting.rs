@@ -603,7 +603,8 @@ You get part of what was said, in order, and then the decisions and tasks found 
 Two or three sentences, plain and factual: what was talked about, then what was decided or \
 taken on. No bullet points, no preamble, no sign-off.\n\n\
 Only what the transcript and the list say. Mention a decision or a task only if it is in the \
-list. Never invent a project, a deadline, a team, a company or a next meeting.";
+list, and do not copy the list out: it is shown under its own headings. Never invent a \
+project, a deadline, a team, a company or a next meeting.";
 
 const NAME: &str = "You are naming a meeting from its summary, the way someone would \
 name it in a list of meetings.\n\n\
@@ -674,7 +675,7 @@ fn is_decision(line: &str) -> bool {
         .any(|w| l.contains(w))
 }
 
-fn is_action(line: &str) -> bool {
+fn is_action(line: &str, spoken: &str) -> bool {
     let l = line.to_lowercase();
     let commits = [
         "will ", "going to", "agreed to", "committed to", "needs to", "need to", "should ",
@@ -683,6 +684,14 @@ fn is_action(line: &str) -> bool {
     ]
     .iter()
     .any(|w| l.contains(w));
+    // What should have happened, or already has, is not a task: "It should
+    // have been worn that way" and "You've let yourself down tonight" were
+    // both under To do, the second on the strength of "tonight". A past
+    // agreement about something still to come keeps its "will".
+    let looking_back = ["should have", "would have", "could have", "might have", "must have", "'ve ", "\u{2019}ve "]
+        .iter()
+        .any(|p| l.contains(p));
+    let commits = commits && !(looking_back && !l.contains("will ") && !l.contains("going to"));
     // Or it opens with somebody's name and then what they are doing, which is
     // how a task is written when nobody says "will": "Dami writes up the
     // offer tonight". The capital alone is not a name - every sentence opens
@@ -701,8 +710,13 @@ fn is_action(line: &str) -> bool {
     // would otherwise read as someone called Installing doing something.
     // The odd surname that ends this way ("Manning takes the notes") moves
     // to the key points, which costs nothing.
+    // And a name is a word the transcript always writes with a capital.
+    // "Electrical vehicles only." opened its sentence, and the same
+    // recording says "an actual electrical vehicle spot" further on.
+    let said_lowercase = |w: &str| spoken.split(|c: char| !c.is_alphanumeric()).any(|x| x == w);
     let opens_with_name = words.first().is_some_and(|w| {
         capital(w)
+            && !said_lowercase(&bare(w).to_lowercase())
             && !(bare(w).len() > 5 && bare(w).ends_with("ing"))
             && !["The", "This", "That", "These", "Those", "There", "It", "We", "They", "You", "Someone", "Somebody", "And", "But", "His", "Her", "Their", "Our", "Its", "A", "An"]
                 .contains(&bare(w).as_str())
@@ -954,6 +968,117 @@ fn name_from(s: &Settings, model: Option<&str>, overview: &str, decisions: &[Str
     Some((title, subtitle))
 }
 
+/// How many single-letter changes two words can differ by and still be the
+/// same word.
+fn edits(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut prev = row[0];
+        row[0] = i;
+        for j in 1..=b.len() {
+            let here = row[j];
+            row[j] = (row[j] + 1).min(row[j - 1] + 1).min(prev + usize::from(a[i - 1] != b[j - 1]));
+            prev = here;
+        }
+    }
+    row[b.len()]
+}
+
+/// The names in `text` that nobody said: words capitalised in the middle of
+/// a sentence that appear nowhere in the transcript.
+///
+/// A small model knows things the meeting never mentioned and uses them.
+/// Summarising a recording that never named him, llama3.2:3b wrote that the
+/// bulb "was initially invented by Joseph Swan"; another summary handed out
+/// a task to "John", and the names whisper used to invent ("Danielle
+/// Pletka", "David Wright") came through into decisions and questions. A
+/// name is the one kind of word a summary has no business inventing, and
+/// the easiest kind to check.
+///
+/// The check allows for how the transcript was made. whisper splits words
+/// ("Envato Ele ments", "Graz iti Interactive") and the model joins them
+/// back; it spells a name one way and the model another ("de Molens", "de
+/// Molles"); and the model abbreviates what was said in full ("Artificial
+/// Intelligence (AI)"). A near spelling has to start with the same letter,
+/// so "Wright" is not excused by "right".
+fn names_outside(text: &str, spoken: &str) -> Vec<String> {
+    let said: Vec<String> = spoken
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let known: std::collections::HashSet<&str> = said.iter().map(String::as_str).collect();
+    let joined: std::collections::HashSet<String> = said.windows(2).map(|p| format!("{}{}", p[0], p[1])).collect();
+    let near = |w: &str| {
+        let n = w.chars().count();
+        let allowed = if n >= 6 { n / 3 } else if n >= 4 { 1 } else { 0 };
+        allowed > 0
+            && known.iter().any(|k| {
+                k.chars().next() == w.chars().next() && k.chars().count().abs_diff(n) <= allowed && edits(k, w) <= allowed
+            })
+    };
+    let acronym = |w: &str| {
+        let n = w.chars().count();
+        n >= 2 && w.chars().all(|c| c.is_uppercase() || c.is_ascii_digit()) && said.windows(n).any(|run| {
+            run.iter().filter_map(|x| x.chars().next()).collect::<String>() == w.to_lowercase()
+        })
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut sentence_start = true;
+    for token in text.split_whitespace() {
+        let quoted = token.starts_with(['"', '\u{201C}', '\'', '\u{2018}']);
+        let mut first = true;
+        for part in token.split(|c: char| !c.is_alphanumeric()).filter(|p| !p.is_empty()) {
+            let opening = first && (sentence_start || quoted);
+            first = false;
+            if opening || part.chars().count() < 2 || !part.chars().next().is_some_and(char::is_uppercase) {
+                continue;
+            }
+            if ["I", "Someone", "Somebody"].contains(&part) {
+                continue;
+            }
+            let lower = part.to_lowercase();
+            if known.contains(lower.as_str()) || joined.contains(&lower) || acronym(part) || near(&lower) {
+                continue;
+            }
+            if !out.iter().any(|o| o == part) {
+                out.push(part.to_string());
+            }
+        }
+        let end = token.trim_end_matches(['"', '\u{201D}', '\'', '\u{2019}', ')']);
+        sentence_start = end.ends_with(['.', '!', '?', ':']) || ["-", "*", "\u{2022}"].contains(&token);
+    }
+    out
+}
+
+/// `text` without the sentences that mention any of `names`.
+fn without_sentences_naming(text: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return text.to_string();
+    }
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            sentences.push(std::mem::take(&mut current));
+            continue;
+        }
+        current.push(c);
+        if ['.', '!', '?'].contains(&c) && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) {
+            sentences.push(std::mem::take(&mut current));
+        }
+    }
+    sentences.push(current);
+    sentences
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.split(|c: char| !c.is_alphanumeric()).any(|w| names.iter().any(|n| n == w)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What the model writing the overview is shown: always what was said, and
 /// the decisions and tasks when there are any.
 ///
@@ -972,8 +1097,15 @@ fn overview_request(decisions: &[String], actions: &[String], spoken: &str) -> (
     if decisions.is_empty() && actions.is_empty() {
         return (OVERVIEW_TALK, heard);
     }
-    let list = |items: &[String]| if items.is_empty() { "(nothing)".to_string() } else { items.join("\n") };
-    (OVERVIEW, format!("{heard}\n\nDecided:\n{}\n\nTaken on:\n{}", list(decisions), list(actions)))
+    // Only the headings that have something under them: handed "Decided:
+    // (nothing)", the model reported a decision to decide nothing.
+    let mut user = heard;
+    for (heading, items) in [("Decided", decisions), ("Taken on", actions)] {
+        if !items.is_empty() {
+            user.push_str(&format!("\n\n{heading}:\n{}", items.join("\n")));
+        }
+    }
+    (OVERVIEW, user)
 }
 
 /// Takes off what a model wraps an answer in.
@@ -992,8 +1124,11 @@ fn clean_overview(out: &str) -> String {
     }
     let mut kept = Vec::new();
     for line in out.lines() {
-        let l = line.trim_start().to_lowercase();
-        if l.starts_with("decided:") || l.starts_with("taken on:") {
+        // The copy comes under a heading - the request's own, or one the
+        // model makes up ("Decisions:", "Two tasks were taken on:").
+        let l = line.trim().to_lowercase();
+        let heading = l.ends_with(':') && l.split_whitespace().count() <= 6;
+        if l.starts_with("decided:") || l.starts_with("taken on:") || (heading && ["decision", "task", "action", "taken on", "decided"].iter().any(|w| l.contains(w))) {
             break;
         }
         kept.push(line);
@@ -1004,7 +1139,17 @@ fn clean_overview(out: &str) -> String {
 /// The opening paragraph of a summary, and the check that it is true.
 fn write_overview(s: &Settings, model: Option<&str>, decisions: &[String], actions: &[String], spoken: &str) -> Result<String, String> {
     let (system, user) = overview_request(decisions, actions, spoken);
-    let out = clean_overview(&crate::engines::chat_as(s, model, system, &[], &user)?);
+    // A name nobody said is the model's own knowledge. It does not do it
+    // every time, so it gets one more go; after that the sentences carrying
+    // such a name are taken out and the rest is kept.
+    let mut out = String::new();
+    for _ in 0..2 {
+        out = clean_overview(&crate::engines::chat_as(s, model, system, &[], &user)?);
+        if names_outside(&out, spoken).is_empty() {
+            break;
+        }
+    }
+    let out = without_sentences_naming(&out, &names_outside(&out, spoken));
     // A summary that is merely thin is worth keeping. One that describes a
     // meeting that did not happen is not, and it is worse than none at all
     // because it reads like the real thing.
@@ -1017,6 +1162,7 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         return Err("There is nothing in this meeting to summarise.".into());
     }
     let model = if s.meeting_model.trim().is_empty() { None } else { Some(s.meeting_model.trim()) };
+    let spoken: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
 
     // Blocks break where the speaker changes as well as on length, so every
     // block has one speaker and the model is never asked to tell them apart
@@ -1085,7 +1231,13 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
             // and "you will provide an update on your findings next week",
             // neither phrase appearing anywhere in what was said. Both score
             // 17% against the part they supposedly came from.
-            if (2..=22).contains(&n) && !describing && bucket.len() < per_block_cap && grounded(&item, block) {
+            // Nor may it name anyone the meeting did not: see `names_outside`.
+            if (2..=22).contains(&n)
+                && !describing
+                && bucket.len() < per_block_cap
+                && grounded(&item, block)
+                && names_outside(&item, &spoken).is_empty()
+            {
                 bucket.push(attribute(&item, voice));
             }
         }
@@ -1100,7 +1252,7 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         kept
     };
     let decisions = sift(decisions, &is_decision);
-    let actions = sift(actions, &is_action);
+    let actions = sift(actions, &|x: &str| is_action(x, &spoken));
     let questions = sift(questions, &is_question);
 
     let decisions = dedupe(decisions);
@@ -1116,7 +1268,6 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         decisions.join("\n"),
         actions.join("\n")
     );
-    let spoken: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
 
     // A talk, a lecture or a call that settled nothing leaves both lists
     // empty, and the overview used to be written from those empty lists -
@@ -1206,6 +1357,11 @@ mod tests {
         assert_eq!(clean_overview(out), "The discussion covered Joseph Swan's work on incandescent lighting.");
         assert_eq!(clean_overview("Summary: It was about Edison.\nTaken on:\n(nothing)"), "It was about Edison.");
         assert_eq!(clean_overview("Edison decided nothing."), "Edison decided nothing.");
+        // The model's own headings for the same copy.
+        let out = "The Deep Dive explores the Edison myth.\n\nDecisions:\n\n* No specific decisions were made.\n\nTasks:\n* Someone is researching materials.";
+        assert_eq!(clean_overview(out), "The Deep Dive explores the Edison myth.");
+        let out = "It was about the show.\n\nTwo tasks were taken on:\n\n1. Someone will check your ticket.";
+        assert_eq!(clean_overview(out), "It was about the show.");
     }
 
     #[test]
@@ -1219,18 +1375,18 @@ mod tests {
     fn a_line_is_filed_by_what_it_is() {
         // Every one of these came out of real recordings, under the wrong
         // heading.
-        assert!(!is_action("things get sloppy"));
-        assert!(!is_action("people are not busy because they're rushing"));
-        assert!(!is_action("A fundamental rewiring of how digital products are built"));
+        assert!(!is_action("things get sloppy", ""));
+        assert!(!is_action("people are not busy because they're rushing", ""));
+        assert!(!is_action("A fundamental rewiring of how digital products are built", ""));
         assert!(!is_question("It felt eerily intuitive, but it wasn't magic."));
         assert!(!is_question("No, definitely not."));
         assert!(!is_decision("improving design quality for 91% of designers"));
 
         // And these are the shapes a real working meeting uses, including
         // the one with no commitment word in it at all.
-        assert!(is_action("Priya takes the revised numbers to finance on Thursday"));
-        assert!(is_action("Dami writes up the offer tonight"));
-        assert!(is_action("you will provide the figures"));
+        assert!(is_action("Priya takes the revised numbers to finance on Thursday", ""));
+        assert!(is_action("Dami writes up the offer tonight", ""));
+        assert!(is_action("you will provide the figures", ""));
         assert!(is_question("how do users access their balances?"));
         assert!(is_question("What are the actual numbers"));
         assert!(is_decision("The team agreed to halve the conference spend"));
@@ -1241,15 +1397,67 @@ mod tests {
     fn a_capital_letter_is_not_a_name() {
         // Filed under To do when two stored meetings were summarised again:
         // the opening capital was taken for somebody's name.
-        assert!(!is_action("Thank you."));
-        assert!(!is_action("Having that iconic light bulb moment."));
-        assert!(!is_action("Understand how AI is transforming designers from micro to macro level system architects."));
-        assert!(!is_action("Edison was the first to make something that took off in the marketplace."));
+        assert!(!is_action("Thank you.", ""));
+        assert!(!is_action("Having that iconic light bulb moment.", ""));
+        assert!(!is_action("Understand how AI is transforming designers from micro to macro level system architects.", ""));
+        assert!(!is_action("Edison was the first to make something that took off in the marketplace.", ""));
         // A plural ends like a verb; an opening -ing word is an activity.
-        assert!(!is_action("Installing bulbs, lighting up streets and buildings"));
+        assert!(!is_action("Installing bulbs, lighting up streets and buildings", ""));
         // A name is followed by what the person does, or by "to".
-        assert!(is_action("Priya Patel takes the deck to finance"));
-        assert!(is_action("Tomi to send the contract"));
+        assert!(is_action("Priya Patel takes the deck to finance", ""));
+        assert!(is_action("Tomi to send the contract", ""));
+    }
+
+    #[test]
+    fn a_name_is_a_word_the_transcript_always_capitalises() {
+        // From a recording of a car show. "Electrical" opens its sentence,
+        // and the transcript writes it in lowercase elsewhere: it is not
+        // somebody's name, and "vehicles" is not what they are doing.
+        let car_show = "Right, just notice this, right? Electrical vehicles only. And there \
+            is an actual electrical vehicle spot.";
+        assert!(!is_action("Electrical vehicles only.", car_show));
+        let budget = "Priya, can you take the revised numbers back to finance on Thursday?";
+        assert!(is_action("Priya takes the revised numbers to finance on Thursday", budget));
+    }
+
+    #[test]
+    fn what_should_have_happened_is_not_a_task() {
+        // Both from the same recording, both under To do, both past.
+        assert!(!is_action("It should have been worn that way.", ""));
+        assert!(!is_action("You've let yourself down tonight.", ""));
+        // A past agreement about a future task is still a task.
+        assert!(is_action("We've agreed Tomi will send it", ""));
+    }
+
+    #[test]
+    fn a_name_the_transcript_never_mentions_is_found() {
+        let edison = "I know he wasn't the only one. Vaisotov became the household name \
+            eventually. Frederick de Molens got the first patent. Artificial intelligence and \
+            Envato Ele ments, Graz iti Interactive.";
+        // Outside knowledge, and the speaker labels whisper used to invent.
+        assert_eq!(names_outside("It was first made by Joseph Swan, known as Vaisotov.", edison), vec!["Joseph", "Swan"]);
+        assert_eq!(names_outside("Danielle Pletka committed to figuring it out.", edison), vec!["Pletka"]);
+        assert_eq!(names_outside("A task was assigned to John.", edison), vec!["John"]);
+        assert_eq!(names_outside("Reviewed by [Name] next week.", "we reviewed it last week"), vec!["Name"]);
+        // The same names spelled a little differently, a word whisper split
+        // in two, an acronym of words that were said, and the opening word.
+        assert!(names_outside("Earlier, Frederick de Molles had a patent.", edison).is_empty());
+        assert!(names_outside("Data from Envato Elements and Graziti Interactive.", edison).is_empty());
+        assert!(names_outside("It covered Artificial Intelligence (AI) at length.", edison).is_empty());
+        assert!(names_outside("Overall it was about invention. Someone said so.", edison).is_empty());
+        // One letter off is a spelling; a different first letter is a different word.
+        assert_eq!(names_outside("Then David Wright agreed.", "the right answer, avid readers"), vec!["David", "Wright"]);
+    }
+
+    #[test]
+    fn a_sentence_naming_an_outsider_is_dropped() {
+        let out = "The talk was about Thomas Edison. The bulb was first made by Joseph Swan. \
+            It changed how people lived at night.";
+        assert_eq!(
+            without_sentences_naming(out, &["Joseph".to_string(), "Swan".to_string()]),
+            "The talk was about Thomas Edison. It changed how people lived at night."
+        );
+        assert_eq!(without_sentences_naming("Nothing to drop.", &[]), "Nothing to drop.");
     }
 
     #[test]
@@ -1267,6 +1475,10 @@ mod tests {
         assert!(user.contains("Thomas Edison"), "the transcript was left out: {user}");
         assert!(user.contains("Having that iconic light bulb moment."), "the list was left out: {user}");
         assert!(system.contains("only if it is in the list"), "{system}");
+        // An empty heading is read as something to report: "Decided:
+        // (nothing)" came back as "A decision was made to not take on any
+        // specific tasks".
+        assert!(!user.contains("Decided:") && !user.contains("(nothing)"), "{user}");
         let (system, user) = overview_request(&[], &[], spoken);
         assert_eq!(system, OVERVIEW_TALK, "nothing listed is a talk");
         assert!(user.contains("Thomas Edison"));
