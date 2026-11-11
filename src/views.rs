@@ -1481,8 +1481,11 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
             });
             ui.add_space(12.0);
             ui.label(b(&meta.title, 24.0, theme::TEXT()));
+            if !meta.subtitle.is_empty() {
+                ui.label(t(&meta.subtitle, 14.0, theme::MUTED()));
+            }
             let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
-            ui.label(t(format!("{} · {length}", meta.source), 13.0, theme::MUTED()));
+            ui.label(t(format!("{} · {} · {length}", crate::stats::stamp(meta.started), meta.source), 13.0, theme::MUTED()));
             ui.add_space(16.0);
 
             // What it came to, before what was said.
@@ -1585,7 +1588,13 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                         ui.label(t(length, 13.0, theme::MUTED()));
                     });
                 });
-                ui.label(t(&m.source, 12.5, theme::FAINT()));
+                // The title says what it was about and no longer says when,
+                // so the when goes here - in full, with the year, because
+                // this line is now the only record of it on the page.
+                if !m.subtitle.is_empty() {
+                    ui.label(t(&m.subtitle, 13.0, theme::MUTED()));
+                }
+                ui.label(t(format!("{} · {}", crate::stats::stamp(m.started), m.source), 12.5, theme::FAINT()));
             });
             let click = ui.interact(resp.response.rect, ui.id().with(&m.id), Sense::click());
             if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
