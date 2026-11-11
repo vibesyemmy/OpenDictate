@@ -37,6 +37,12 @@ pub struct Meta {
     /// meeting has not been summarised, or when what came back was no use.
     #[serde(default)]
     pub subtitle: String,
+    /// When the transcript was last corrected by hand, if it ever was.
+    /// Recorded rather than read from the file's modified time: copying a
+    /// meeting, restoring it from a backup or syncing it all move the mtime
+    /// without a word having changed.
+    #[serde(default)]
+    pub edited_at: Option<u64>,
     pub started: u64,
     pub ended: Option<u64>,
     /// "You and the room" or "Everyone on the call", for the UI to show.
@@ -107,6 +113,42 @@ pub fn transcript(id: &str) -> Vec<Segment> {
         .lines()
         .filter_map(|l| serde_json::from_str::<Segment>(l).ok())
         .collect()
+}
+
+/// Rewrites one line of a transcript.
+///
+/// The file is appended to while a meeting runs and only read afterwards, so
+/// a correction is a whole-file rewrite. `at_ms` is the key: stretches are
+/// cut in order and none of them start at the same millisecond.
+///
+/// Writes through a temporary file and renames over the original, so a
+/// correction cannot leave half a transcript behind if something fails
+/// mid-write. A meeting is not recoverable once its audio is gone.
+pub fn edit_segment(id: &str, at_ms: u64, text: &str) -> Result<(), String> {
+    let path = root().join(id).join("transcript.jsonl");
+    let mut segments = transcript(id);
+    let Some(seg) = segments.iter_mut().find(|s| s.at_ms == at_ms) else {
+        return Err("That line is no longer in this meeting.".into());
+    };
+    if seg.text == text {
+        return Ok(());
+    }
+    seg.text = text.to_string();
+    let body: String = segments
+        .iter()
+        .filter_map(|s| serde_json::to_string(s).ok())
+        .map(|l| l + "\n")
+        .collect();
+    let tmp = path.with_extension("jsonl.new");
+    std::fs::write(&tmp, body).map_err(|e| format!("Could not save the correction: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Could not save the correction: {e}"))?;
+
+    let meta_path = root().join(id).join("meta.json");
+    if let Some(mut m) = std::fs::read_to_string(&meta_path).ok().and_then(|s| serde_json::from_str::<Meta>(&s).ok()) {
+        m.edited_at = Some(now());
+        let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&m).unwrap_or_default());
+    }
+    Ok(())
 }
 
 pub fn rename(id: &str, title: &str) {
@@ -226,6 +268,7 @@ impl Session {
             id: id.clone(),
             title: chrono::Local::now().format("%A %H:%M").to_string(),
             subtitle: String::new(),
+            edited_at: None,
             started,
             ended: None,
             source: source.to_string(),
@@ -487,6 +530,17 @@ No numbering, no commentary. If all of them were answered, output nothing.";
 
 fn summary_path(id: &str) -> PathBuf {
     root().join(id).join("summary.json")
+}
+
+/// Whether the transcript has been corrected since the summary was written.
+///
+/// Both times are recorded by this app, so the answer does not change
+/// because a folder was copied or a backup restored. A summary written from
+/// text that has since been fixed is quietly wrong, and the person who fixed
+/// it is the one who would never know.
+pub fn summary_is_stale(id: &str) -> bool {
+    let Some(summary) = summary(id) else { return false };
+    list().iter().find(|m| m.id == id).and_then(|m| m.edited_at).is_some_and(|at| at > summary.made_at)
 }
 
 pub fn summary(id: &str) -> Option<Summary> {
@@ -1026,6 +1080,51 @@ mod tests {
         assert!(!overview.is_empty(), "the overview was rejected as invented");
         let named = name_from(&s, None, &overview, &[], &[]);
         println!("named:    {named:?}");
+    }
+
+    #[test]
+    fn editing_a_line_keeps_the_rest_of_the_transcript() {
+        let dir = temp_meeting("edit-line");
+        let id = dir.file_name().unwrap().to_str().unwrap().to_string();
+        // root() is under the data dir, so write through the real path the
+        // function will use rather than the temp one.
+        let real = root().join(&id);
+        std::fs::create_dir_all(&real).unwrap();
+        let lines = [
+            Segment { at_ms: 0, secs: 1.0, text: "Thomas Edision".into(), voice: "them".into() },
+            Segment { at_ms: 1000, secs: 1.0, text: "and the light bulb".into(), voice: "you".into() },
+        ];
+        let body: String = lines.iter().map(|s| serde_json::to_string(s).unwrap() + "\n").collect();
+        std::fs::write(real.join("transcript.jsonl"), body).unwrap();
+
+        std::fs::write(
+            real.join("meta.json"),
+            serde_json::to_string(&Meta {
+                id: id.clone(),
+                title: "t".into(),
+                subtitle: String::new(),
+                edited_at: None,
+                started: 0,
+                ended: None,
+                source: "s".into(),
+                peak: 0.0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        edit_segment(&id, 0, "Thomas Edison").unwrap();
+        let meta: Meta = serde_json::from_str(&std::fs::read_to_string(real.join("meta.json")).unwrap()).unwrap();
+        assert!(meta.edited_at.is_some(), "the correction was not stamped");
+        let got = transcript(&id);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "Thomas Edison");
+        assert_eq!(got[0].voice, "them", "the rest of the line survived the rewrite");
+        assert_eq!(got[1].text, "and the light bulb");
+
+        assert!(edit_segment(&id, 9999, "nowhere").is_err(), "an unknown line is refused");
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_meeting(name: &str) -> PathBuf {
