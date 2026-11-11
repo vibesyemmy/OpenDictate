@@ -1,6 +1,20 @@
 const FRAME_SECS: f64 = 0.02;
 const VOICED_RMS: f32 = 0.004;
 const PAUSE_FRAMES: usize = 25;
+/// How much a stretch must hold before a pause is allowed to end it.
+///
+/// Half a second of quiet is a breath, not the end of a thought. Cutting on
+/// one sent whisper fragments with no context, and whisper given 0.6 s of
+/// audio writes "By the" and then starts the next stretch at "End of this
+/// video" with a capital letter: one sentence, transcribed as two wrong
+/// ones. In a 100 stretch meeting 20 came back three words or fewer.
+///
+/// Two seconds is enough to carry a clause, and short enough that the
+/// transcript still arrives while the meeting is on. A speaker change still
+/// cuts whatever the length - two people cannot share a stretch - and the
+/// fifteen second cap still applies, so a word followed by a long silence
+/// comes out on its own rather than being held for ever.
+const MIN_STRETCH_FRAMES: usize = 100;
 const FORCED_CUT_FRAMES: usize = 750;
 const TURN_FRAMES: usize = 15;
 const SIDE_RATIO: f32 = 2.5;
@@ -124,7 +138,11 @@ impl Cutter {
             self.run = 0;
             self.quiet_run += 1;
             self.turn_run = 0;
-            if self.quiet_run >= PAUSE_FRAMES {
+            // Silence with nothing in it is still dropped at once, whatever
+            // the length: holding it would park the leading quiet of a
+            // meeting at the front of the first real stretch and date every
+            // line in it from the wrong second.
+            if self.quiet_run >= PAUSE_FRAMES && (self.voiced == 0 || self.frames >= MIN_STRETCH_FRAMES) {
                 out.extend(self.take_stretch(self.frames));
             }
             return;
@@ -255,6 +273,27 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
+    /// The real failure: "By the" came back as its own stretch, and the
+    /// sentence it belonged to started again with a capital letter.
+    #[test]
+    fn a_breath_mid_sentence_does_not_split_it() {
+        let theirs = cat(&[speech(0.6), silence(0.6), speech(2.0), silence(0.6)]);
+        let out = cut_all(&silence(3.8), &theirs, true);
+        assert_eq!(out.len(), 1, "a 0.6s fragment should not be transcribed on its own");
+        assert!(out[0].secs > 2.5, "{}", out[0].secs);
+    }
+
+    /// Holding a short stretch must not mean holding it for ever: the gate
+    /// is on how long the stretch has been open, and silence counts towards
+    /// that, so a word nobody follows still comes out two seconds later.
+    #[test]
+    fn a_word_followed_by_silence_still_comes_out_on_its_own() {
+        let theirs = cat(&[speech(0.6), silence(4.0)]);
+        let out = Cutter::new(RATE).push(&silence(4.6), &theirs, true);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].secs < 2.5, "held longer than it should have been: {}", out[0].secs);
+    }
+
     #[test]
     fn forces_a_cut_after_fifteen_seconds_of_nonstop_speech() {
         let out = Cutter::new(RATE).push(&silence(20.0), &speech(20.0), true);
@@ -316,7 +355,9 @@ mod tests {
     #[test]
     fn a_mic_only_stream_still_produces_stretches() {
         let mut c = Cutter::new(RATE);
-        let mic = cat(&[speech(1.0), silence(0.6)]);
+        // Two seconds, not one: a pause only ends a stretch once there is
+        // enough in it to transcribe on its own.
+        let mic = cat(&[speech(2.0), silence(0.6)]);
         let out = c.push(&mic, &[], false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].voice, "both");
