@@ -10,9 +10,29 @@ pub fn find_server_bin(whisper_cli: &str) -> Option<PathBuf> {
     beside.or_else(|| crate::engines::find_whisper_bin("whisper-server"))
 }
 
+/// What every stretch is sent with.
+///
+/// `max_context=0` stops the server feeding what it has already transcribed
+/// back in as the next stretch's context. Left on, a few minutes of
+/// podcast-style dialogue taught the model to write subtitle-style speaker
+/// labels with invented names: replaying one real meeting through a server
+/// set up as this one was put "Katie Grant:" and "David Wright:" into the
+/// transcript, the same two every time, and 24 such labels had built up
+/// across six stored meetings - some of them real public figures, two of them
+/// repeated in summaries as fact. The same audio through whisper-cli, which
+/// starts fresh for every file, invented none, and neither did the server
+/// with this field set. Turning off temperature fallback changed nothing.
+///
+/// The cost, measured rather than assumed: with no context at all the
+/// dictionary prompt has nothing to ride in, so it no longer steers meeting
+/// transcription (dictation runs through whisper-cli and still uses it). Any
+/// budget above zero let past text in with the prompt, and 32 tokens was
+/// already enough to bring both names back. Inventing people outweighs
+/// spelling them. The prompt is still sent, so a whisper.cpp that keeps it
+/// with context off will start honouring it without a change here.
 fn inference_fields<'a>(language: &'a str, prompt: &'a str) -> Vec<(&'static str, &'a str)> {
     let language = if language.is_empty() { "auto" } else { language };
-    let mut fields = vec![("response_format", "json"), ("language", language)];
+    let mut fields = vec![("response_format", "json"), ("language", language), ("max_context", "0")];
     if !prompt.is_empty() {
         fields.push(("prompt", prompt));
     }
@@ -220,6 +240,10 @@ mod tests {
 
     #[test]
     fn passes_an_explicit_language_through() {
+        assert!(
+            inference_fields("auto", "").contains(&("max_context", "0")),
+            "past transcription must never ride along as context: it is how speaker names were invented"
+        );
         let fields = inference_fields("fr", "Vocabulary: x.");
         assert!(fields.contains(&("language", "fr")));
         assert!(fields.contains(&("prompt", "Vocabulary: x.")));
@@ -413,6 +437,70 @@ mod tests {
         let server = WhisperServer::start(&s, &AtomicBool::new(false), &std::env::temp_dir()).unwrap();
         let text = server.transcribe(&s, &fixture()).unwrap();
         assert!(text.to_lowercase().contains("cost estimate"), "{text}");
+    }
+
+    /// "Firstname Lastname:" - the shape of a subtitle speaker label. Nobody
+    /// speaks a colon, so in a transcript it is always the model's invention.
+    fn speaker_labels(text: &str) -> Vec<String> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut out = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let Some(last) = w.strip_suffix(':') else { continue };
+            let capital = |s: &str| s.chars().next().is_some_and(char::is_uppercase) && s.chars().skip(1).all(|c| c.is_alphabetic() || "'’-é".contains(c));
+            if !capital(last) || i == 0 {
+                continue;
+            }
+            let mut name = vec![last];
+            for back in (i.saturating_sub(2)..i).rev() {
+                if capital(words[back]) && !words[back].ends_with(['.', ',', '!', '?']) {
+                    name.insert(0, words[back]);
+                } else {
+                    break;
+                }
+            }
+            if name.len() >= 2 {
+                out.push(name.join(" "));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn spots_a_speaker_label_and_leaves_ordinary_colons_alone() {
+        assert_eq!(speaker_labels("has entirely changed. Katie Grant: And to really"), vec!["Katie Grant"]);
+        assert_eq!(speaker_labels("Elements. Steve McLaughlin: Plus some"), vec!["Steve McLaughlin"]);
+        assert!(speaker_labels("there are two options: this and that").is_empty());
+        assert!(speaker_labels("we meet at 10:30 tomorrow").is_empty());
+        assert!(speaker_labels("Note: bring it").is_empty(), "one word is a heading, not a name");
+    }
+
+    /// Replays a meeting's kept stretches, in order, through this module's
+    /// own client - the path a meeting really takes - with a dictionary in
+    /// place, and fails if the model invents a speaker anywhere in it.
+    ///   WHISPER_MODEL=<ggml> MEETING_DIR=<meeting with kept audio> \
+    ///     cargo test --release replays_a_meeting -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs WHISPER_MODEL, MEETING_DIR with kept audio, and whisper-server"]
+    fn replays_a_meeting_without_inventing_anyone() {
+        let mut s = real_settings();
+        s.dictionary = ["Lulu", "Ajagbe", "Kubernetes"]
+            .iter()
+            .map(|w| crate::settings::DictWord { word: w.to_string(), auto: false })
+            .collect();
+        let dir = std::path::PathBuf::from(std::env::var("MEETING_DIR").expect("set MEETING_DIR"));
+        let mut wavs: Vec<_> = std::fs::read_dir(dir.join("audio")).unwrap().filter_map(|e| e.ok().map(|e| e.path())).collect();
+        wavs.sort();
+        assert!(!wavs.is_empty(), "no kept audio in {}", dir.display());
+        let server = WhisperServer::start(&s, &AtomicBool::new(false), &std::env::temp_dir()).unwrap();
+        let mut invented = Vec::new();
+        for w in &wavs {
+            let text = server.transcribe(&s, &std::fs::read(w).unwrap()).unwrap();
+            let labels = speaker_labels(&text);
+            println!("  {}  {}{}", w.file_stem().unwrap().to_string_lossy(), text.chars().take(90).collect::<String>(), if labels.is_empty() { String::new() } else { format!("   <-- {labels:?}") });
+            invented.extend(labels);
+        }
+        println!("INVENTED: {invented:?}");
+        assert!(invented.is_empty(), "the model invented speakers: {invented:?}");
     }
 
     #[test]
