@@ -1502,20 +1502,34 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                     ui.label(b("Summary", 19.0, theme::TEXT()));
                     ui.add_space(6.0);
                     ui.label(para(&sum.overview, 14.0, theme::TEXT()));
-                    for (title, items, empty) in [
-                        ("Decided", &sum.decisions, "Nothing was settled."),
-                        ("To do", &sum.actions, "Nobody took anything on."),
-                        ("Still open", &sum.questions, "Nothing was left hanging."),
-                    ] {
-                        ui.add_space(14.0);
-                        ui.label(m(title, 13.0, theme::MUTED()));
-                        ui.add_space(4.0);
-                        if items.is_empty() {
-                            ui.label(t(empty, 13.0, theme::FAINT()));
-                        } else {
-                            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                            bullets(ui, &refs, 14.0, theme::TEXT());
+                    // A talk settles nothing and assigns nothing, and saying
+                    // so three times over is not a summary of it. When all
+                    // three headings are empty the key points are the whole
+                    // answer, so they are shown on their own.
+                    let a_discussion = sum.decisions.is_empty() && sum.actions.is_empty() && sum.questions.is_empty();
+                    if !a_discussion {
+                        for (title, items, empty) in [
+                            ("Decided", &sum.decisions, "Nothing was settled."),
+                            ("To do", &sum.actions, "Nobody took anything on."),
+                            ("Still open", &sum.questions, "Nothing was left hanging."),
+                        ] {
+                            ui.add_space(14.0);
+                            ui.label(m(title, 13.0, theme::MUTED()));
+                            ui.add_space(4.0);
+                            if items.is_empty() {
+                                ui.label(t(empty, 13.0, theme::FAINT()));
+                            } else {
+                                let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+                                bullets(ui, &refs, 14.0, theme::TEXT());
+                            }
                         }
+                    }
+                    if !sum.points.is_empty() {
+                        ui.add_space(14.0);
+                        ui.label(m("Key points", 13.0, theme::MUTED()));
+                        ui.add_space(4.0);
+                        let refs: Vec<&str> = sum.points.iter().map(String::as_str).collect();
+                        bullets(ui, &refs, 14.0, theme::TEXT());
                     }
                     ui.add_space(12.0);
                     ui.label(t(format!("Written by {}", sum.model), 12.0, theme::FAINT()));

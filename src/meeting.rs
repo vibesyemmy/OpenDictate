@@ -476,6 +476,11 @@ pub struct Summary {
     pub actions: Vec<String>,
     /// Questions nothing in the meeting answered.
     pub questions: Vec<String>,
+    /// Things that were said and are worth keeping, but are not a decision,
+    /// a task or an open question. A talk produces nothing but these, and
+    /// filing them under "To do" is how a podcast came to have six.
+    #[serde(default)]
+    pub points: Vec<String>,
     pub model: String,
     pub made_at: u64,
 }
@@ -556,6 +561,65 @@ pub fn summary_is_stale(id: &str) -> bool {
 
 pub fn summary(id: &str) -> Option<Summary> {
     std::fs::read_to_string(summary_path(id)).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Whether a line is the kind of thing its heading claims.
+///
+/// The model is asked for decisions, tasks and open questions, and on a
+/// conversation that holds none it answers with whatever it found: one
+/// recording of two people talking about design filed "things get sloppy"
+/// and "people are not busy because they're rushing" under To do, and
+/// "No, definitely not." under Still open.
+///
+/// A line that fails here is moved to the key points rather than thrown
+/// away. These rules were measured against podcasts, which is all the
+/// recorded material there was; a real working meeting may well phrase a
+/// task in a way they miss - "Dami writes up the offer tonight" has no
+/// commitment word in it. Moving a line costs a reader nothing, where
+/// deleting one loses something that was actually said.
+fn is_decision(line: &str) -> bool {
+    let l = line.to_lowercase();
+    ["agreed", "decided", "chose", "chosen", "settled", "approved", "rejected", "will ", "going to", "moving away", "adopt", "we are keeping", "dropping"]
+        .iter()
+        .any(|w| l.contains(w))
+}
+
+fn is_action(line: &str) -> bool {
+    let l = line.to_lowercase();
+    let commits = [
+        "will ", "going to", "agreed to", "committed to", "needs to", "need to", "should ",
+        "takes ", "take on", "owns ", "own the", "by monday", "by tuesday", "by wednesday",
+        "by thursday", "by friday", "by next", "by the end", "tonight", "tomorrow", "next week",
+    ]
+    .iter()
+    .any(|w| l.contains(w));
+    // Or it opens with somebody's name, which is how a task is written when
+    // nobody says "will": "Dami writes up the offer tonight".
+    let named = line
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| {
+            let bare = w.trim_matches(|c: char| !c.is_alphanumeric());
+            bare.len() > 1
+                && bare.chars().next().is_some_and(char::is_uppercase)
+                && !["The", "This", "That", "These", "Those", "There", "It", "We", "They", "You", "Someone", "Somebody", "And", "But", "His", "Her", "Their", "Our", "Its", "A", "An"]
+                    .contains(&bare)
+        });
+    commits || named
+}
+
+fn is_question(line: &str) -> bool {
+    let l = line.trim();
+    l.ends_with('?')
+        || l.split_whitespace().next().is_some_and(|w| {
+            let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            [
+                "what", "why", "how", "who", "whom", "whose", "when", "where", "which", "is",
+                "are", "was", "were", "do", "does", "did", "can", "could", "should", "would",
+                "will", "has", "have", "had", "if", "whether",
+            ]
+            .contains(&w.as_str())
+        })
 }
 
 /// Collapses lines that say the same thing. Two blocks often catch one
@@ -880,9 +944,23 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
             }
         }
     }
+    // Sort what came back by what it actually is. Anything that does not
+    // belong under its heading becomes a key point rather than a wrong
+    // entry under To do or Still open.
+    let mut points: Vec<String> = Vec::new();
+    let mut sift = |items: Vec<String>, fits: &dyn Fn(&str) -> bool| -> Vec<String> {
+        let (kept, rest): (Vec<String>, Vec<String>) = items.into_iter().partition(|x| fits(x));
+        points.extend(rest);
+        kept
+    };
+    let decisions = sift(decisions, &is_decision);
+    let actions = sift(actions, &is_action);
+    let questions = sift(questions, &is_question);
+
     let decisions = dedupe(decisions);
     let actions = dedupe(actions);
     let questions = dedupe(questions);
+    let points = dedupe(points);
 
     if let Ok(mut p) = progress.lock() {
         *p = "Writing it up…".into();
@@ -940,6 +1018,7 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         decisions,
         actions,
         questions: open,
+        points,
         model: model.unwrap_or(&s.ollama_model).to_string(),
         made_at: now(),
     };
@@ -975,6 +1054,28 @@ mod tests {
         assert_eq!(tidy("", 6), "");
         assert_eq!(tidy("   ", 6), "");
         assert_eq!(tidy("\"\"", 6), "");
+    }
+
+    #[test]
+    fn a_line_is_filed_by_what_it_is() {
+        // Every one of these came out of real recordings, under the wrong
+        // heading.
+        assert!(!is_action("things get sloppy"));
+        assert!(!is_action("people are not busy because they're rushing"));
+        assert!(!is_action("A fundamental rewiring of how digital products are built"));
+        assert!(!is_question("It felt eerily intuitive, but it wasn't magic."));
+        assert!(!is_question("No, definitely not."));
+        assert!(!is_decision("improving design quality for 91% of designers"));
+
+        // And these are the shapes a real working meeting uses, including
+        // the one with no commitment word in it at all.
+        assert!(is_action("Priya takes the revised numbers to finance on Thursday"));
+        assert!(is_action("Dami writes up the offer tonight"));
+        assert!(is_action("you will provide the figures"));
+        assert!(is_question("how do users access their balances?"));
+        assert!(is_question("What are the actual numbers"));
+        assert!(is_decision("The team agreed to halve the conference spend"));
+        assert!(is_decision("We will keep the take-home exercise"));
     }
 
     #[test]
