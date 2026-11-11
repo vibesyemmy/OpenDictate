@@ -36,6 +36,12 @@ struct Sink {
     /// How many belong to the tap. Together these say what the device should
     /// be handing over; when it hands over something else, the split is off.
     tap_channels: usize,
+    /// How many times the device has called us, and how many of those
+    /// carried any frames. The difference between "the device is not
+    /// running" and "the device is running and handing over nothing" is not
+    /// visible from the captured audio, and it was guessed at once already.
+    calls: std::sync::atomic::AtomicUsize,
+    with_frames: std::sync::atomic::AtomicUsize,
     /// Cleared the moment the channel layout stops matching what was opened.
     ///
     /// A 20 minute meeting came back with the two sides bit-identical for 70
@@ -108,6 +114,7 @@ unsafe extern "C-unwind" fn io_proc(
         return 0;
     }
     let sink = &*(client as *const Arc<Sink>);
+    sink.calls.fetch_add(1, Ordering::Relaxed);
     let list = input.as_ref();
     let buffers = std::slice::from_raw_parts(list.mBuffers.as_ptr(), list.mNumberBuffers as usize);
 
@@ -126,6 +133,7 @@ unsafe extern "C-unwind" fn io_proc(
     if frames == 0 || channels == 0 {
         return 0;
     }
+    sink.with_frames.fetch_add(1, Ordering::Relaxed);
 
     // Only split when the device is handing over exactly what it was opened
     // with. Anything else and we do not know whose channel is whose, so
@@ -296,6 +304,52 @@ pub fn meeting_input(configured: &str) -> Option<AudioObjectID> {
 }
 
 /// The Core Audio id of the system's default input.
+/// Makes the audio chain run.
+///
+/// An aggregate built from a process tap and a microphone does not run at
+/// all until some process plays something: measured as zero IO callbacks and
+/// zero samples through a silent window, then 657,920 samples the moment a
+/// sound played. The microphone sits in that device, so it was deaf until
+/// the call started - which is exactly what "my audio doesn't come in until
+/// theirs does" means.
+///
+/// It is only the cold start. Once anything has played the device keeps
+/// clocking through the quiet: 563 more callbacks and the microphone still
+/// at 0.147 after the sound stopped. So a third of a second of silence,
+/// played by us at the moment recording begins, is enough to wake it, and
+/// nobody hears it.
+fn wake() {
+    let path = std::env::temp_dir().join("open-dictate-wake.wav");
+    if !path.is_file() {
+        // 0.3 s of 48 kHz mono silence, as a minimal RIFF file.
+        let frames = 14_400u32;
+        let bytes = frames * 2;
+        let mut w = Vec::with_capacity(44 + bytes as usize);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + bytes).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&1u16.to_le_bytes()); // mono
+        w.extend_from_slice(&48_000u32.to_le_bytes());
+        w.extend_from_slice(&96_000u32.to_le_bytes()); // byte rate
+        w.extend_from_slice(&2u16.to_le_bytes()); // block align
+        w.extend_from_slice(&16u16.to_le_bytes()); // bits
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&bytes.to_le_bytes());
+        w.resize(44 + bytes as usize, 0);
+        if std::fs::write(&path, w).is_err() {
+            return;
+        }
+    }
+    let _ = std::process::Command::new("afplay")
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 pub fn default_input() -> Option<AudioObjectID> {
     unsafe {
         let mut dev: AudioObjectID = 0;
@@ -398,6 +452,8 @@ impl SystemCapture {
             let sink = Box::into_raw(Box::new(Arc::new(Sink {
                 mine: Mutex::new(Vec::new()),
                 theirs: Mutex::new(Vec::new()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                with_frames: std::sync::atomic::AtomicUsize::new(0),
                 mic_channels,
                 tap_channels,
                 split_ok: AtomicBool::new(mic_channels > 0 && tap_channels > 0),
@@ -423,6 +479,7 @@ impl SystemCapture {
                 AudioHardwareDestroyProcessTap(tap);
                 return Err(format!("system audio was refused (start {})", status(st)));
             }
+            wake();
             Ok(Self { tap, device, proc_id, sink, rate, has_mic })
         }
     }
@@ -463,6 +520,14 @@ impl SystemCapture {
         unsafe {
             let sink = &*self.sink;
             sink.split_ok.load(Ordering::Relaxed)
+        }
+    }
+
+    /// (callbacks, callbacks that carried frames) since the capture opened.
+    pub fn io_calls(&self) -> (usize, usize) {
+        unsafe {
+            let sink = &*self.sink;
+            (sink.calls.load(Ordering::Relaxed), sink.with_frames.load(Ordering::Relaxed))
         }
     }
 
@@ -507,6 +572,26 @@ pub fn check(secs: u64, microphone: &str) -> String {
         Err(e) => r.push_str(&format!("{e}\nVERDICT: no system audio.\n")),
         Ok(cap) => {
             r.push_str(&format!("opened at {} Hz\n", cap.rate));
+            let pk = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+
+            // Before anything plays. A process tap carries nothing until a
+            // process makes a sound, and the microphone sits in the same
+            // aggregate device: if the device only clocks once the tap has
+            // something to say, the microphone is deaf until the call
+            // starts. This window is what tells those apart, so speak into
+            // the microphone while it runs.
+            r.push_str("say something now - listening with nothing playing\n");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let quiet = cap.drain();
+            r.push_str(&format!(
+                "  with nothing playing: you {:.4}  them {:.4}  ({} samples)\n",
+                pk(&quiet.mine),
+                pk(&quiet.theirs),
+                quiet.mine.len()
+            ));
+            let (calls, with_frames) = cap.io_calls();
+            r.push_str(&format!("  the device called us {calls} times, {with_frames} with any frames\n"));
+
             let player = std::thread::spawn(move || {
                 for _ in 0..secs.max(1) {
                     let _ = std::process::Command::new("afplay")
@@ -517,7 +602,28 @@ pub fn check(secs: u64, microphone: &str) -> String {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             let _ = player.join();
             let c = cap.drain();
-            let pk = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+            r.push_str(&format!(
+                "  with sound playing:   you {:.4}  them {:.4}  ({} samples)\n",
+                pk(&c.mine),
+                pk(&c.theirs),
+                c.mine.len()
+            ));
+            let (after_play, _) = cap.io_calls();
+
+            // And once it has stopped again. If the device keeps clocking
+            // after the first sound, the microphone is only deaf until
+            // something plays once, which is a very different problem from
+            // being deaf whenever the room is quiet.
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let quiet2 = cap.drain();
+            let (calls2, _) = cap.io_calls();
+            r.push_str(&format!(
+                "  after it stopped:     you {:.4}  them {:.4}  ({} samples, {} more callbacks)\n",
+                pk(&quiet2.mine),
+                pk(&quiet2.theirs),
+                quiet2.mine.len(),
+                calls2 - after_play
+            ));
             r.push_str(&format!(
                 "mic channels {}, per-channel peaks {:?}\n",
                 cap.mic_channels(),
