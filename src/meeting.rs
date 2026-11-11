@@ -503,7 +503,11 @@ Say \"you\" for the first and \"someone\" for the second.\n\
 made, a question left hanging, a task taken on. A line reporting what was said is not one. \
 Never copy wording from these rules into your answer.\n\
 - A part this size rarely holds more than three or four of any one kind. If you are \
-writing more than that, you are describing rather than listing.";
+writing more than that, you are describing rather than listing.\n\
+- Most parts of most conversations contain none of these at all. A talk, an interview \
+or two people thinking out loud decide nothing and assign nothing. Writing no lines is \
+the usual correct answer, and it is always better than inventing the sort of thing a \
+meeting might have contained.";
 
 const OVERVIEW: &str = "You are writing the opening of a meeting summary for someone who missed it.\n\n\
 Two or three sentences, plain and factual, saying what the meeting was about and what came of it. \
@@ -781,7 +785,16 @@ fn write_overview(s: &Settings, model: Option<&str>, notes: &str, spoken: &str, 
     } else {
         crate::engines::chat_as(s, model, OVERVIEW, &[], notes)?
     };
-    let out = out.trim().to_string();
+    // Models label their output even when told not to. "Meeting Summary:"
+    // at the front of the first sentence is the model talking about the
+    // task, not about the meeting.
+    let mut out = out.trim();
+    for heading in ["Meeting Summary:", "Summary:", "Overview:", "Here is the summary:"] {
+        if out.to_lowercase().starts_with(&heading.to_lowercase()) {
+            out = out[heading.len()..].trim_start();
+        }
+    }
+    let out = out.to_string();
     // A summary that is merely thin is worth keeping. One that describes a
     // meeting that did not happen is not, and it is worse than none at all
     // because it reads like the real thing.
@@ -854,7 +867,15 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
             let describing = ["the meeting", "someone explained", "someone said", "someone discussed", "it was noted"]
                 .iter()
                 .any(|p| item.to_lowercase().starts_with(p));
-            if (2..=22).contains(&n) && !describing && bucket.len() < per_block_cap {
+            // And it has to be in the part it came from. Asked for decisions
+            // and actions by a transcript that holds none, a small model
+            // writes the sort of thing a meeting might have contained: one
+            // real recording of two people discussing AI and design produced
+            // "someone will research best practices for remote collaboration"
+            // and "you will provide an update on your findings next week",
+            // neither phrase appearing anywhere in what was said. Both score
+            // 17% against the part they supposedly came from.
+            if (2..=22).contains(&n) && !describing && bucket.len() < per_block_cap && grounded(&item, block) {
                 bucket.push(attribute(&item, voice));
             }
         }
@@ -954,6 +975,17 @@ mod tests {
         assert_eq!(tidy("", 6), "");
         assert_eq!(tidy("   ", 6), "");
         assert_eq!(tidy("\"\"", 6), "");
+    }
+
+    #[test]
+    fn an_invented_action_is_not_kept() {
+        // Both of these came out of a real recording of two people
+        // discussing AI and design. Neither phrase was said in it.
+        let part = "I'm trying to wrap my head around how that is functionally possible without \
+            the designers just working around the clock. The cognitive load has changed.";
+        assert!(!grounded("someone will research best practices for remote collaboration", part));
+        assert!(!grounded("you will provide an update on your findings next week", part));
+        assert!(grounded("The cognitive load for designers has changed", part));
     }
 
     #[test]
@@ -1140,6 +1172,43 @@ mod tests {
         handle_stretch(&dir, 0, &stretch(0.3, 2.0), RATE, &|_| Ok("hello".into()), true).unwrap();
         assert!(dir.join("audio/000.wav").exists(), "the stretch was deleted despite being asked for");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-summarises a stored meeting and prints what came out, so a change
+    /// to the prompts or the filters can be judged against a real recording
+    /// instead of an invented one. Writes summary.json and the title, so
+    /// point HOME at a copy:
+    ///
+    ///   HOME=/tmp/copy MEETING_ID=<id> <test-binary> \
+    ///     resummarises -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs Ollama and MEETING_ID naming a stored meeting"]
+    fn resummarises_a_stored_meeting() {
+        let id = std::env::var("MEETING_ID").expect("set MEETING_ID");
+        let s = Settings {
+            text_engine: crate::settings::TextEngine::Ollama,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2:3b".into(),
+            ..Settings::default()
+        };
+        let progress = Mutex::new(String::new());
+        let out = summarise(&s, &id, &progress).expect("summarise failed");
+        println!("OVERVIEW: {}", out.overview);
+        println!("DECISIONS ({}):", out.decisions.len());
+        for x in &out.decisions {
+            println!("  - {x}");
+        }
+        println!("ACTIONS ({}):", out.actions.len());
+        for x in &out.actions {
+            println!("  - {x}");
+        }
+        println!("QUESTIONS ({}):", out.questions.len());
+        for x in &out.questions {
+            println!("  - {x}");
+        }
+        let named = list().into_iter().find(|m| m.id == id).expect("meeting vanished");
+        println!("TITLE:    {}", named.title);
+        println!("SUBTITLE: {}", named.subtitle);
     }
 
     fn temp_meeting(name: &str) -> PathBuf {
