@@ -22,6 +22,7 @@ const NOISE_K: f32 = 1.5;
 const FLOOR_RISE: f32 = 1.014;
 const FLOOR_MAX: f32 = 0.02;
 const MIN_RUN: usize = 3;
+const SIDE_PRESENT_FRAMES: usize = 25;
 
 pub struct Stretch {
     pub voice: &'static str,
@@ -63,6 +64,36 @@ fn rms(v: &[f32]) -> f32 {
 fn clears_floor(floor: &mut f32, r: f32) -> bool {
     *floor = if r < *floor { r } else { (floor.max(VOICED_RMS / NOISE_K) * FLOOR_RISE).min(FLOOR_MAX) };
     r >= (*floor * NOISE_K).max(VOICED_RMS)
+}
+
+/// How loud a side was while it was speaking: the ninth decile of the frames
+/// that carry anything at all.
+///
+/// A stretch used to be assigned to whichever side had the higher level
+/// across the whole of it, and the other side's audio was then thrown away.
+/// Over fifteen seconds of a video with three seconds of you talking over
+/// it, your microphone averages mostly silence, the video wins by more than
+/// the 2.5 ratio, and what you said is discarded before it reaches whisper.
+/// Four recordings in a row had no "you" line until the other side went
+/// quiet - 37s, 66s and 85s in - while one with no system audio had one at
+/// 1.7s.
+///
+/// Asking how loud each side was while it was speaking is the question that
+/// was meant. It leaves the speaker case alone: a microphone hearing the
+/// call out loud picks it up attenuated, so it stays far below the tap at
+/// its own ninth decile too, and the stretch is still theirs - which is what
+/// keeps the call from being transcribed twice.
+fn loudest(side: &[f32], frame: usize) -> f32 {
+    let mut levels: Vec<f32> = side.chunks(frame).map(rms).filter(|r| *r >= VOICED_RMS).collect();
+    // Half a second before a side counts as present at all. Without it a
+    // cough or a keyboard on the quiet side would call the whole stretch
+    // "both" and mix the two together, which is worse for the side that was
+    // actually talking.
+    if levels.len() < SIDE_PRESENT_FRAMES {
+        return 0.0;
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    levels[(levels.len() * 9 / 10).min(levels.len() - 1)]
 }
 
 fn side_of(you_rms: f32, them_rms: f32) -> Side {
@@ -207,7 +238,7 @@ impl Cutter {
             let theirs_silent = theirs.iter().all(|x| *x == 0.0);
             ("both", if theirs_silent { mine } else { theirs })
         } else {
-            match side_of(rms(&mine), rms(&theirs)) {
+            match side_of(loudest(&mine, self.frame), loudest(&theirs, self.frame)) {
                 Side::You => ("you", mine),
                 Side::Them => ("them", theirs),
                 Side::Both => (
@@ -239,6 +270,12 @@ mod tests {
     fn speech(secs: f64) -> Vec<f32> {
         (0..(secs * RATE) as usize)
             .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / RATE as f32).sin())
+            .collect()
+    }
+
+    fn speech_at(amplitude: f32, secs: f64) -> Vec<f32> {
+        (0..(secs * RATE) as usize)
+            .map(|i| amplitude * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / RATE as f32).sin())
             .collect()
     }
 
@@ -292,6 +329,28 @@ mod tests {
         let out = Cutter::new(RATE).push(&silence(4.6), &theirs, true);
         assert_eq!(out.len(), 1);
         assert!(out[0].secs < 2.5, "held longer than it should have been: {}", out[0].secs);
+    }
+
+    /// The real failure: with the call playing throughout, a short turn of
+    /// yours averaged away to nothing over the stretch and your side of it
+    /// was dropped rather than transcribed.
+    #[test]
+    fn a_short_turn_of_yours_over_a_playing_call_is_not_dropped() {
+        let theirs = speech_at(0.3, 15.0);
+        let mine = cat(&[silence(12.0), speech_at(0.3, 1.0), silence(2.0)]);
+        let out = cut_all(&mine, &theirs, true);
+        assert_eq!(out[0].voice, "both", "one second of you in fifteen was thrown away");
+    }
+
+    /// And the case the ratio exists for: on speakers the microphone hears
+    /// the call too, attenuated. That is still their stretch, or the call
+    /// gets transcribed twice.
+    #[test]
+    fn the_call_leaking_into_the_microphone_is_still_their_stretch() {
+        let theirs = speech_at(0.3, 10.0);
+        let mine = speech_at(0.03, 10.0);
+        let out = cut_all(&mine, &theirs, true);
+        assert_eq!(out[0].voice, "them");
     }
 
     #[test]
