@@ -216,7 +216,7 @@ fn should_start_lm_studio(s: &Settings, memory: u64, lms_found: bool) -> bool {
 
 impl Session {
     pub fn start(s: &Settings) -> Result<Self, String> {
-        let cap = SystemCapture::start(crate::tap::default_input())?;
+        let cap = SystemCapture::start(crate::tap::meeting_input(&s.microphone))?;
         let source = if cap.has_mic { "You and everyone on the call" } else { "Everyone on the call" };
         let started = now();
         let id = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
@@ -461,14 +461,14 @@ No bullet points, no preamble, no sign-off. Only what the notes say.";
 
 const NAME: &str = "You are naming a meeting from its summary, the way someone would \
 name it in a list of meetings.\n\n\
-title: what the meeting was about, two to five words. No date, no time, no weekday, \
-and never the word \"meeting\". Capitalise it like a heading.\n\
+title: the subject of the meeting, two to five words, built from the things the \
+summary actually names - the project, the people, the decision. No date, no time, no \
+weekday, and never the word \"meeting\". Capitalise it like a heading. A title that \
+would fit any meeting at all, such as \"Recent Developments\", \"Team Meeting\" or \
+\"General Discussion\", is a failure: name what this one was about.\n\
 subtitle: what came of it, under twelve words, written as a sentence in ordinary \
-sentence case - not a second title, and not Title Case. Give the outcome, not the \
-topic again: \"Conference spend halved to fund the search trial\", not \"Budget \
-Discussion\".\n\n\
-Only what the summary says. If it is too thin to name, use the main topic for the \
-title and leave the subtitle empty.";
+sentence case. The outcome, not the subject again. Leave it empty rather than padding it.\n\n\
+Use only what the notes below say. Every word you write must come from them.";
 
 const STILL_OPEN: &str = "You are checking which questions from a meeting were left unanswered.\n\n\
 You get a list of questions and a list of what the meeting decided and assigned. Output only the \
@@ -590,27 +590,85 @@ fn tidy(line: &str, words: usize) -> String {
     kept.join(" ").trim_end_matches(['.', ',', ';', ':', '-']).to_string()
 }
 
-/// Asks the model for a title and a subtitle, from the overview it just
-/// wrote rather than from the transcript.
+/// A title that would fit any meeting ever held tells you nothing the
+/// timestamp beside it does not.
+const EMPTY_TITLES: [&str; 10] = [
+    "recent developments",
+    "meeting summary",
+    "meeting notes",
+    "team meeting",
+    "general discussion",
+    "discussion",
+    "various topics",
+    "key points",
+    "summary of discussion",
+    "untitled",
+];
+
+/// The words of `line` that carry meaning, lowercased and crudely stemmed.
+fn content_words(line: &str) -> Vec<String> {
+    const NOISE: [&str; 28] = [
+        "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is", "are", "was", "were",
+        "be", "will", "that", "this", "it", "with", "by", "at", "about", "from", "into", "their",
+        "they", "our",
+    ];
+    line.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && !NOISE.contains(w))
+        .map(|w| w.trim_end_matches('s').to_string())
+        .collect()
+}
+
+/// Whether a name was drawn from the notes, or from somewhere else.
 ///
-/// The overview is two or three sentences that already say what the meeting
-/// was about and what came of it, which is exactly what a title needs. The
-/// transcript is the wrong input: it is long, it costs another pass over
-/// every block, and the opening minute of a call is small talk.
-fn name_from(s: &Settings, model: Option<&str>, overview: &str) -> Option<(String, String)> {
-    if overview.split_whitespace().count() < 8 {
+/// A small model handed a worked example in its instructions will hand the
+/// example back: a real meeting about a stolen car and a trip to Greggs was
+/// named "Conference spend halved to fund the search trial", word for word
+/// the example the prompt gave. Taking the example out is half the fix. The
+/// other half is not trusting the answer - most of what a name says has to
+/// appear in the notes it was made from.
+fn grounded(line: &str, notes: &str) -> bool {
+    let notes = notes.to_lowercase();
+    let words = content_words(line);
+    if words.is_empty() {
+        return false;
+    }
+    let hits = words.iter().filter(|w| notes.contains(w.as_str())).count();
+    hits * 2 >= words.len()
+}
+
+/// Asks the model for a title and a subtitle, from the notes the summary
+/// just produced rather than from the transcript.
+///
+/// The transcript is the wrong input: it is long, it costs another pass over
+/// every block, and the opening minute of a call is small talk. The overview
+/// alone was not enough either - it opens with its own filler, and a model
+/// asked to name "The meeting discussed recent developments..." answers
+/// "Recent Developments". The decisions and actions are where the nouns are.
+fn name_from(s: &Settings, model: Option<&str>, overview: &str, decisions: &[String], actions: &[String]) -> Option<(String, String)> {
+    let mut notes = overview.to_string();
+    for line in decisions.iter().chain(actions.iter()).take(8) {
+        notes.push('\n');
+        notes.push_str(line);
+    }
+    if notes.split_whitespace().count() < 8 {
         return None;
     }
-    let out = crate::engines::chat_json(s, model, NAME, overview, "name", &name_schema(), &|| true).ok()?;
+    let out = crate::engines::chat_json(s, model, NAME, &notes, "name", &name_schema(), &|| true).ok()?;
     let v: serde_json::Value = serde_json::from_str(&out).ok()?;
     let title = tidy(v["title"].as_str().unwrap_or(""), 6);
     let subtitle = tidy(v["subtitle"].as_str().unwrap_or(""), 14);
-    // A title that is only a date is the thing this replaces, and a one
-    // character answer is not a name.
-    if title.len() < 3 {
+    // A one character answer is not a name, a name that could belong to any
+    // meeting is no better than the date it replaces, and a name about
+    // something the meeting never mentioned is worse than both.
+    if title.len() < 3 || EMPTY_TITLES.contains(&title.to_lowercase().as_str()) || !grounded(&title, &notes) {
         return None;
     }
-    let subtitle = if subtitle.eq_ignore_ascii_case(&title) { String::new() } else { subtitle };
+    let subtitle = if subtitle.eq_ignore_ascii_case(&title) || !grounded(&subtitle, &notes) {
+        String::new()
+    } else {
+        subtitle
+    };
     Some((title, subtitle))
 }
 
@@ -706,7 +764,7 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
     if let Ok(mut p) = progress.lock() {
         *p = "Naming it…".into();
     }
-    if let Some((title, subtitle)) = name_from(s, model, &overview) {
+    if let Some((title, subtitle)) = name_from(s, model, &overview, &decisions, &actions) {
         set_name(id, &title, &subtitle);
     }
 
@@ -769,6 +827,32 @@ mod tests {
         assert_eq!(tidy("\"\"", 6), "");
     }
 
+    /// The exact failure a real meeting produced: a recording about a
+    /// stolen car and a trip to Greggs came back named with the example
+    /// sentence from the prompt, which mentioned neither.
+    #[test]
+    fn a_name_that_came_from_nowhere_is_rejected() {
+        let notes = "The meeting discussed recent developments, including the theft of the 64 \
+            sinus, with plans to transport the Bugatti and McLaren P1 to GR8 in the UK.\n\
+            We'll do a Greggs run on the way back.";
+        assert!(!grounded("Conference spend halved to fund the search trial", notes));
+        assert!(grounded("Bugatti and McLaren going to the UK", notes));
+    }
+
+    #[test]
+    fn grounded_wants_most_of_the_words_not_all_of_them() {
+        let notes = "Priya takes the revised numbers to finance on Thursday.";
+        // "revised numbers" and "finance" are there; "soon" is not.
+        assert!(grounded("Revised numbers going to finance soon", notes));
+        assert!(!grounded("Hiring freeze lifted for the design team", notes));
+    }
+
+    #[test]
+    fn grounded_rejects_an_empty_line() {
+        assert!(!grounded("", "anything at all"));
+        assert!(!grounded("the and of", "anything at all"));
+    }
+
     /// Run with:
     ///   cargo test --release names_a_real_meeting -- --ignored --nocapture
     /// The prompt is the risky part of naming, and only a real model shows
@@ -786,7 +870,9 @@ mod tests {
             conference spend in half so the paid search trial can run for another quarter. \
             Priya is taking the revised numbers back to finance on Thursday, and nobody has \
             heard back from legal about the annual contracts yet.";
-        let (title, subtitle) = name_from(&s, None, overview).expect("the model should name this");
+        let decisions = ["Conference spend halved for the quarter".to_string()];
+        let actions = ["Priya takes the revised numbers to finance on Thursday".to_string()];
+        let (title, subtitle) = name_from(&s, None, overview, &decisions, &actions).expect("the model should name this");
         println!("budget  title:    {title}");
         println!("budget  subtitle: {subtitle}");
         assert!((1..=6).contains(&title.split_whitespace().count()), "title was {title:?}");
@@ -801,12 +887,31 @@ mod tests {
             team agreed to make an offer to the second one at the top of the band. Dami is \
             writing it up tonight. The panel still cannot agree whether to keep the take-home \
             exercise for the next round.";
-        let (t2, s2) = name_from(&s, None, hiring).expect("the model should name this too");
+        let hiring_d = ["Offer goes to the second candidate at the top of the band".to_string()];
+        let hiring_a = ["Dami writes up the offer tonight".to_string()];
+        let (t2, s2) = name_from(&s, None, hiring, &hiring_d, &hiring_a).expect("the model should name this too");
         println!("hiring  title:    {t2}");
         println!("hiring  subtitle: {s2}");
         assert!(!s2.to_lowercase().contains("conference"), "the example leaked into the answer: {s2:?}");
         assert!(!s2.to_lowercase().contains("search trial"), "the example leaked into the answer: {s2:?}");
         assert!(!t2.eq_ignore_ascii_case(&title), "both meetings got the same name: {t2:?}");
+
+        // The meeting that showed the bug: nothing to do with budgets or
+        // hiring, and the old prompt named it after its own example.
+        let car = "The meeting discussed recent developments, including the theft of the 64 \
+            sinus, with plans to transport the Bugatti and McLaren P1 to GR8 in the UK. The team \
+            also touched on logistical arrangements for their trip, including a planned stop at \
+            Greggs on the way back.";
+        let car_d = ["The Bugatti and McLaren P1 will be going to GR8 in the UK".to_string()];
+        let car_a = ["We'll do a Greggs run on the way back".to_string()];
+        let named = name_from(&s, None, car, &car_d, &car_a);
+        println!("car     title:    {:?}", named.as_ref().map(|(t, _)| t));
+        println!("car     subtitle: {:?}", named.as_ref().map(|(_, s)| s));
+        if let Some((t3, s3)) = named {
+            assert!(!t3.to_lowercase().contains("budget"), "named after another meeting: {t3:?}");
+            assert!(!s3.to_lowercase().contains("conference"), "the old example came back: {s3:?}");
+            assert!(!EMPTY_TITLES.contains(&t3.to_lowercase().as_str()), "a title that fits anything: {t3:?}");
+        }
     }
 
     fn temp_meeting(name: &str) -> PathBuf {
