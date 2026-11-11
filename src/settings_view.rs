@@ -355,16 +355,16 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                         ui.horizontal(|ui| {
                             crate::views::status(ui, crate::views::State::Bad, "Not running");
                             if crate::views::btn(ui, "Start Ollama").clicked() {
-                                match engines::start_ollama() {
-                                    Ok(()) => app.notify("Starting Ollama…", false),
-                                    Err(e) => app.notify(e, true),
-                                }
+                                app.notify("Starting Ollama…", false);
                                 let h = app.health.clone();
                                 let c = ctx.clone();
                                 let url = app.s.ollama_url.clone();
+                                // Waiting for it to answer, rather than
+                                // sleeping three seconds and hoping: a slow
+                                // start used to leave this row reading "Not
+                                // running" over a server that was coming up.
                                 std::thread::spawn(move || {
-                                    std::thread::sleep(std::time::Duration::from_secs(3));
-                                    h.lock().unwrap().ollama = Some(engines::ollama_models(&url));
+                                    h.lock().unwrap().ollama = Some(engines::start_ollama_and_wait(&url));
                                     c.request_repaint();
                                 });
                             }

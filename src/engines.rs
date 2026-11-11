@@ -548,6 +548,32 @@ pub fn pull_ollama(url: &str, model: &str, progress: SharedProgress, ctx: eframe
     });
 }
 
+/// Starts a local Ollama and waits until it answers.
+///
+/// `start_ollama` only spawns: the server needs a moment to bind its port,
+/// and a health check run straight after the spawn reports "not running"
+/// every time, which is what made the Models tab look wrong at launch even
+/// when Ollama had in fact just been started.
+///
+/// A URL pointing somewhere other than this Mac is left alone. Starting a
+/// server here would not make someone else's reachable, and the person who
+/// typed that address did not ask us to run one.
+pub fn start_ollama_and_wait(url: &str) -> Result<Vec<String>, String> {
+    if !crate::talking::is_local(url) {
+        return Err("Ollama isn't running".into());
+    }
+    start_ollama()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        match ollama_models(url) {
+            Ok(models) => return Ok(models),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => {}
+        }
+    }
+}
+
 pub fn start_ollama() -> Result<(), String> {
     let bin = find_whisper_bin("ollama").ok_or("Ollama isn't installed (see ollama.com).")?;
     std::process::Command::new(bin)
