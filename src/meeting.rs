@@ -598,9 +598,12 @@ or two people thinking out loud decide nothing and assign nothing. Writing no li
 the usual correct answer, and it is always better than inventing the sort of thing a \
 meeting might have contained.";
 
-const OVERVIEW: &str = "You are writing the opening of a meeting summary for someone who missed it.\n\n\
-Two or three sentences, plain and factual, saying what the meeting was about and what came of it. \
-No bullet points, no preamble, no sign-off. Only what the notes say.";
+const OVERVIEW: &str = "You are writing the opening of a summary for someone who missed this.\n\n\
+You get part of what was said, in order, and then the decisions and tasks found in it. \
+Two or three sentences, plain and factual: what was talked about, then what was decided or \
+taken on. No bullet points, no preamble, no sign-off.\n\n\
+Only what the transcript and the list say. Mention a decision or a task only if it is in the \
+list. Never invent a project, a deadline, a team, a company or a next meeting.";
 
 const NAME: &str = "You are naming a meeting from its summary, the way someone would \
 name it in a list of meetings.\n\n\
@@ -663,7 +666,10 @@ pub fn summary(id: &str) -> Option<Summary> {
 /// deleting one loses something that was actually said.
 fn is_decision(line: &str) -> bool {
     let l = line.to_lowercase();
-    ["agreed", "decided", "chose", "chosen", "settled", "approved", "rejected", "will ", "going to", "moving away", "adopt", "we are keeping", "dropping"]
+    // "adopted", not "adopt": a podcast about how widely companies use AI
+    // had "adopting a new approach to building software" filed as a decision.
+    // A decision is something done; a gerund is a trend being described.
+    ["agreed", "decided", "chose", "chosen", "settled", "approved", "rejected", "will ", "going to", "moving away", "adopted", "we are keeping", "dropping"]
         .iter()
         .any(|w| l.contains(w))
 }
@@ -677,19 +683,37 @@ fn is_action(line: &str) -> bool {
     ]
     .iter()
     .any(|w| l.contains(w));
-    // Or it opens with somebody's name, which is how a task is written when
-    // nobody says "will": "Dami writes up the offer tonight".
-    let named = line
-        .split_whitespace()
-        .next()
-        .is_some_and(|w| {
-            let bare = w.trim_matches(|c: char| !c.is_alphanumeric());
-            bare.len() > 1
-                && bare.chars().next().is_some_and(char::is_uppercase)
-                && !["The", "This", "That", "These", "Those", "There", "It", "We", "They", "You", "Someone", "Somebody", "And", "But", "His", "Her", "Their", "Our", "Its", "A", "An"]
-                    .contains(&bare)
-        });
-    commits || named
+    // Or it opens with somebody's name and then what they are doing, which is
+    // how a task is written when nobody says "will": "Dami writes up the
+    // offer tonight". The capital alone is not a name - every sentence opens
+    // with one, and "Thank you." and "Having that iconic light bulb moment."
+    // were both filed as tasks on the strength of it. After the name (one to
+    // three capitalised words) comes a verb doing something now, "takes",
+    // "writes", "owns", or "to" as in "Tomi to send the contract".
+    let bare = |w: &str| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+    let capital = |w: &str| {
+        let b = bare(w);
+        b.len() > 1 && b.chars().next().is_some_and(char::is_uppercase)
+    };
+    let words: Vec<&str> = line.split_whitespace().collect();
+    // An opening "-ing" word is an activity, not a person, and the plural
+    // after it ends like a verb: "Installing bulbs, lighting up streets"
+    // would otherwise read as someone called Installing doing something.
+    // The odd surname that ends this way ("Manning takes the notes") moves
+    // to the key points, which costs nothing.
+    let opens_with_name = words.first().is_some_and(|w| {
+        capital(w)
+            && !(bare(w).len() > 5 && bare(w).ends_with("ing"))
+            && !["The", "This", "That", "These", "Those", "There", "It", "We", "They", "You", "Someone", "Somebody", "And", "But", "His", "Her", "Their", "Our", "Its", "A", "An"]
+                .contains(&bare(w).as_str())
+    });
+    // "was", "has" and "is" end the same way and say what someone is, not
+    // what they will do: "Edison was the first to make something that took off".
+    let doing = words.iter().skip(1).take(3).find(|w| !capital(w)).is_some_and(|w| {
+        let v = bare(w).to_lowercase();
+        v == "to" || (v.len() > 2 && v.ends_with('s') && !v.ends_with("ss") && !["was", "has", "does", "this", "its", "his", "always", "perhaps", "plus"].contains(&v.as_str()))
+    });
+    commits || (opens_with_name && doing)
 }
 
 fn is_question(line: &str) -> bool {
@@ -809,7 +833,14 @@ fn tidy(line: &str, words: usize) -> String {
     // One line: a model that ignores "one line" usually puts its reasoning
     // on the second.
     let t = t.lines().next().unwrap_or("").trim();
-    let kept: Vec<&str> = t.split_whitespace().take(words).collect();
+    let mut kept: Vec<&str> = t.split_whitespace().take(words).collect();
+    // Cut at the limit, "The Shift in Software Development and" is half a
+    // title. A word that only joins or points onward is dropped from the end.
+    while kept.last().is_some_and(|w| {
+        ["and", "or", "of", "in", "on", "the", "a", "an", "to", "for", "with", "its", "&"].contains(&w.trim_end_matches([',', ';', ':', '-']).to_lowercase().as_str())
+    }) {
+        kept.pop();
+    }
     kept.join(" ").trim_end_matches(['.', ',', ';', ':', '-']).to_string()
 }
 
@@ -923,26 +954,57 @@ fn name_from(s: &Settings, model: Option<&str>, overview: &str, decisions: &[Str
     Some((title, subtitle))
 }
 
-/// The opening paragraph of a summary, and the check that it is true.
+/// What the model writing the overview is shown: always what was said, and
+/// the decisions and tasks when there are any.
 ///
-/// `barren` means the meeting decided nothing and assigned nothing, so the
-/// notes are empty and the transcript is the only source there is.
-fn write_overview(s: &Settings, model: Option<&str>, notes: &str, spoken: &str, barren: bool) -> Result<String, String> {
-    let out = if barren {
-        crate::engines::chat_as(s, model, OVERVIEW_TALK, &[], &sample(spoken, 350))?
-    } else {
-        crate::engines::chat_as(s, model, OVERVIEW, &[], notes)?
-    };
-    // Models label their output even when told not to. "Meeting Summary:"
-    // at the front of the first sentence is the model talking about the
-    // task, not about the meeting.
+/// It used to get the decisions and tasks alone whenever there were some,
+/// and one stray line was enough to send a meeting that way. Handed nothing
+/// but "Having that iconic light bulb moment." from a recording about Thomas
+/// Edison, llama3.2:3b wrote about "marketing strategies for the upcoming
+/// product launch", or a project timeline moved by two weeks with a task for
+/// "John". Replaying four stored meetings with the notes they had produced,
+/// the notes alone invented a meeting in 11 runs of 12; the same notes with
+/// the transcript described what was said in every run. A list of two lines
+/// says almost nothing about a meeting, and a small model fills the rest with
+/// what meetings usually contain.
+fn overview_request(decisions: &[String], actions: &[String], spoken: &str) -> (&'static str, String) {
+    let heard = sample(spoken, 350);
+    if decisions.is_empty() && actions.is_empty() {
+        return (OVERVIEW_TALK, heard);
+    }
+    let list = |items: &[String]| if items.is_empty() { "(nothing)".to_string() } else { items.join("\n") };
+    (OVERVIEW, format!("{heard}\n\nDecided:\n{}\n\nTaken on:\n{}", list(decisions), list(actions)))
+}
+
+/// Takes off what a model wraps an answer in.
+///
+/// Models label their output even when told not to. "Meeting Summary:" at
+/// the front of the first sentence is the model talking about the task, not
+/// about the meeting. And handed a list under "Decided:" and "Taken on:",
+/// it sometimes copies the list out again after its paragraph; the list is
+/// shown under its own headings anyway, so the copy goes.
+fn clean_overview(out: &str) -> String {
     let mut out = out.trim();
     for heading in ["Meeting Summary:", "Summary:", "Overview:", "Here is the summary:"] {
         if out.to_lowercase().starts_with(&heading.to_lowercase()) {
             out = out[heading.len()..].trim_start();
         }
     }
-    let out = out.to_string();
+    let mut kept = Vec::new();
+    for line in out.lines() {
+        let l = line.trim_start().to_lowercase();
+        if l.starts_with("decided:") || l.starts_with("taken on:") {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.join("\n").trim().to_string()
+}
+
+/// The opening paragraph of a summary, and the check that it is true.
+fn write_overview(s: &Settings, model: Option<&str>, decisions: &[String], actions: &[String], spoken: &str) -> Result<String, String> {
+    let (system, user) = overview_request(decisions, actions, spoken);
+    let out = clean_overview(&crate::engines::chat_as(s, model, system, &[], &user)?);
     // A summary that is merely thin is worth keeping. One that describes a
     // meeting that did not happen is not, and it is worse than none at all
     // because it reads like the real thing.
@@ -1061,10 +1123,11 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
     // which is to say from nothing. A model handed nothing invents: a
     // recording about Thomas Edison was summarised as a project timeline
     // review with resource allocation and a follow-up in two weeks, none of
-    // which was said. Nothing to list is not nothing to say, so when there
-    // is nothing to list the transcript is what gets summarised.
+    // which was said. The same happened with a list of one or two lines, so
+    // the overview is now always written from the transcript, with the list
+    // beside it when there is one (see `overview_request`).
     let barren = decisions.is_empty() && actions.is_empty();
-    let overview = write_overview(s, model, &notes, &spoken, barren)?;
+    let overview = write_overview(s, model, &decisions, &actions, &spoken)?;
     if overview.is_empty() && barren {
         return Err("Nothing in this meeting could be summarised without making it up.".into());
     }
@@ -1131,6 +1194,18 @@ mod tests {
         assert_eq!(tidy("Hiring Plan\nHere is my reasoning", 6), "Hiring Plan");
         // A short answer is a good answer, not one to pad.
         assert_eq!(tidy("Budget", 6), "Budget");
+        // Cut at the limit, a title can stop on a word that leads nowhere.
+        assert_eq!(tidy("The Shift in Software Development and Its Future", 6), "The Shift in Software Development");
+    }
+
+    #[test]
+    fn an_overview_does_not_repeat_the_list_it_was_given() {
+        // What came back for a stored meeting: a good paragraph, then the
+        // list from the request copied out under its own heading.
+        let out = "The discussion covered Joseph Swan's work on incandescent lighting.\n\nDecided: \nSomeone will look up the first house lit by a light bulb.";
+        assert_eq!(clean_overview(out), "The discussion covered Joseph Swan's work on incandescent lighting.");
+        assert_eq!(clean_overview("Summary: It was about Edison.\nTaken on:\n(nothing)"), "It was about Edison.");
+        assert_eq!(clean_overview("Edison decided nothing."), "Edison decided nothing.");
     }
 
     #[test]
@@ -1160,6 +1235,41 @@ mod tests {
         assert!(is_question("What are the actual numbers"));
         assert!(is_decision("The team agreed to halve the conference spend"));
         assert!(is_decision("We will keep the take-home exercise"));
+    }
+
+    #[test]
+    fn a_capital_letter_is_not_a_name() {
+        // Filed under To do when two stored meetings were summarised again:
+        // the opening capital was taken for somebody's name.
+        assert!(!is_action("Thank you."));
+        assert!(!is_action("Having that iconic light bulb moment."));
+        assert!(!is_action("Understand how AI is transforming designers from micro to macro level system architects."));
+        assert!(!is_action("Edison was the first to make something that took off in the marketplace."));
+        // A plural ends like a verb; an opening -ing word is an activity.
+        assert!(!is_action("Installing bulbs, lighting up streets and buildings"));
+        // A name is followed by what the person does, or by "to".
+        assert!(is_action("Priya Patel takes the deck to finance"));
+        assert!(is_action("Tomi to send the contract"));
+    }
+
+    #[test]
+    fn a_trend_is_not_a_decision() {
+        // A podcast about enterprise adoption of AI, filed under Decided.
+        assert!(!is_decision("adopting a new approach to building software based on Figma report data."));
+        assert!(is_decision("The team adopted the new pricing page"));
+    }
+
+    #[test]
+    fn the_overview_always_hears_what_was_said() {
+        let spoken = "Thomas Edison and the electric light. The filament kept oxidising.";
+        let junk = ["Having that iconic light bulb moment.".to_string()];
+        let (system, user) = overview_request(&[], &junk, spoken);
+        assert!(user.contains("Thomas Edison"), "the transcript was left out: {user}");
+        assert!(user.contains("Having that iconic light bulb moment."), "the list was left out: {user}");
+        assert!(system.contains("only if it is in the list"), "{system}");
+        let (system, user) = overview_request(&[], &[], spoken);
+        assert_eq!(system, OVERVIEW_TALK, "nothing listed is a talk");
+        assert!(user.contains("Thomas Edison"));
     }
 
     #[test]
@@ -1282,6 +1392,49 @@ mod tests {
         }
     }
 
+    /// Run with:
+    ///   cargo test --release an_overview_with_a_list -- --ignored --nocapture
+    /// Three times each, because the model runs at temperature 0.2 and one
+    /// good answer proves little.
+    #[test]
+    #[ignore = "needs Ollama running llama3.2:3b on 127.0.0.1:11434"]
+    fn an_overview_with_a_list_still_describes_what_was_said() {
+        let s = Settings {
+            text_engine: crate::settings::TextEngine::Ollama,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2:3b".into(),
+            ..Settings::default()
+        };
+        // A working meeting: what it decided has to reach the overview.
+        let budget = "Okay, the Q3 marketing budget. We're over on events again. I think we cut the \
+            conference spend in half and use that to keep the paid search trial going another \
+            quarter. Does everyone agree? Yes, agreed. Priya, can you take the revised numbers back \
+            to finance on Thursday? Sure, I'll do that. Has anyone heard from legal about the annual \
+            contracts? Not yet, nothing.";
+        let d = ["The team agreed to halve the conference spend".to_string()];
+        let a = ["Priya takes the revised numbers to finance on Thursday".to_string()];
+        // A talk with one stray line under To do - the shape that used to
+        // come back as a product launch or a project timeline.
+        let talk = "So when people think of Thomas Edison they picture the lone genius in his lab \
+            and the light bulb going on. But he wasn't the first. Joseph Swan in England had carbon \
+            filaments in an evacuated bulb years before, and the early bulbs blackened and burned out. \
+            What Edison's team did was test thousands of materials until carbonised bamboo lasted over \
+            twelve hundred hours, and then build the power stations and the wiring to sell it.";
+        let junk = ["Having that iconic light bulb moment.".to_string()];
+        let invented = ["marketing", "launch", "deadline", "timeline", "budget", "team decided", "next meeting", "campaign"];
+        for run in 1..=3 {
+            let o = write_overview(&s, None, &d, &a, budget).unwrap();
+            println!("budget #{run} ({:.0}%): {o}", overlap(&o, budget) * 100.0);
+            assert!(o.to_lowercase().contains("conference"), "the decision did not reach the overview: {o}");
+            let o = write_overview(&s, None, &[], &junk, talk).unwrap();
+            println!("talk   #{run} ({:.0}%): {o}", overlap(&o, talk) * 100.0);
+            assert!(!o.is_empty(), "the overview was rejected as invented");
+            let l = o.to_lowercase();
+            assert!(!invented.iter().any(|w| l.contains(w)), "a meeting was invented: {o}");
+            assert!(l.contains("edison") || l.contains("swan"), "not about what was said: {o}");
+        }
+    }
+
     /// Run against a real stored meeting:
     ///   MEETING_ID=2026-11-11-130316 cargo test --release summarises_a_talk \
     ///     -- --ignored --nocapture
@@ -1298,7 +1451,7 @@ mod tests {
             ollama_model: "llama3.2:3b".into(),
             ..Settings::default()
         };
-        let overview = write_overview(&s, None, "", &spoken, true).unwrap();
+        let overview = write_overview(&s, None, &[], &[], &spoken).unwrap();
         println!("overview: {overview}");
         println!("overlap:  {:.0}%", overlap(&overview, &spoken) * 100.0);
         assert!(!overview.is_empty(), "the overview was rejected as invented");
