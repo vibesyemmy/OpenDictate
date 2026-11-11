@@ -590,6 +590,30 @@ fn general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     }
     ui.add_space(14.0);
 
+    section(ui, crate::icon::TIMER, "Startup");
+    row(
+        ui,
+        "Open at login",
+        "Start Open Dictate when you log in, so the shortcuts work without opening it first.",
+        204.0,
+        |ui| {
+            let mut want = app.s.start_at_login;
+            if crate::views::kit_checkbox(ui, &mut want).changed() {
+                // The setting only moves if the file did. A tick that saved
+                // itself while the login item failed to write would promise
+                // something that will not happen.
+                match crate::login_item::set(want) {
+                    Ok(()) => {
+                        app.s.start_at_login = want;
+                        app.changed();
+                    }
+                    Err(e) => app.notify(e, true),
+                }
+            }
+        },
+    );
+    ui.add_space(14.0);
+
     section(ui, crate::icon::KEYBOARD, "Shortcuts");
     // One choice of two, which is what the segmented control is for. As a
     // pair of selectable labels the unchosen one looked like plain text and
