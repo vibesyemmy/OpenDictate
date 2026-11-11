@@ -99,6 +99,19 @@ pub fn local_date(secs: u64) -> NaiveDate {
         .unwrap_or_else(|| Local::now().date_naive())
 }
 
+/// "Mon 10 Nov 2026, 15:48" - the exact moment something happened.
+///
+/// Spelled out, with the year, because this is the record of when: a list
+/// that says only "Monday" is no help a fortnight later, which is what the
+/// meeting titles used to say.
+pub fn stamp(secs: u64) -> String {
+    Local
+        .timestamp_opt(secs as i64, 0)
+        .single()
+        .map(|t| t.format("%a %-d %b %Y, %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 pub fn day_key(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
 }

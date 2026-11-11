@@ -29,7 +29,14 @@ const OUT_RATE: u32 = 16_000;
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Meta {
     pub id: String,
+    /// What the meeting was about, written by the model once it has been
+    /// summarised. Until then - and for a meeting nothing was transcribed
+    /// from - it is the day and time the recording started.
     pub title: String,
+    /// One line under the title, from the same model pass. Empty when the
+    /// meeting has not been summarised, or when what came back was no use.
+    #[serde(default)]
+    pub subtitle: String,
     pub started: u64,
     pub ended: Option<u64>,
     /// "You and the room" or "Everyone on the call", for the UI to show.
@@ -106,6 +113,21 @@ pub fn rename(id: &str, title: &str) {
     let path = root().join(id).join("meta.json");
     if let Some(mut m) = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Meta>(&s).ok()) {
         m.title = title.to_string();
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
+    }
+}
+
+/// Stores the name the model gave a meeting. A blank title is ignored, so a
+/// model that returns nothing useful leaves the day and time in place rather
+/// than wiping it.
+pub fn set_name(id: &str, title: &str, subtitle: &str) {
+    if title.trim().is_empty() {
+        return;
+    }
+    let path = root().join(id).join("meta.json");
+    if let Some(mut m) = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Meta>(&s).ok()) {
+        m.title = title.trim().to_string();
+        m.subtitle = subtitle.trim().to_string();
         let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
     }
 }
@@ -203,6 +225,7 @@ impl Session {
         let meta = Meta {
             id: id.clone(),
             title: chrono::Local::now().format("%A %H:%M").to_string(),
+            subtitle: String::new(),
             started,
             ended: None,
             source: source.to_string(),
@@ -436,6 +459,17 @@ const OVERVIEW: &str = "You are writing the opening of a meeting summary for som
 Two or three sentences, plain and factual, saying what the meeting was about and what came of it. \
 No bullet points, no preamble, no sign-off. Only what the notes say.";
 
+const NAME: &str = "You are naming a meeting from its summary, the way someone would \
+name it in a list of meetings.\n\n\
+title: what the meeting was about, two to five words. No date, no time, no weekday, \
+and never the word \"meeting\". Capitalise it like a heading.\n\
+subtitle: what came of it, under twelve words, written as a sentence in ordinary \
+sentence case - not a second title, and not Title Case. Give the outcome, not the \
+topic again: \"Conference spend halved to fund the search trial\", not \"Budget \
+Discussion\".\n\n\
+Only what the summary says. If it is too thin to name, use the main topic for the \
+title and leave the subtitle empty.";
+
 const STILL_OPEN: &str = "You are checking which questions from a meeting were left unanswered.\n\n\
 You get a list of questions and a list of what the meeting decided and assigned. Output only the \
 questions that nothing in those lists answers, one per line, exactly as they were written. \
@@ -523,6 +557,63 @@ fn strip_bullet(line: &str) -> String {
 /// Map then reduce: every block is listed separately, then the lists are
 /// merged here in code and the model is asked only for the two things code
 /// cannot do - the opening paragraph, and which questions went unanswered.
+fn name_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "title": { "type": "string" },
+            "subtitle": { "type": "string" }
+        },
+        "required": ["title", "subtitle"]
+    })
+}
+
+/// Cuts a model's answer down to something that fits a list row.
+///
+/// Small models decorate: they wrap the answer in quotes, open with "Title:",
+/// and write "Meeting about the Q3 budget" when "Q3 Budget" was asked for.
+/// Asking again in a firmer tone does not fix it; trimming it does. `words`
+/// is a ceiling, not a target - a two word answer is a good answer.
+fn tidy(line: &str, words: usize) -> String {
+    let mut t = line.trim();
+    for prefix in ["title:", "subtitle:", "name:"] {
+        if t.to_lowercase().starts_with(prefix) {
+            t = t[prefix.len()..].trim_start();
+        }
+    }
+    let t = t.trim_matches(|c| c == '"' || c == '\'' || c == '*' || c == '#' || c == ' ');
+    // One line: a model that ignores "one line" usually puts its reasoning
+    // on the second.
+    let t = t.lines().next().unwrap_or("").trim();
+    let kept: Vec<&str> = t.split_whitespace().take(words).collect();
+    kept.join(" ").trim_end_matches(['.', ',', ';', ':', '-']).to_string()
+}
+
+/// Asks the model for a title and a subtitle, from the overview it just
+/// wrote rather than from the transcript.
+///
+/// The overview is two or three sentences that already say what the meeting
+/// was about and what came of it, which is exactly what a title needs. The
+/// transcript is the wrong input: it is long, it costs another pass over
+/// every block, and the opening minute of a call is small talk.
+fn name_from(s: &Settings, model: Option<&str>, overview: &str) -> Option<(String, String)> {
+    if overview.split_whitespace().count() < 8 {
+        return None;
+    }
+    let out = crate::engines::chat_json(s, model, NAME, overview, "name", &name_schema(), &|| true).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let title = tidy(v["title"].as_str().unwrap_or(""), 6);
+    let subtitle = tidy(v["subtitle"].as_str().unwrap_or(""), 14);
+    // A title that is only a date is the thing this replaces, and a one
+    // character answer is not a name.
+    if title.len() < 3 {
+        return None;
+    }
+    let subtitle = if subtitle.eq_ignore_ascii_case(&title) { String::new() } else { subtitle };
+    Some((title, subtitle))
+}
+
 pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Summary, String> {
     let segments = transcript(id);
     if segments.is_empty() {
@@ -608,6 +699,17 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
     );
     let overview = crate::engines::chat_as(s, model, OVERVIEW, &[], &notes)?.trim().to_string();
 
+    // Naming it is the last thing that could fail, and the least important,
+    // so a failure here costs the meeting its name and nothing else: the
+    // summary is already worth keeping, and the day and time stay as the
+    // title.
+    if let Ok(mut p) = progress.lock() {
+        *p = "Naming it…".into();
+    }
+    if let Some((title, subtitle)) = name_from(s, model, &overview) {
+        set_name(id, &title, &subtitle);
+    }
+
     let open = if questions.is_empty() {
         Vec::new()
     } else {
@@ -643,6 +745,69 @@ mod tests {
     use crate::cut::Stretch;
 
     const RATE: f64 = 48_000.0;
+
+    #[test]
+    fn tidy_strips_what_small_models_decorate_with() {
+        assert_eq!(tidy("\"Q3 Budget\"", 6), "Q3 Budget");
+        assert_eq!(tidy("Title: Q3 Budget", 6), "Q3 Budget");
+        assert_eq!(tidy("**Q3 Budget**", 6), "Q3 Budget");
+        assert_eq!(tidy("Q3 Budget.", 6), "Q3 Budget");
+    }
+
+    #[test]
+    fn tidy_caps_the_length_and_keeps_one_line() {
+        assert_eq!(tidy("one two three four five six seven", 5), "one two three four five");
+        assert_eq!(tidy("Hiring Plan\nHere is my reasoning", 6), "Hiring Plan");
+        // A short answer is a good answer, not one to pad.
+        assert_eq!(tidy("Budget", 6), "Budget");
+    }
+
+    #[test]
+    fn tidy_survives_an_empty_answer() {
+        assert_eq!(tidy("", 6), "");
+        assert_eq!(tidy("   ", 6), "");
+        assert_eq!(tidy("\"\"", 6), "");
+    }
+
+    /// Run with:
+    ///   cargo test --release names_a_real_meeting -- --ignored --nocapture
+    /// The prompt is the risky part of naming, and only a real model shows
+    /// whether it holds.
+    #[test]
+    #[ignore = "needs Ollama running llama3.2:3b on 127.0.0.1:11434"]
+    fn names_a_real_meeting() {
+        let s = Settings {
+            text_engine: crate::settings::TextEngine::Ollama,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2:3b".into(),
+            ..Settings::default()
+        };
+        let overview = "The team went through the Q3 marketing budget and agreed to cut the \
+            conference spend in half so the paid search trial can run for another quarter. \
+            Priya is taking the revised numbers back to finance on Thursday, and nobody has \
+            heard back from legal about the annual contracts yet.";
+        let (title, subtitle) = name_from(&s, None, overview).expect("the model should name this");
+        println!("budget  title:    {title}");
+        println!("budget  subtitle: {subtitle}");
+        assert!((1..=6).contains(&title.split_whitespace().count()), "title was {title:?}");
+        assert!(subtitle.split_whitespace().count() <= 14, "subtitle was {subtitle:?}");
+        assert!(!title.to_lowercase().contains("meeting"), "the title should not say meeting: {title:?}");
+
+        // The prompt carries an example subtitle, and a small model will
+        // happily hand it back whatever it was given. A second meeting with
+        // nothing to do with budgets is the only way to tell a model that
+        // read the summary from one that copied the example.
+        let hiring = "Two of the three candidates for the backend role were discussed and the \
+            team agreed to make an offer to the second one at the top of the band. Dami is \
+            writing it up tonight. The panel still cannot agree whether to keep the take-home \
+            exercise for the next round.";
+        let (t2, s2) = name_from(&s, None, hiring).expect("the model should name this too");
+        println!("hiring  title:    {t2}");
+        println!("hiring  subtitle: {s2}");
+        assert!(!s2.to_lowercase().contains("conference"), "the example leaked into the answer: {s2:?}");
+        assert!(!s2.to_lowercase().contains("search trial"), "the example leaked into the answer: {s2:?}");
+        assert!(!t2.eq_ignore_ascii_case(&title), "both meetings got the same name: {t2:?}");
+    }
 
     fn temp_meeting(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("opendictate-meeting-test-{name}-{}", std::process::id()));

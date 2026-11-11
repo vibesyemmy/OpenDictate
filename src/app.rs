@@ -264,6 +264,7 @@ impl DictateApp {
         };
         // Lets a screenshot start on another screen:
         // --page history|meetings|dictionary|models|settings|audio|personal
+        // --open <meeting id> opens that stored meeting
         let args: Vec<String> = std::env::args().collect();
         if let Some(p) = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)) {
             match p.as_str() {
@@ -276,6 +277,12 @@ impl DictateApp {
                 "personal" => app.settings_tab = Some(SettingsTab::Personalization),
                 _ => {}
             }
+        }
+        // --open <meeting id> goes straight into one, which is the only way
+        // to put the meeting detail in front of a screenshot.
+        if let Some(id) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
+            app.page = Page::Meetings;
+            app.open_meeting(id.clone());
         }
         // Started by the login item, not by a person: come up in the menu
         // bar with no window. Logging in is not a request to be shown
