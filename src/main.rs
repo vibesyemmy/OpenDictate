@@ -172,7 +172,7 @@ fn main() -> eframe::Result<()> {
         // Writes as well as prints: the only run that proves anything about
         // the permission is one launched by LaunchServices as the signed
         // bundle, and that run has nowhere to print to.
-        let report = tap::check(6);
+        let report = tap::check(6, &settings::load_settings().microphone);
         print!("{report}");
         let path = settings::data_dir().join("tap-check.txt");
         let _ = std::fs::create_dir_all(settings::data_dir());
