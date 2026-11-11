@@ -44,6 +44,14 @@ pub struct Meta {
     /// without a word having changed.
     #[serde(default)]
     pub edited_at: Option<u64>,
+    /// Why this meeting's audio was held on to, if it was: "labelling" for
+    /// audio kept only until the far side's voices have been told apart, and
+    /// "kept" for audio the person asked to keep. Recorded when the meeting
+    /// starts, because the sweep at launch must be able to tell a leftover
+    /// from a recording somebody chose to keep - and a meeting from before
+    /// this existed has neither, and is never touched.
+    #[serde(default)]
+    pub audio_hold: Option<String>,
     pub started: u64,
     pub ended: Option<u64>,
     /// "You and the room" or "Everyone on the call", for the UI to show.
@@ -97,7 +105,11 @@ fn now() -> u64 {
 
 /// Every meeting on disk, newest first.
 pub fn list() -> Vec<Meta> {
-    let mut out: Vec<Meta> = std::fs::read_dir(root())
+    list_in(&root())
+}
+
+fn list_in(root: &Path) -> Vec<Meta> {
+    let mut out: Vec<Meta> = std::fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
@@ -114,6 +126,22 @@ pub fn transcript(id: &str) -> Vec<Segment> {
         .lines()
         .filter_map(|l| serde_json::from_str::<Segment>(l).ok())
         .collect()
+}
+
+/// Why a meeting recorded under these settings holds on to its audio, if it
+/// does. The same answer decides whether stretches are retained and what the
+/// meeting is marked with, so the two cannot drift apart.
+///
+/// Keeping for good wins over keeping for labelling: if both are on, the
+/// audio is the person's to delete, not the app's.
+pub fn audio_hold(s: &Settings) -> Option<&'static str> {
+    if s.keep_meeting_audio {
+        Some("kept")
+    } else if s.label_speakers && crate::speakers::model_path().is_some() {
+        Some("labelling")
+    } else {
+        None
+    }
 }
 
 /// What a kept stretch's audio file is called: when it began, in
@@ -138,14 +166,28 @@ pub fn clear_audio(id: &str) {
     }
 }
 
-/// Deletes audio left behind by meetings that have finished, at 1.9 MB a
-/// minute. A meeting only holds on to it between its last word and its
-/// speakers being told apart, so anything still there when the app starts is
-/// from one that did not get as far - a crash, a quit mid-labelling.
+/// Deletes audio that was only ever being held for labelling, from meetings
+/// that have finished. A meeting holds it between its last word and its
+/// voices being told apart, so any still there at launch belongs to one that
+/// did not get that far: a crash, a quit.
+///
+/// Only that kind. Audio somebody chose to keep is theirs, and a meeting from
+/// before this was recorded says nothing either way, so neither is touched. A
+/// sweep that cleared everything would delete a deliberately kept recording
+/// the first time "Keep meeting audio" was switched off.
 pub fn sweep_audio() {
-    for m in list() {
-        if m.ended.is_some() {
-            clear_audio(&m.id);
+    sweep_audio_in(&root());
+}
+
+fn sweep_audio_in(root: &Path) {
+    for m in list_in(root) {
+        if m.ended.is_some() && m.audio_hold.as_deref() == Some("labelling") {
+            let Ok(files) = std::fs::read_dir(root.join(&m.id).join("audio")) else { continue };
+            for f in files.filter_map(|f| f.ok()).map(|f| f.path()) {
+                if f.extension().is_some_and(|x| x == "wav") {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
         }
     }
 }
@@ -304,6 +346,7 @@ impl Session {
             title: chrono::Local::now().format("%A %H:%M").to_string(),
             subtitle: String::new(),
             edited_at: None,
+            audio_hold: audio_hold(s).map(str::to_string),
             started,
             ended: None,
             source: source.to_string(),
@@ -375,7 +418,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
     // for, or until the meeting is over, so that its far side can be told
     // apart then. The second is only worth doing if there is a model to do it
     // with - holding 1.9 MB a minute for nothing is not a favour.
-    let retain = s.keep_meeting_audio || (s.label_speakers && crate::speakers::model_path().is_some());
+    let retain = audio_hold(&s).is_some();
     let transcribe = |wav: &[u8]| {
         let mut server = server.borrow_mut();
         let text = crate::whisper_server::transcribe_stretch(
@@ -1285,6 +1328,7 @@ mod tests {
                 title: "t".into(),
                 subtitle: String::new(),
                 edited_at: None,
+                audio_hold: None,
                 started: 0,
                 ended: None,
                 source: "s".into(),
@@ -1351,6 +1395,43 @@ mod tests {
         let named = list().into_iter().find(|m| m.id == id).expect("meeting vanished");
         println!("TITLE:    {}", named.title);
         println!("SUBTITLE: {}", named.subtitle);
+    }
+
+    #[test]
+    fn the_sweep_removes_only_audio_the_app_was_holding_temporarily() {
+        // A scratch root, never the real one: this deletes files.
+        let root = std::env::temp_dir().join(format!("opendictate-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let make = |id: &str, ended: Option<u64>, hold: Option<&str>| {
+            let dir = root.join(id);
+            std::fs::create_dir_all(dir.join("audio")).unwrap();
+            std::fs::write(dir.join("audio").join(stretch_file(1500)), b"RIFF....").unwrap();
+            let meta = serde_json::json!({
+                "id": id, "title": "t", "started": 1, "ended": ended, "source": "s", "peak": 0.0, "audio_hold": hold,
+            });
+            std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+        };
+        make("leftover", Some(9), Some("labelling"));
+        make("kept-on-purpose", Some(9), Some("kept"));
+        make("still-recording", None, Some("labelling"));
+        // A meeting from before audio_hold existed: the field is simply absent.
+        let old = root.join("from-before");
+        std::fs::create_dir_all(old.join("audio")).unwrap();
+        std::fs::write(old.join("audio").join(stretch_file(1500)), b"RIFF....").unwrap();
+        std::fs::write(
+            old.join("meta.json"),
+            serde_json::json!({"id": "from-before", "title": "t", "started": 1, "ended": 9, "source": "s", "peak": 0.0}).to_string(),
+        )
+        .unwrap();
+
+        sweep_audio_in(&root);
+
+        let has = |id: &str| root.join(id).join("audio").join(stretch_file(1500)).exists();
+        assert!(!has("leftover"), "held for labelling and never released: swept");
+        assert!(has("kept-on-purpose"), "a recording somebody chose to keep is theirs, not the app's to sweep");
+        assert!(has("still-recording"), "a meeting in progress is not a leftover");
+        assert!(has("from-before"), "a meeting from before this existed says nothing, so nothing is done");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_meeting(name: &str) -> PathBuf {

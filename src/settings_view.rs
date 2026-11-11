@@ -802,11 +802,80 @@ fn audio_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             app.toggle_mic_test();
         }
     }
-    section(ui, crate::icon::FLASK, "Speaker testing");
+    section(ui, crate::icon::MIC_VOCAL, "Speakers");
+    let ctx = ui.ctx().clone();
+    row(
+        ui,
+        "Tell speakers apart",
+        "Labels the people on the far side of a meeting Speaker 1, Speaker 2 and so on, so you can name them. It needs a 30 MB voice model, holds a meeting's audio until the meeting is over (about 2 MB a minute, then deleted), and spends a few minutes of CPU after it.",
+        260.0,
+        |ui| {
+            let mut on = app.s.label_speakers;
+            if crate::views::kit_checkbox(ui, &mut on).changed() {
+                app.s.label_speakers = on;
+                app.changed();
+                // Turning it on is the request for the model, so fetch it
+                // rather than leave a switch that does nothing until a second
+                // button is found.
+                if on && crate::speakers::model_path().is_none() && app.download.is_none() {
+                    let p: engines::SharedProgress = Default::default();
+                    p.lock().unwrap().total = crate::speakers::DOWNLOAD_BYTES;
+                    crate::speakers::download(p.clone(), ctx.clone());
+                    app.download = Some((crate::app::SPEAKER_MODEL_KEY.to_string(), p));
+                }
+            }
+        },
+    );
+    if app.s.label_speakers {
+        row(ui, "Voice model", "Downloaded once and checked against a known fingerprint before it is used.", 260.0, |ui| {
+            if let Some((f, p)) = &app.download {
+                if f == crate::app::SPEAKER_MODEL_KEY {
+                    let p = p.lock().unwrap();
+                    let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
+                    crate::views::progress(ui, "Downloading", &format!("{:.0}%", frac * 100.0), frac, 180.0);
+                    return;
+                }
+            }
+            if crate::speakers::model_path().is_some() {
+                crate::views::status(ui, crate::views::State::Ok, "Ready");
+            } else if ui.add_enabled(app.download.is_none(), egui::Button::new("Download (30 MB)")).clicked() {
+                let p: engines::SharedProgress = Default::default();
+                p.lock().unwrap().total = crate::speakers::DOWNLOAD_BYTES;
+                crate::speakers::download(p.clone(), ctx.clone());
+                app.download = Some((crate::app::SPEAKER_MODEL_KEY.to_string(), p));
+            }
+        });
+        row(
+            ui,
+            "People on the far side",
+            "How many people are usually on the other end. This is something you say, not something it works out: left to count, the model found fourteen voices in a recording of two. You can correct it on any meeting afterwards.",
+            260.0,
+            |ui| {
+                // A row hands its right-hand side a vertical layout; without
+                // this the minus, the number and the plus stack on top of each
+                // other.
+                ui.horizontal(|ui| {
+                    let n = app.s.speaker_count as usize;
+                    if crate::views::btn(ui, "-").clicked() && n > 1 {
+                        app.s.speaker_count = (n - 1) as u8;
+                        app.changed();
+                    }
+                    ui.label(t(format!("{n}"), 15.0, theme::TEXT()));
+                    if crate::views::btn(ui, "+").clicked() && n < crate::speakers::MAX_SPEAKERS {
+                        app.s.speaker_count = (n + 1) as u8;
+                        app.changed();
+                    }
+                });
+            },
+        );
+    }
+    ui.add_space(14.0);
+
+    section(ui, crate::icon::FLASK, "Meeting audio");
     row(
         ui,
         "Keep meeting audio",
-        "Normally a meeting's audio is deleted the moment it has been transcribed. Keeping it lets speaker separation be tried against a real call - there is no way to try it on a meeting whose audio has gone. It is 1.9 MB a minute, so turn it back off afterwards.",
+        "Normally a meeting's audio is deleted the moment it has been transcribed - or, with speaker labels on, once the voices have been told apart. This keeps it on this Mac for good. It is 1.9 MB a minute, so only turn it on to try things against a real call.",
         260.0,
         |ui| {
             if crate::views::kit_checkbox(ui, &mut app.s.keep_meeting_audio).changed() {

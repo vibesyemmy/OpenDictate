@@ -522,6 +522,20 @@ pub fn label_meeting(id: &str, count: usize, model: &Path, report: &dyn Fn(&str)
     finish(described, embedder.dim(), count, |s| s.save(id))
 }
 
+/// Tells a finished meeting's voices apart and then lets go of its audio.
+///
+/// The audio goes whether or not the labelling worked. It was only ever held
+/// for this, an hour of it is more than a hundred megabytes, and a failure is
+/// not a reason to keep a recording of other people that nobody asked to
+/// keep. Unless they did: `keep` is the "keep meeting audio" setting.
+pub fn label_and_release(id: &str, count: usize, model: &Path, keep: bool, report: &dyn Fn(&str)) -> Result<Speakers, String> {
+    let out = label_meeting(id, count, model, report);
+    if !keep {
+        crate::meeting::clear_audio(id);
+    }
+    out
+}
+
 fn describe_files(embedder: &Embedder, files: &[(u64, PathBuf)], report: &dyn Fn(&str)) -> Result<Vec<Described>, String> {
     let mut out = Vec::new();
     for (i, (at_ms, path)) in files.iter().enumerate() {
@@ -895,6 +909,48 @@ mod tests {
         let raw = std::fs::read(&bin).unwrap();
         std::fs::write(&bin, &raw[..raw.len() / 2]).unwrap();
         assert!(Speakers::load_from(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- letting go of the audio ---------------------------------------------
+
+    /// A meeting directory of its own under the data dir, because that is
+    /// where `label_and_release` looks. It touches no other meeting, and is
+    /// removed afterwards whatever happens.
+    fn meeting_with_audio(tag: &str) -> (String, PathBuf) {
+        let id = format!("test-speakers-{tag}-{}", std::process::id());
+        let dir = crate::meeting::root().join(&id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        std::fs::write(dir.join("audio").join(crate::meeting::stretch_file(1500)), b"RIFF....").unwrap();
+        std::fs::write(dir.join("audio").join(crate::meeting::stretch_file(9000)), b"RIFF....").unwrap();
+        std::fs::write(dir.join("audio").join("not-audio.txt"), b"not audio").unwrap();
+        (id, dir)
+    }
+
+    fn wavs_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("audio"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
+            .count()
+    }
+
+    #[test]
+    fn the_audio_is_let_go_even_when_the_labelling_failed() {
+        let (id, dir) = meeting_with_audio("failed");
+        let out = label_and_release(&id, 2, Path::new("/nowhere/model.onnx"), false, &|_| {});
+        assert!(out.is_err(), "there is no model, so this cannot have worked");
+        assert_eq!(wavs_in(&dir), 0, "a failure is not a reason to hold on to a recording of other people");
+        assert!(dir.join("audio").join("not-audio.txt").exists(), "and only the audio goes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_audio_stays_when_it_was_asked_to() {
+        let (id, dir) = meeting_with_audio("kept");
+        let _ = label_and_release(&id, 2, Path::new("/nowhere/model.onnx"), true, &|_| {});
+        assert_eq!(wavs_in(&dir), 2, "Keep meeting audio means keep it, labelled or not");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

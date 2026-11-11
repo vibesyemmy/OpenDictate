@@ -49,6 +49,11 @@ pub struct JobOut {
     pub note: Option<String>,
 }
 
+/// Names the voice-model download in the one slot the app has for downloads.
+/// Without it the completion handler would take any file that was not an
+/// Ollama model for a whisper one, and point speech recognition at it.
+pub const SPEAKER_MODEL_KEY: &str = "speaker-voice-model";
+
 /// What we know about the models right now (refreshed in the background).
 #[derive(Default, Clone)]
 pub struct Health {
@@ -149,6 +154,18 @@ pub struct DictateApp {
     pub summarising: Option<String>,
     pub summary_progress: Arc<Mutex<String>>,
     summary_rx: Option<Receiver<(String, Result<crate::meeting::Summary, String>)>>,
+    /// Who spoke on the far side of the open meeting, if it was told apart.
+    pub open_speakers: Option<crate::speakers::Speakers>,
+    /// Who spoke each of `open_segments`, in the same order. Worked out once
+    /// when a meeting is opened, not every frame.
+    pub speaker_lines: Vec<Vec<usize>>,
+    /// The meeting whose voices are being told apart right now, and how far
+    /// along that is.
+    pub labelling: Option<String>,
+    pub label_progress: Arc<Mutex<String>>,
+    label_rx: Option<Receiver<(String, Result<crate::speakers::Speakers, String>)>>,
+    /// The speaker being renamed, and what has been typed so far.
+    pub renaming_speaker: Option<(usize, String)>,
     /// The window the backdrop is attached to, if any.
     ///
     /// Not a flag: closing the window destroys it and the backdrop with it,
@@ -257,6 +274,12 @@ impl DictateApp {
             summarising: None,
             summary_progress: Arc::new(Mutex::new(String::new())),
             summary_rx: None,
+            open_speakers: None,
+            speaker_lines: Vec::new(),
+            labelling: None,
+            label_progress: Arc::new(Mutex::new(String::new())),
+            label_rx: None,
+            renaming_speaker: None,
             blurred_window: None,
             was_active: true,
             hooked: false,
@@ -294,6 +317,13 @@ impl DictateApp {
         // reason people turn a login item back off.
         if args.iter().any(|a| a == "--hidden") {
             app.window_open = false;
+        }
+        // Meeting audio is held only between a meeting's last word and its
+        // speakers being told apart. What is still here at launch belongs to
+        // one that never got that far - a crash, a quit - and is 1.9 MB a
+        // minute that nothing else would ever clear.
+        if !app.s.keep_meeting_audio {
+            std::thread::spawn(crate::meeting::sweep_audio);
         }
         app.prune_history();
         app.refresh_mics();
@@ -491,7 +521,8 @@ impl DictateApp {
                 self.notify("Meeting saved, but nothing was transcribed", true);
             } else {
                 self.notify("Meeting saved · summarising", false);
-                self.start_summary(id);
+                self.start_summary(id.clone());
+                self.start_labelling(id);
             }
             return;
         }
@@ -561,11 +592,93 @@ impl DictateApp {
     pub fn open_meeting(&mut self, id: String) {
         // A half-typed correction belongs to the meeting it was started in.
         self.editing_line = None;
+        self.renaming_speaker = None;
         self.open_summary = crate::meeting::summary(&id);
         self.open_segments = crate::meeting::transcript(&id);
+        self.open_speakers = crate::speakers::Speakers::load(&id);
+        self.refresh_speaker_lines();
         self.refresh_meetings();
         self.open_meta = self.meeting_list.iter().find(|m| m.id == id).cloned();
         self.open_meeting = Some(id);
+    }
+
+    /// Works out who spoke each line of the open meeting.
+    pub fn refresh_speaker_lines(&mut self) {
+        self.speaker_lines = match &self.open_speakers {
+            Some(sp) => sp.lines(&self.open_segments),
+            None => Vec::new(),
+        };
+    }
+
+    /// Tells the voices on the far side of a finished meeting apart, in the
+    /// background, and then lets go of the audio that made it possible.
+    ///
+    /// Runs beside the summary rather than before it: neither needs the
+    /// other, and the summary is the one somebody is waiting for.
+    pub fn start_labelling(&mut self, id: String) {
+        if !self.s.label_speakers || self.labelling.is_some() {
+            return;
+        }
+        let Some(model) = crate::speakers::model_path() else {
+            // Nothing was held for it, so there is nothing to do and nothing to say.
+            return;
+        };
+        let (tx, rx) = channel();
+        let progress = self.label_progress.clone();
+        let (count, keep) = (self.s.speaker_count as usize, self.s.keep_meeting_audio);
+        let for_thread = id.clone();
+        std::thread::spawn(move || {
+            let out = crate::speakers::label_and_release(&for_thread, count, &model, keep, &|m| {
+                if let Ok(mut p) = progress.lock() {
+                    *p = m.to_string();
+                }
+            });
+            let _ = tx.send((for_thread, out));
+        });
+        if let Ok(mut p) = self.label_progress.lock() {
+            *p = "Listening to the voices…".into();
+        }
+        self.labelling = Some(id);
+        self.label_rx = Some(rx);
+    }
+
+    /// Picks up finished speaker labels. Called once a frame.
+    fn collect_labelling(&mut self) {
+        let Some(rx) = &self.label_rx else { return };
+        let Ok((id, out)) = rx.try_recv() else { return };
+        self.label_rx = None;
+        self.labelling = None;
+        match out {
+            Ok(_) => {
+                if self.open_meeting.as_deref() == Some(id.as_str()) {
+                    self.open_speakers = crate::speakers::Speakers::load(&id);
+                    self.refresh_speaker_lines();
+                }
+                self.notify("Voices told apart", false);
+            }
+            Err(e) => self.notify(e, true),
+        }
+    }
+
+    /// Names a speaker in the open meeting. An empty name puts the number back.
+    pub fn rename_speaker(&mut self, speaker: usize, name: &str) {
+        let (Some(id), Some(sp)) = (self.open_meeting.clone(), self.open_speakers.as_mut()) else { return };
+        sp.rename(speaker, name);
+        if let Err(e) = sp.save(&id) {
+            self.notify(e, true);
+        }
+    }
+
+    /// Groups the open meeting's voices again into `people`. Needs no audio:
+    /// the voices were kept, and this is what they were kept for.
+    pub fn regroup_speakers(&mut self, people: usize) {
+        let (Some(id), Some(sp)) = (self.open_meeting.clone(), self.open_speakers.as_mut()) else { return };
+        sp.regroup(people);
+        let saved = sp.save(&id);
+        self.refresh_speaker_lines();
+        if let Err(e) = saved {
+            self.notify(e, true);
+        }
     }
 
     /// Re-reads the list of meetings. Called when the page is opened and
@@ -1221,6 +1334,7 @@ impl eframe::App for DictateApp {
             crate::macos_look::set_backdrop_tint(theme::sheer_rgba());
         }
         self.collect_summary();
+        self.collect_labelling();
         self.window_lifecycle(ctx);
         while let Ok(e) = self.hk_rx.try_recv() {
             if self.capturing_key.is_none() {
@@ -1242,6 +1356,8 @@ impl eframe::App for DictateApp {
                     None => {
                         if file.starts_with("ollama:") {
                             self.notify("Model downloaded", false);
+                        } else if file == SPEAKER_MODEL_KEY {
+                            self.notify("Voice model ready", false);
                         } else {
                             self.s.whisper_model = settings::models_dir().join(&file).to_string_lossy().into_owned();
                             self.changed();
