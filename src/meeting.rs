@@ -461,14 +461,24 @@ No bullet points, no preamble, no sign-off. Only what the notes say.";
 
 const NAME: &str = "You are naming a meeting from its summary, the way someone would \
 name it in a list of meetings.\n\n\
-title: the subject of the meeting, two to five words, built from the things the \
-summary actually names - the project, the people, the decision. No date, no time, no \
+title: the subject, two to five words, built from the things the summary actually \
+names. If it is mostly about one person, product or project, the title is that name - \
+a summary about Marie Curie and radium is \"Marie Curie And Radium\", not \"Early \
+Experiments\". No date, no time, no \
 weekday, and never the word \"meeting\". Capitalise it like a heading. A title that \
 would fit any meeting at all, such as \"Recent Developments\", \"Team Meeting\" or \
 \"General Discussion\", is a failure: name what this one was about.\n\
 subtitle: what came of it, under twelve words, written as a sentence in ordinary \
 sentence case. The outcome, not the subject again. Leave it empty rather than padding it.\n\n\
 Use only what the notes below say. Every word you write must come from them.";
+
+const OVERVIEW_TALK: &str = "You are writing the opening of a summary for someone who \
+missed this.\n\n\
+You get part of what was said, in order. Two or three sentences, plain and factual, \
+saying what was talked about. No bullet points, no preamble, no sign-off.\n\n\
+Only what the transcript says. Nothing was decided and nobody took anything on, so do \
+not write as though they had: say what the subject was and what was said about it. \
+Never invent a project, a deadline, a team or a next meeting.";
 
 const STILL_OPEN: &str = "You are checking which questions from a meeting were left unanswered.\n\n\
 You get a list of questions and a list of what the meeting decided and assigned. Output only the \
@@ -628,13 +638,41 @@ fn content_words(line: &str) -> Vec<String> {
 /// other half is not trusting the answer - most of what a name says has to
 /// appear in the notes it was made from.
 fn grounded(line: &str, notes: &str) -> bool {
-    let notes = notes.to_lowercase();
+    overlap(line, notes) >= 0.5
+}
+
+/// The share of a line's meaningful words that appear in its source.
+fn overlap(line: &str, source: &str) -> f32 {
+    let source = source.to_lowercase();
     let words = content_words(line);
     if words.is_empty() {
-        return false;
+        return 0.0;
     }
-    let hits = words.iter().filter(|w| notes.contains(w.as_str())).count();
-    hits * 2 >= words.len()
+    words.iter().filter(|w| source.contains(w.as_str())).count() as f32 / words.len() as f32
+}
+
+/// How much of an overview must come from the transcript.
+///
+/// Far below the bar a name has to clear, because an overview is a paraphrase
+/// and is meant to use its own words. The number comes from measuring every
+/// meeting on one Mac: the ones written from real notes scored 15% to 65%,
+/// and the three written from nothing scored 0%, 3% and 7%. A fabricated
+/// summary is not a worse summary, it is a false one, so the bar only has to
+/// separate those two groups.
+const OVERVIEW_FLOOR: f32 = 0.10;
+
+/// Enough of a long transcript for a model to say what it was about.
+///
+/// The opening sets the subject and the end carries wherever it got to, so
+/// those are the halves kept. The middle of an hour is the part an overview
+/// can most afford to lose.
+fn sample(text: &str, words: usize) -> String {
+    let all: Vec<&str> = text.split_whitespace().collect();
+    if all.len() <= words {
+        return all.join(" ");
+    }
+    let half = words / 2;
+    format!("{}\n…\n{}", all[..half].join(" "), all[all.len() - half..].join(" "))
 }
 
 /// Asks the model for a title and a subtitle, from the notes the summary
@@ -670,6 +708,23 @@ fn name_from(s: &Settings, model: Option<&str>, overview: &str, decisions: &[Str
         subtitle
     };
     Some((title, subtitle))
+}
+
+/// The opening paragraph of a summary, and the check that it is true.
+///
+/// `barren` means the meeting decided nothing and assigned nothing, so the
+/// notes are empty and the transcript is the only source there is.
+fn write_overview(s: &Settings, model: Option<&str>, notes: &str, spoken: &str, barren: bool) -> Result<String, String> {
+    let out = if barren {
+        crate::engines::chat_as(s, model, OVERVIEW_TALK, &[], &sample(spoken, 350))?
+    } else {
+        crate::engines::chat_as(s, model, OVERVIEW, &[], notes)?
+    };
+    let out = out.trim().to_string();
+    // A summary that is merely thin is worth keeping. One that describes a
+    // meeting that did not happen is not, and it is worse than none at all
+    // because it reads like the real thing.
+    Ok(if overlap(&out, spoken) >= OVERVIEW_FLOOR { out } else { String::new() })
 }
 
 pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Summary, String> {
@@ -755,7 +810,20 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         decisions.join("\n"),
         actions.join("\n")
     );
-    let overview = crate::engines::chat_as(s, model, OVERVIEW, &[], &notes)?.trim().to_string();
+    let spoken: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+
+    // A talk, a lecture or a call that settled nothing leaves both lists
+    // empty, and the overview used to be written from those empty lists -
+    // which is to say from nothing. A model handed nothing invents: a
+    // recording about Thomas Edison was summarised as a project timeline
+    // review with resource allocation and a follow-up in two weeks, none of
+    // which was said. Nothing to list is not nothing to say, so when there
+    // is nothing to list the transcript is what gets summarised.
+    let barren = decisions.is_empty() && actions.is_empty();
+    let overview = write_overview(s, model, &notes, &spoken, barren)?;
+    if overview.is_empty() && barren {
+        return Err("Nothing in this meeting could be summarised without making it up.".into());
+    }
 
     // Naming it is the last thing that could fail, and the least important,
     // so a failure here costs the meeting its name and nothing else: the
@@ -825,6 +893,28 @@ mod tests {
         assert_eq!(tidy("", 6), "");
         assert_eq!(tidy("   ", 6), "");
         assert_eq!(tidy("\"\"", 6), "");
+    }
+
+    #[test]
+    fn overlap_separates_a_paraphrase_from_an_invention() {
+        let spoken = "Thomas Edison and the electric light. The filament kept oxidising until \
+            they found a way to stop it, and the real invention was the laboratory itself.";
+        let real = "The talk went through Edison's work on the electric light and the trouble \
+            with the filament oxidising, and argued his real invention was the laboratory.";
+        let invented = "The meeting discussed the upcoming project timeline and deadlines. Key \
+            decisions were made regarding resource allocation and task prioritization.";
+        assert!(overlap(real, spoken) >= OVERVIEW_FLOOR, "{}", overlap(real, spoken));
+        assert!(overlap(invented, spoken) < OVERVIEW_FLOOR, "{}", overlap(invented, spoken));
+    }
+
+    #[test]
+    fn sample_keeps_both_ends_of_a_long_transcript() {
+        let text: String = (0..1000).map(|i| format!("w{i} ")).collect();
+        let got = sample(&text, 100);
+        assert!(got.starts_with("w0 w1 "), "{}", &got[..20]);
+        assert!(got.ends_with("w998 w999"), "{}", &got[got.len() - 20..]);
+        assert!(got.contains('…'));
+        assert!(sample("short one", 100) == "short one");
     }
 
     /// The exact failure a real meeting produced: a recording about a
@@ -912,6 +1002,30 @@ mod tests {
             assert!(!s3.to_lowercase().contains("conference"), "the old example came back: {s3:?}");
             assert!(!EMPTY_TITLES.contains(&t3.to_lowercase().as_str()), "a title that fits anything: {t3:?}");
         }
+    }
+
+    /// Run against a real stored meeting:
+    ///   MEETING_ID=2026-11-11-130316 cargo test --release summarises_a_talk \
+    ///     -- --ignored --nocapture
+    /// Read-only: it writes nothing back.
+    #[test]
+    #[ignore = "needs Ollama and MEETING_ID naming a stored meeting"]
+    fn summarises_a_talk_from_what_was_said() {
+        let id = std::env::var("MEETING_ID").expect("set MEETING_ID");
+        let spoken: String = transcript(&id).iter().map(|s| s.text.clone()).collect::<Vec<_>>().join(" ");
+        assert!(!spoken.is_empty(), "no transcript for {id}");
+        let s = Settings {
+            text_engine: crate::settings::TextEngine::Ollama,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2:3b".into(),
+            ..Settings::default()
+        };
+        let overview = write_overview(&s, None, "", &spoken, true).unwrap();
+        println!("overview: {overview}");
+        println!("overlap:  {:.0}%", overlap(&overview, &spoken) * 100.0);
+        assert!(!overview.is_empty(), "the overview was rejected as invented");
+        let named = name_from(&s, None, &overview, &[], &[]);
+        println!("named:    {named:?}");
     }
 
     fn temp_meeting(name: &str) -> PathBuf {
