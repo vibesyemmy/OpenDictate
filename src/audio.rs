@@ -13,6 +13,18 @@ pub struct Recording {
     info: String,
     /// Last error the audio system reported while recording.
     error: Arc<Mutex<Option<String>>>,
+    device_name: String,
+    gain: f32,
+    prior: Vec<f32>,
+    last_check: std::time::Instant,
+}
+
+fn needs_recovery(device: &str, available: &[String], stream_error: bool) -> bool {
+    stream_error || (!device.is_empty() && !available.iter().any(|name| name == device))
+}
+
+fn append_section(out: &mut Vec<f32>, samples: &[f32], rate: u32) {
+    out.extend(resample(samples, rate, 16_000));
 }
 
 fn device_name(d: &cpal::Device) -> Option<String> {
@@ -45,9 +57,16 @@ impl Recording {
                 .ok()
                 .and_then(|mut it| it.find(|d| device_name(d).as_deref() == Some(mic)))
         };
-        let device = chosen
-            .or_else(|| host.default_input_device())
-            .ok_or("No microphone found. Check System Settings › Sound › Input.")?;
+        if let Some(device) = chosen {
+            if let Ok(recording) = Self::open(device, gain) {
+                return Ok(recording);
+            }
+        }
+        let device = host.default_input_device().ok_or("No microphone found. Check System Settings › Sound › Input.")?;
+        Self::open(device, gain)
+    }
+
+    fn open(device: cpal::Device, gain: f32) -> Result<Self, String> {
         let gain = gain.clamp(0.1, 8.0);
         let supported = device
             .default_input_config()
@@ -125,7 +144,32 @@ impl Recording {
         .map_err(|e| format!("Could not open the microphone: {e}"))?;
         stream.play().map_err(|e| format!("Could not start the microphone: {e}"))?;
 
-        Ok(Self { stream, samples, level, rate, started: std::time::Instant::now(), info, error })
+        Ok(Self { stream, samples, level, rate, started: std::time::Instant::now(), info, error,
+            device_name: device_name(&device).unwrap_or_default(), gain, prior: Vec::new(), last_check: std::time::Instant::now() })
+    }
+
+    /// Preserve the old section and continue on the current system input.
+    pub fn recover_if_needed(&mut self) -> Option<Result<String, String>> {
+        if self.last_check.elapsed() < std::time::Duration::from_secs(1) { return None; }
+        self.last_check = std::time::Instant::now();
+        if !needs_recovery(&self.device_name, &input_devices(), self.error().is_some()) { return None; }
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => return Some(Err("Microphone disconnected; no system microphone is available.".into())),
+        };
+        let mut next = match Self::open(device, self.gain) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(format!("Microphone disconnected; could not switch to the system input: {e}"))),
+        };
+        let old = std::mem::replace(self, next);
+        let started = old.started;
+        let mut prior = old.prior;
+        drop(old.stream);
+        append_section(&mut prior, &old.samples.lock().unwrap(), old.rate);
+        self.prior = prior;
+        self.started = started;
+        Some(Ok(self.device_name.clone()))
     }
 
     pub fn info(&self) -> String {
@@ -158,7 +202,9 @@ impl Recording {
     pub fn finish(self) -> Clip {
         drop(self.stream);
         let raw = std::mem::take(&mut *self.samples.lock().unwrap());
-        Clip { samples: resample(&raw, self.rate, 16_000) }
+        let mut samples = self.prior;
+        append_section(&mut samples, &raw, self.rate);
+        Clip { samples }
     }
 }
 
@@ -220,4 +266,27 @@ fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
             slice.iter().sum::<f32>() / slice.len() as f32
         })
         .collect()
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn joins_recorded_sections_with_different_sample_rates_in_order() {
+        let mut samples = Vec::new();
+        append_section(&mut samples, &[0.5; 480], 48_000);
+        append_section(&mut samples, &[-0.5; 160], 16_000);
+        assert_eq!(samples.len(), 320);
+        assert!(samples[..160].iter().all(|x| *x == 0.5));
+        assert!(samples[160..].iter().all(|x| *x == -0.5));
+    }
+
+    #[test]
+    fn recovery_only_triggers_for_missing_device_or_stream_error() {
+        assert!(!needs_recovery("External", &["External".into()], false));
+        assert!(needs_recovery("External", &["Built-in".into()], false));
+        assert!(needs_recovery("External", &["External".into()], true));
+        assert!(!needs_recovery("", &[], false));
+    }
 }

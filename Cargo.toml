@@ -15,19 +15,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tray-icon = "0.26.1"
 ureq = { version = "3", features = ["json"] }
-# Speaker recognition: finds who is talking in a meeting and which voice is
-# which. Statically linked, so the app stays one file to sign. The build
-# script downloads a prebuilt ~21 MB archive from k2-fsa's GitHub releases
-# (override with SHERPA_ONNX_LIB_DIR to build offline). The measured
-# two-speaker result came from this engine, so this is what ships.
-sherpa-onnx = "2.0.1"
-# Checks the speaker models against a pinned hash before they are loaded.
-# Already in the tree, so this adds no new code to the build.
-sha2 = "0.11"
-
 # AppKit, for the two window things egui has no builder for: the backdrop
 # blur and the Dock tile. Both versions are already in the tree via winit.
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.25"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication", "NSColor", "NSGraphics", "NSImage", "NSResponder",

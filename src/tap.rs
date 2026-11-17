@@ -62,6 +62,7 @@ pub struct SystemCapture {
     pub rate: f64,
     /// Whether the microphone made it into the same device, or only the tap.
     pub has_mic: bool,
+    pub mic: Option<AudioObjectID>,
 }
 
 /// One pass of audio, with the two sides kept apart.
@@ -303,6 +304,10 @@ pub fn meeting_input(configured: &str) -> Option<AudioObjectID> {
     input_named(configured).or_else(default_input)
 }
 
+pub fn input_present(id: AudioObjectID) -> bool {
+    input_devices().iter().any(|(device, _)| *device == id)
+}
+
 /// The Core Audio id of the system's default input.
 /// Makes the audio chain run.
 ///
@@ -480,7 +485,7 @@ impl SystemCapture {
                 return Err(format!("system audio was refused (start {})", status(st)));
             }
             wake();
-            Ok(Self { tap, device, proc_id, sink, rate, has_mic })
+            Ok(Self { tap, device, proc_id, sink, rate, has_mic, mic: if has_mic { mic } else { None } })
         }
     }
 

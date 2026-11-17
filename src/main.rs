@@ -10,7 +10,6 @@ mod meeting;
 mod macos_look;
 mod search;
 mod settings;
-mod speakers;
 mod settings_view;
 mod stats;
 mod talking;
@@ -169,10 +168,6 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
-    if args.iter().any(|a| a == "--speakers-check") {
-        print!("{}", speakers::check(&args));
-        return Ok(());
-    }
     if args.iter().any(|a| a == "--tap-check") {
         // Writes as well as prints: the only run that proves anything about
         // the permission is one launched by LaunchServices as the signed
@@ -256,3 +251,5 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| Ok(Box::new(app::DictateApp::new(cc, screenshot)))),
     )
 }
+
+mod chords;

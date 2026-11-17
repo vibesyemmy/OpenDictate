@@ -49,10 +49,23 @@ pub struct JobOut {
     pub note: Option<String>,
 }
 
-/// Names the voice-model download in the one slot the app has for downloads.
-/// Without it the completion handler would take any file that was not an
-/// Ollama model for a whisper one, and point speech recognition at it.
-pub const SPEAKER_MODEL_KEY: &str = "speaker-voice-model";
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingResult {
+    Speech,
+    NoSpeech,
+    NoAudio,
+    StreamError(String),
+}
+
+fn classify_recording(clip: &crate::audio::Clip, elapsed: f32, error: Option<&str>) -> RecordingResult {
+    if let Some(error) = error {
+        return RecordingResult::StreamError(error.to_owned());
+    }
+    if clip.samples.is_empty() && elapsed >= 1.0 {
+        return RecordingResult::NoAudio;
+    }
+    if clip.is_silent() { RecordingResult::NoSpeech } else { RecordingResult::Speech }
+}
 
 /// What we know about the models right now (refreshed in the background).
 #[derive(Default, Clone)]
@@ -89,10 +102,18 @@ pub struct DictateApp {
     hk_rx: Receiver<GlobalHotKeyEvent>,
     pub hotkey_errors: Vec<String>,
     pub capturing_key: Option<Trigger>,
+    pub capture_first_key: Option<egui::Key>,
+    #[cfg(target_os = "macos")]
+    chord_listener: Option<crate::chords::mac::Listener>,
+    chord_tx: Sender<(usize, bool)>,
+    chord_rx: Receiver<(usize, bool)>,
+    chord_triggers: Vec<Trigger>,
+    chord_ctx: egui::Context,
 
     /// Microphones found on the system, and the system default's name.
     pub mics: Vec<String>,
     pub default_mic: Option<String>,
+    last_mic_refresh: Instant,
     /// Live recording used only to show the level meter in Settings.
     pub mic_test: Option<Recording>,
 
@@ -154,18 +175,6 @@ pub struct DictateApp {
     pub summarising: Option<String>,
     pub summary_progress: Arc<Mutex<String>>,
     summary_rx: Option<Receiver<(String, Result<crate::meeting::Summary, String>)>>,
-    /// Who spoke on the far side of the open meeting, if it was told apart.
-    pub open_speakers: Option<crate::speakers::Speakers>,
-    /// Who spoke each of `open_segments`, in the same order. Worked out once
-    /// when a meeting is opened, not every frame.
-    pub speaker_lines: Vec<Vec<usize>>,
-    /// The meeting whose voices are being told apart right now, and how far
-    /// along that is.
-    pub labelling: Option<String>,
-    pub label_progress: Arc<Mutex<String>>,
-    label_rx: Option<Receiver<(String, Result<crate::speakers::Speakers, String>)>>,
-    /// The speaker being renamed, and what has been typed so far.
-    pub renaming_speaker: Option<(usize, String)>,
     /// The window the backdrop is attached to, if any.
     ///
     /// Not a flag: closing the window destroys it and the backdrop with it,
@@ -206,6 +215,7 @@ impl DictateApp {
         theme::install(&cc.egui_ctx);
         let (jobs_tx, jobs_rx) = channel();
         let (hk_tx, hk_rx) = channel();
+        let (chord_tx, chord_rx) = channel();
         let ctx = cc.egui_ctx.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             let _ = hk_tx.send(e);
@@ -234,8 +244,16 @@ impl DictateApp {
             hk_rx,
             hotkey_errors: Vec::new(),
             capturing_key: None,
+            capture_first_key: None,
+            #[cfg(target_os = "macos")]
+            chord_listener: None,
+            chord_tx,
+            chord_rx,
+            chord_triggers: Vec::new(),
+            chord_ctx: cc.egui_ctx.clone(),
             mics: Vec::new(),
             default_mic: None,
+            last_mic_refresh: Instant::now(),
             mic_test: None,
             health: Default::default(),
             download: None,
@@ -274,12 +292,6 @@ impl DictateApp {
             summarising: None,
             summary_progress: Arc::new(Mutex::new(String::new())),
             summary_rx: None,
-            open_speakers: None,
-            speaker_lines: Vec::new(),
-            labelling: None,
-            label_progress: Arc::new(Mutex::new(String::new())),
-            label_rx: None,
-            renaming_speaker: None,
             blurred_window: None,
             was_active: true,
             hooked: false,
@@ -318,10 +330,8 @@ impl DictateApp {
         if args.iter().any(|a| a == "--hidden") {
             app.window_open = false;
         }
-        // Meeting audio is held only between a meeting's last word and its
-        // speakers being told apart. What is still here at launch belongs to
-        // one that never got that far - a crash, a quit - and is 1.9 MB a
-        // minute that nothing else would ever clear.
+        // Clean up audio that an older version held temporarily for speaker
+        // labelling; explicitly retained recordings remain untouched.
         if !app.s.keep_meeting_audio {
             std::thread::spawn(crate::meeting::sweep_audio);
         }
@@ -447,6 +457,10 @@ impl DictateApp {
 
     pub fn register_hotkeys(&mut self) {
         self.hotkey_errors.clear();
+        #[cfg(target_os = "macos")]
+        { self.chord_listener = None; }
+        while self.chord_rx.try_recv().is_ok() {}
+        self.chord_triggers.clear();
         let Some(mgr) = &self.hotkeys else {
             if self.shot.is_none() {
                 self.hotkey_errors.push("Global shortcuts are unavailable on this system.".into());
@@ -459,7 +473,18 @@ impl DictateApp {
             .iter()
             .flat_map(|t| self.s.trigger_keys(*t).iter().map(|k| (k.clone(), *t)))
             .collect();
+        let mut chords = Vec::new();
         for (k, trigger) in want {
+            if let Some((a, b)) = crate::chords::parse(&k) {
+                if chords.iter().any(|(x,y,_)| (*x == a && *y == b) || (*x == b && *y == a)) {
+                    self.hotkey_errors.push(format!("{k}: shortcut is already assigned."));
+                    continue;
+                }
+                let id = self.chord_triggers.len();
+                self.chord_triggers.push(trigger);
+                chords.push((a,b,id));
+                continue;
+            }
             match k.parse::<HotKey>() {
                 Ok(h) => match mgr.register(h) {
                     Ok(()) => self.registered.push((h, trigger)),
@@ -468,24 +493,43 @@ impl DictateApp {
                 Err(e) => self.hotkey_errors.push(format!("{k}: {e}")),
             }
         }
+        #[cfg(target_os = "macos")]
+        if !chords.is_empty() {
+            match crate::chords::mac::Listener::new(chords, self.chord_tx.clone(), self.chord_ctx.clone()) {
+                Ok(listener) => self.chord_listener = Some(listener),
+                Err(e) => self.hotkey_errors.push(e),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if !chords.is_empty() { self.hotkey_errors.push("Two-key shortcuts are currently available only on macOS.".into()); }
+    }
+
+    pub fn pause_chord_capture(&mut self) {
+        #[cfg(target_os = "macos")]
+        { self.chord_listener = None; }
+        self.capture_first_key = None;
     }
 
     fn on_hotkey(&mut self, ctx: &egui::Context, e: GlobalHotKeyEvent) {
         let Some(trigger) = self.registered.iter().find(|(h, _)| h.id() == e.id).map(|(_, a)| *a) else {
             return;
         };
+        self.on_trigger(ctx, trigger, e.state);
+    }
+
+    fn on_trigger(&mut self, ctx: &egui::Context, trigger: Trigger, state: HotKeyState) {
         // A meeting is always a toggle: hold-to-talk makes no sense for
         // something that runs for an hour.
         let action = match trigger {
             Trigger::Meeting => {
-                if e.state == HotKeyState::Pressed {
+                if state == HotKeyState::Pressed {
                     self.toggle_meeting();
                 }
                 return;
             }
             Trigger::Act(a) => a,
         };
-        match e.state {
+        match state {
             HotKeyState::Pressed => {
                 if let Some((_, current, _)) = &self.recording {
                     if !self.s.hold_to_talk && *current == action {
@@ -522,7 +566,6 @@ impl DictateApp {
             } else {
                 self.notify("Meeting saved · summarising", false);
                 self.start_summary(id.clone());
-                self.start_labelling(id);
             }
             return;
         }
@@ -592,93 +635,11 @@ impl DictateApp {
     pub fn open_meeting(&mut self, id: String) {
         // A half-typed correction belongs to the meeting it was started in.
         self.editing_line = None;
-        self.renaming_speaker = None;
         self.open_summary = crate::meeting::summary(&id);
         self.open_segments = crate::meeting::transcript(&id);
-        self.open_speakers = crate::speakers::Speakers::load(&id);
-        self.refresh_speaker_lines();
         self.refresh_meetings();
         self.open_meta = self.meeting_list.iter().find(|m| m.id == id).cloned();
         self.open_meeting = Some(id);
-    }
-
-    /// Works out who spoke each line of the open meeting.
-    pub fn refresh_speaker_lines(&mut self) {
-        self.speaker_lines = match &self.open_speakers {
-            Some(sp) => sp.lines(&self.open_segments),
-            None => Vec::new(),
-        };
-    }
-
-    /// Tells the voices on the far side of a finished meeting apart, in the
-    /// background, and then lets go of the audio that made it possible.
-    ///
-    /// Runs beside the summary rather than before it: neither needs the
-    /// other, and the summary is the one somebody is waiting for.
-    pub fn start_labelling(&mut self, id: String) {
-        if !self.s.label_speakers || self.labelling.is_some() {
-            return;
-        }
-        let Some(model) = crate::speakers::model_path() else {
-            // Nothing was held for it, so there is nothing to do and nothing to say.
-            return;
-        };
-        let (tx, rx) = channel();
-        let progress = self.label_progress.clone();
-        let (count, keep) = (self.s.speaker_count as usize, self.s.keep_meeting_audio);
-        let for_thread = id.clone();
-        std::thread::spawn(move || {
-            let out = crate::speakers::label_and_release(&for_thread, count, &model, keep, &|m| {
-                if let Ok(mut p) = progress.lock() {
-                    *p = m.to_string();
-                }
-            });
-            let _ = tx.send((for_thread, out));
-        });
-        if let Ok(mut p) = self.label_progress.lock() {
-            *p = "Listening to the voices…".into();
-        }
-        self.labelling = Some(id);
-        self.label_rx = Some(rx);
-    }
-
-    /// Picks up finished speaker labels. Called once a frame.
-    fn collect_labelling(&mut self) {
-        let Some(rx) = &self.label_rx else { return };
-        let Ok((id, out)) = rx.try_recv() else { return };
-        self.label_rx = None;
-        self.labelling = None;
-        match out {
-            Ok(_) => {
-                if self.open_meeting.as_deref() == Some(id.as_str()) {
-                    self.open_speakers = crate::speakers::Speakers::load(&id);
-                    self.refresh_speaker_lines();
-                }
-                self.notify("Voices told apart", false);
-            }
-            Err(e) => self.notify(e, true),
-        }
-    }
-
-    /// Names a speaker in the open meeting. An empty name puts the number back.
-    pub fn rename_speaker(&mut self, speaker: usize, name: &str) {
-        let (Some(id), Some(sp)) = (self.open_meeting.clone(), self.open_speakers.as_mut()) else { return };
-        sp.rename(speaker, name);
-        if let Err(e) = sp.save(&id) {
-            self.notify(e, true);
-        }
-    }
-
-    /// Groups the open meeting's voices again into `people`. Needs no audio:
-    /// the voices were kept, and this is what they were kept for.
-    pub fn regroup_speakers(&mut self, people: usize) {
-        let (Some(id), Some(sp)) = (self.open_meeting.clone(), self.open_speakers.as_mut()) else { return };
-        sp.regroup(people);
-        let saved = sp.save(&id);
-        self.refresh_speaker_lines();
-        if let Err(e) = saved {
-            self.notify(e, true);
-        }
     }
 
     /// Re-reads the list of meetings. Called when the page is opened and
@@ -702,6 +663,7 @@ impl DictateApp {
     pub fn refresh_mics(&mut self) {
         self.mics = crate::audio::input_devices();
         self.default_mic = crate::audio::default_input_name();
+        self.last_mic_refresh = Instant::now();
     }
 
     /// Starts or stops the microphone test in Settings.
@@ -723,24 +685,26 @@ impl DictateApp {
         let Some((rec, action, selection)) = self.recording.take() else { return };
         // Long finished by now; joining only collects it.
         let selection = selection.and_then(|h| h.join().ok()).unwrap_or_default();
+        let elapsed = rec.elapsed();
+        let stream_error = rec.error();
         let clip = rec.finish();
         let when = settings::now_secs();
         let seconds = clip.seconds();
-        if clip.is_silent() {
-            if seconds >= 0.3 {
-                let wav = clip.to_wav();
-                self.add_failure(action, when, seconds, &selection, "Audio is silent.", &wav);
+        match classify_recording(&clip, elapsed, stream_error.as_deref()) {
+            RecordingResult::NoSpeech => { self.notify("No speech detected.", false); return; }
+            RecordingResult::NoAudio => {
+                self.notify("No audio received. Check your microphone in Settings › Audio input.", true);
+                return;
             }
-            let blocked = seconds >= 0.3 && clip.samples.iter().all(|v| *v == 0.0);
-            self.notify(
-                if blocked {
-                    "macOS is blocking the microphone. Allow Open Dictate in Privacy & Security › Microphone (Settings › Audio input)."
-                } else {
-                    "Audio is silent. Check your microphone in Settings › Audio input."
-                },
-                true,
-            );
-            return;
+            RecordingResult::StreamError(error) => {
+                let message = format!("Microphone error: {error}");
+                if !clip.samples.is_empty() {
+                    self.add_failure(action, when, seconds, &selection, &message, &clip.to_wav());
+                }
+                self.notify(message, true);
+                return;
+            }
+            RecordingResult::Speech => {}
         }
         self.run_job(ctx, action, when, clip.to_wav(), seconds, selection, false);
     }
@@ -839,6 +803,9 @@ impl DictateApp {
                     self.history.push(entry);
                 }
                 self.save_history();
+            }
+            Err(e) if e == "No speech detected." => {
+                self.notify(e, false);
             }
             Err(e) => {
                 self.notify(e.clone(), true);
@@ -1334,11 +1301,33 @@ impl eframe::App for DictateApp {
             crate::macos_look::set_backdrop_tint(theme::sheer_rgba());
         }
         self.collect_summary();
-        self.collect_labelling();
         self.window_lifecycle(ctx);
         while let Ok(e) = self.hk_rx.try_recv() {
             if self.capturing_key.is_none() {
                 self.on_hotkey(ctx, e);
+            }
+        }
+        while let Ok((id, pressed)) = self.chord_rx.try_recv() {
+            if self.capturing_key.is_none() {
+                if let Some(trigger) = self.chord_triggers.get(id).copied() {
+                    self.on_trigger(ctx, trigger, if pressed { HotKeyState::Pressed } else { HotKeyState::Released });
+                }
+            }
+        }
+        if let Some((recording, _, _)) = self.recording.as_mut() {
+            if let Some(result) = recording.recover_if_needed() {
+                match result {
+                    Ok(name) => self.notify(format!("Microphone disconnected; switched to {name}."), false),
+                    Err(e) => self.notify(e, true),
+                }
+            }
+        }
+        if let Some(recording) = self.mic_test.as_mut() {
+            if let Some(result) = recording.recover_if_needed() {
+                match result {
+                    Ok(name) => self.notify(format!("Microphone disconnected; switched to {name}."), false),
+                    Err(e) => self.notify(e, true),
+                }
             }
         }
         if self.recording.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1356,8 +1345,6 @@ impl eframe::App for DictateApp {
                     None => {
                         if file.starts_with("ollama:") {
                             self.notify("Model downloaded", false);
-                        } else if file == SPEAKER_MODEL_KEY {
-                            self.notify("Voice model ready", false);
                         } else {
                             self.s.whisper_model = settings::models_dir().join(&file).to_string_lossy().into_owned();
                             self.changed();
@@ -1371,6 +1358,9 @@ impl eframe::App for DictateApp {
         if self.mic_test.is_some() && self.settings_tab != Some(SettingsTab::Audio) {
             self.mic_test = None;
         }
+        if self.settings_tab == Some(SettingsTab::Audio) && self.last_mic_refresh.elapsed() >= std::time::Duration::from_secs(2) {
+            self.refresh_mics();
+        }
         // A meeting belongs in here too. Without it nothing asked for the
         // next frame while one was running, so the indicator's bars moved
         // only when some other event happened to wake the app up - which
@@ -1381,6 +1371,7 @@ impl eframe::App for DictateApp {
             || self.mic_test.is_some()
             || self.meeting.is_some()
             || self.summarising.is_some()
+            || self.settings_tab == Some(SettingsTab::Audio)
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -1529,4 +1520,27 @@ fn paste(text: &str, restore: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    #[test]
+    fn silent_audio_is_a_neutral_empty_dictation_including_digital_silence() {
+        let room = crate::audio::Clip { samples: vec![0.002; 16_000] };
+        let zero = crate::audio::Clip { samples: vec![0.0; 16_000] };
+        assert_eq!(classify_recording(&room, 1.0, None), RecordingResult::NoSpeech);
+        assert_eq!(classify_recording(&zero, 1.0, None), RecordingResult::NoSpeech);
+    }
+
+    #[test]
+    fn distinguishes_no_audio_or_stream_errors_from_silence() {
+        let empty = crate::audio::Clip { samples: vec![] };
+        assert_eq!(classify_recording(&empty, 0.1, None), RecordingResult::NoSpeech);
+        assert_eq!(classify_recording(&empty, 2.0, None), RecordingResult::NoAudio);
+        assert_eq!(classify_recording(&empty, 2.0, Some("device disconnected")), RecordingResult::StreamError("device disconnected".into()));
+        let speech = crate::audio::Clip { samples: vec![0.1; 8_000] };
+        assert_eq!(classify_recording(&speech, 0.5, None), RecordingResult::Speech);
+    }
 }

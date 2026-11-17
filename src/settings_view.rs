@@ -8,6 +8,43 @@ use crate::theme::{self, b, d, m, para, t};
 use crate::views::{VERSION, icon_button, kbd, nav_item};
 use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Sense, Stroke, vec2};
 
+const PHI_MLX: &str = "phi-4-mini-instruct-chat-mlx";
+const PHI_MLX_URL: &str = "https://huggingface.co/SirSahOl/Phi-4-mini-instruct-chat-mlx-4bit";
+
+fn can_pull_ollama(name: &str, busy: bool) -> bool {
+    !busy && !name.trim().is_empty() && name.trim() != PHI_MLX
+}
+
+/// LM Studio owns the MLX download. Only the explicit Use action switches
+/// engines; browsing a suggestion must not replace a working configuration.
+fn phi_mlx_setup(ui: &mut egui::Ui, s: &mut crate::settings::Settings) -> bool {
+    ui.label(m("Phi-4 Mini Instruct Chat · MLX", 14.0, theme::TEXT()));
+    ui.label(t("Runs locally in LM Studio on Apple Silicon Macs.", 12.0, theme::MUTED()));
+    ui.hyperlink_to("Get LM Studio", "https://lmstudio.ai/download");
+    ui.hyperlink_to("Model download page (4-bit MLX)", PHI_MLX_URL);
+    ui.label(t(
+        "On the model page, choose LM Studio under Use this model, or paste the page URL into LM Studio's model search. Download and load it, then start LM Studio's local server.",
+        12.0, theme::MUTED(),
+    ));
+    ui.label(t(
+        "Use switches text clean-up and meeting summaries to LM Studio. If its model identifier differs, click Fetch model list and select the loaded model.",
+        12.0, theme::MUTED(),
+    ));
+    let use_label = "Use for text and meetings";
+    let use_button = crate::views::btn(ui, use_label);
+    use_button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, use_label));
+    if use_button.clicked() {
+        s.text_engine = TextEngine::OpenAiCompatible;
+        s.text_url = "http://localhost:1234/v1".into();
+        s.text_key.clear();
+        s.text_model = PHI_MLX.into();
+        s.meeting_model.clear();
+        s.talking_cloud_host.clear();
+        return true;
+    }
+    false
+}
+
 /// Each tab's title and standfirst. They belong to the sheet, not to the
 /// tab's body: inside the scroll area they scrolled away from the close
 /// button and left the sheet with no heading.
@@ -416,13 +453,13 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                 },
             );
             // Field and action first, suggestions under them and captioned.
-            // The three names used to sit on top looking like buttons that
+            // The names used to sit on top looking like buttons that
             // download, when all they do is fill the box.
             row(ui, "Download a model", "Any name from the Ollama library.", 300.0, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut app.pull_name).hint_text("model name").desired_width(186.0));
                     let busy = app.download.is_some();
-                    let ready = !busy && !app.pull_name.trim().is_empty();
+                    let ready = can_pull_ollama(&app.pull_name, busy);
                     let btn = egui::Button::new(d("DOWNLOAD", 12.0, if ready { theme::PAPER() } else { theme::FAINT() }))
                         .fill(if ready { theme::INK() } else { theme::SURFACE() })
                         .stroke(Stroke::new(2.5, if ready { theme::PAPER() } else { theme::FAINT() }))
@@ -456,7 +493,17 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                             app.pull_name = sug.into();
                         }
                     }
+                    let phi_label = "Phi-4 Mini · MLX";
+                    let phi_button = crate::views::btn(ui, phi_label);
+                    phi_button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, phi_label));
+                    if phi_button.clicked() {
+                        app.pull_name = PHI_MLX.into();
+                    }
                 });
+                if app.pull_name.trim() == PHI_MLX {
+                    ui.add_space(8.0);
+                    changed |= phi_mlx_setup(ui, &mut app.s);
+                }
                 if let Some((f, p)) = &app.download {
                     if f.starts_with("ollama:") {
                         let p = p.lock().unwrap();
@@ -467,6 +514,13 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             });
         }
         TextEngine::OpenAiCompatible => {
+            if crate::lms::is_lm_studio(&app.s) {
+                row(ui, "Download a model", "MLX models are downloaded in LM Studio.", 300.0, |ui| {
+                    if disclosed(ui, "phi-mlx-setup", "Phi-4 Mini · MLX", false) {
+                        changed |= phi_mlx_setup(ui, &mut app.s);
+                    }
+                });
+            }
             row(ui, "Server address", "Base URL ending in /v1.", 300.0, |ui| {
                 changed |= ui.add(egui::TextEdit::singleline(&mut app.s.text_url).desired_width(300.0)).changed();
                 ui.horizontal_wrapped(|ui| {
@@ -673,6 +727,7 @@ fn general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             }
             let label = if app.capturing_key == Some(trigger) { "Press keys…" } else { "Add another" };
             if crate::views::btn(ui, label).clicked() {
+                app.pause_chord_capture();
                 app.capturing_key = Some(trigger);
             }
         });
@@ -802,80 +857,11 @@ fn audio_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             app.toggle_mic_test();
         }
     }
-    section(ui, crate::icon::MIC_VOCAL, "Speakers");
-    let ctx = ui.ctx().clone();
-    row(
-        ui,
-        "Tell speakers apart",
-        "Labels the people on the far side of a meeting Speaker 1, Speaker 2 and so on, so you can name them. It needs a 30 MB voice model, holds a meeting's audio until the meeting is over (about 2 MB a minute, then deleted), and spends a few minutes of CPU after it.",
-        260.0,
-        |ui| {
-            let mut on = app.s.label_speakers;
-            if crate::views::kit_checkbox(ui, &mut on).changed() {
-                app.s.label_speakers = on;
-                app.changed();
-                // Turning it on is the request for the model, so fetch it
-                // rather than leave a switch that does nothing until a second
-                // button is found.
-                if on && crate::speakers::model_path().is_none() && app.download.is_none() {
-                    let p: engines::SharedProgress = Default::default();
-                    p.lock().unwrap().total = crate::speakers::DOWNLOAD_BYTES;
-                    crate::speakers::download(p.clone(), ctx.clone());
-                    app.download = Some((crate::app::SPEAKER_MODEL_KEY.to_string(), p));
-                }
-            }
-        },
-    );
-    if app.s.label_speakers {
-        row(ui, "Voice model", "Downloaded once and checked against a known fingerprint before it is used.", 260.0, |ui| {
-            if let Some((f, p)) = &app.download {
-                if f == crate::app::SPEAKER_MODEL_KEY {
-                    let p = p.lock().unwrap();
-                    let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-                    crate::views::progress(ui, "Downloading", &format!("{:.0}%", frac * 100.0), frac, 180.0);
-                    return;
-                }
-            }
-            if crate::speakers::model_path().is_some() {
-                crate::views::status(ui, crate::views::State::Ok, "Ready");
-            } else if ui.add_enabled(app.download.is_none(), egui::Button::new("Download (30 MB)")).clicked() {
-                let p: engines::SharedProgress = Default::default();
-                p.lock().unwrap().total = crate::speakers::DOWNLOAD_BYTES;
-                crate::speakers::download(p.clone(), ctx.clone());
-                app.download = Some((crate::app::SPEAKER_MODEL_KEY.to_string(), p));
-            }
-        });
-        row(
-            ui,
-            "People on the far side",
-            "How many people are usually on the other end. This is something you say, not something it works out: left to count, the model found fourteen voices in a recording of two. You can correct it on any meeting afterwards.",
-            260.0,
-            |ui| {
-                // A row hands its right-hand side a vertical layout; without
-                // this the minus, the number and the plus stack on top of each
-                // other.
-                ui.horizontal(|ui| {
-                    let n = app.s.speaker_count as usize;
-                    if crate::views::btn(ui, "-").clicked() && n > 1 {
-                        app.s.speaker_count = (n - 1) as u8;
-                        app.changed();
-                    }
-                    ui.label(t(format!("{n}"), 15.0, theme::TEXT()));
-                    if crate::views::btn(ui, "+").clicked() && n < crate::speakers::MAX_SPEAKERS {
-                        app.s.speaker_count = (n + 1) as u8;
-                        app.changed();
-                    }
-                });
-            },
-        );
-    }
-    ui.add_space(14.0);
-
     section(ui, crate::icon::FLASK, "Meeting audio");
     row(
         ui,
         "Keep meeting audio",
-        "Normally a meeting's audio is deleted the moment it has been transcribed - or, with speaker labels on, once the voices have been told apart. This keeps it on this Mac for good. It is 1.9 MB a minute, so only turn it on to try things against a real call.",
+        "Normally a meeting's audio is deleted once it has been transcribed. This keeps it on this Mac for good, using about 1.9 MB a minute.",
         260.0,
         |ui| {
             if crate::views::kit_checkbox(ui, &mut app.s.keep_meeting_audio).changed() {
@@ -1048,10 +1034,19 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
     let mut done: Option<Option<String>> = None;
     ctx.input(|i| {
         for e in &i.events {
-            if let egui::Event::Key { key, pressed: true, modifiers, .. } = e {
-                if *key == egui::Key::Escape {
+            if let egui::Event::Key { key, physical_key, pressed, repeat, modifiers, .. } = e {
+                if *repeat { continue; }
+                let physical = physical_key.unwrap_or(*key);
+                if *pressed && *key == egui::Key::Escape {
                     done = Some(None);
                     break;
+                }
+                if !*pressed {
+                    if app.capture_first_key == Some(physical) {
+                        done = Some(Some(physical.name().to_string()));
+                        break;
+                    }
+                    continue;
                 }
                 let mut parts = Vec::new();
                 if modifiers.ctrl {
@@ -1066,9 +1061,19 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
                 if modifiers.mac_cmd {
                     parts.push("Cmd");
                 }
-                parts.push(key.name());
-                done = Some(Some(parts.join("+")));
-                break;
+                if !parts.is_empty() {
+                    parts.push(key.name());
+                    done = Some(Some(parts.join("+")));
+                    break;
+                }
+                if let Some(first) = app.capture_first_key {
+                    if first != physical {
+                        done = Some(Some(format!("{}+{}", first.name(), physical.name())));
+                        break;
+                    }
+                } else {
+                    app.capture_first_key = Some(physical);
+                }
             }
         }
     });
@@ -1081,23 +1086,27 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
             .inner_margin(Margin::same(20))
             .show(ui, |ui| {
                 ui.label(b(format!("Press the shortcut for {}", trigger.label()), 16.0, theme::TEXT()));
-                ui.label(para("Function keys (F13–F19) or a combination like ⌥ Space work best. Esc cancels.", 13.0, theme::MUTED()));
+                ui.label(para("Hold two keys together, use a modifier such as Option + Space, or press one function key. Esc cancels.", 13.0, theme::MUTED()));
             });
     });
     if let Some(r) = done {
         app.capturing_key = None;
+        app.capture_first_key = None;
         if let Some(k) = r {
-            match k.parse::<global_hotkey::hotkey::HotKey>() {
-                Ok(_) => {
-                    if !app.s.trigger_keys(trigger).contains(&k) {
+            match (crate::chords::parse(&k), k.parse::<global_hotkey::hotkey::HotKey>()) {
+                (Some(_), _) | (_, Ok(_)) => {
+                    let conflict = Trigger::ALL.iter().flat_map(|t| app.s.trigger_keys(*t)).any(|existing| crate::chords::conflicts(&k, existing));
+                    if conflict {
+                        app.notify(format!("{k} conflicts with an existing shortcut."), true);
+                    } else {
                         app.s.trigger_keys_mut(trigger).push(k);
                         app.changed();
-                        app.register_hotkeys();
                     }
                 }
-                Err(_) => app.notify(format!("{k} can't be used as a shortcut"), true),
+                _ => app.notify(format!("{k} can't be used as a shortcut"), true),
             }
         }
+        app.register_hotkeys();
     }
 }
 
@@ -1108,6 +1117,44 @@ fn talking_switch(saved: bool, needs_memory: bool) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn mlx_setup_does_not_change_models_until_use_is_clicked() {
+        let settings = crate::settings::Settings {
+            meeting_model: "llama3.2:3b".into(),
+            text_url: "https://example.com/v1".into(),
+            text_key: "old-server-key".into(),
+            talking_cloud_host: "example.com".into(),
+            ..Default::default()
+        };
+        let original = serde_json::to_value(&settings).unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(340.0, 500.0))
+            .with_context_setup(theme::install)
+            .build_ui_state(|ui, s| { phi_mlx_setup(ui, s); }, settings);
+        assert_eq!(serde_json::to_value(h.state()).unwrap(), original);
+        h.get_by_label("Use for text and meetings").click();
+        h.run();
+        let s = h.state();
+        assert_eq!(s.text_engine, TextEngine::OpenAiCompatible);
+        assert_eq!(s.text_url, "http://localhost:1234/v1");
+        assert_eq!(s.text_model, "phi-4-mini-instruct-chat-mlx");
+        assert!(s.meeting_model.is_empty(), "meetings must use the newly selected model");
+        assert!(s.text_key.is_empty(), "do not send the old server's key to LM Studio");
+        assert!(s.talking_cloud_host.is_empty());
+        assert_eq!(s.ollama_model, "llama3.2:3b");
+        assert_eq!(s.speech_engine, SpeechEngine::WhisperLocal);
+    }
+
+    #[test]
+    fn mlx_suggestion_cannot_be_sent_to_ollamas_downloader() {
+        assert!(!can_pull_ollama("phi-4-mini-instruct-chat-mlx", false));
+        assert!(!can_pull_ollama(" phi-4-mini-instruct-chat-mlx ", false));
+        assert!(!can_pull_ollama("", false));
+        assert!(!can_pull_ollama("llama3.2:3b", true));
+        assert!(can_pull_ollama("llama3.2:3b", false));
+    }
 
     #[test]
     fn the_talking_points_switch_shows_off_and_locked_when_memory_is_too_low_even_if_saved_on() {

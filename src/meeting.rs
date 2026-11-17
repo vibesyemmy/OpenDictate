@@ -11,8 +11,7 @@
 //! meetings/<started>/
 //!   meta.json         title, started, ended, source
 //!   transcript.jsonl  one line per stretch: { at_ms, secs, text }
-//!   audio/<ms>.wav    deleted as each one is transcribed, or once its
-//!                     speakers are told apart if that is switched on
+//!   audio/<ms>.wav    deleted after transcription unless explicitly kept
 //! ```
 //!
 //! JSONL because a meeting in progress is appended to every few seconds: a
@@ -132,13 +131,10 @@ pub fn transcript(id: &str) -> Vec<Segment> {
 /// does. The same answer decides whether stretches are retained and what the
 /// meeting is marked with, so the two cannot drift apart.
 ///
-/// Keeping for good wins over keeping for labelling: if both are on, the
-/// audio is the person's to delete, not the app's.
+/// Only an explicit choice to keep meeting audio retains it.
 pub fn audio_hold(s: &Settings) -> Option<&'static str> {
     if s.keep_meeting_audio {
         Some("kept")
-    } else if s.label_speakers && crate::speakers::model_path().is_some() {
-        Some("labelling")
     } else {
         None
     }
@@ -150,20 +146,6 @@ pub fn audio_hold(s: &Settings) -> Option<&'static str> {
 /// without the transcript having to remember a file name.
 pub fn stretch_file(at_ms: u64) -> String {
     format!("{at_ms:09}.wav")
-}
-
-/// Deletes the audio kept for a meeting. The folder stays: it is where the
-/// next recording of anything would expect to write.
-pub fn clear_audio(id: &str) {
-    if id.contains('/') || id.contains("..") {
-        return;
-    }
-    let Ok(files) = std::fs::read_dir(root().join(id).join("audio")) else { return };
-    for f in files.filter_map(|f| f.ok()).map(|f| f.path()) {
-        if f.extension().is_some_and(|x| x == "wav") {
-            let _ = std::fs::remove_file(f);
-        }
-    }
 }
 
 /// Deletes audio that was only ever being held for labelling, from meetings
@@ -408,16 +390,18 @@ impl Drop for Session {
     }
 }
 
+fn meeting_stretch_time(offset: f64, relative: f64) -> f64 { offset + relative }
+
 fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<AtomicBool>, s: Settings) {
-    let rate = cap.rate;
+    let mut rate = cap.rate;
+    let mut cap = Some(cap);
     let mut cutter = crate::cut::Cutter::new(rate);
+    let mut offset = 0.0;
+    let mut last_check = std::time::Instant::now();
     let mut index = 0usize;
     let started = std::time::Instant::now();
     let server = std::cell::RefCell::new(start_server(&s, &dir, &stop));
-    // Audio is kept past its transcription in two cases: for good, if asked
-    // for, or until the meeting is over, so that its far side can be told
-    // apart then. The second is only worth doing if there is a model to do it
-    // with - holding 1.9 MB a minute for nothing is not a favour.
+    // Only an explicit request keeps audio after transcription.
     let retain = audio_hold(&s).is_some();
     let transcribe = |wav: &[u8]| {
         let mut server = server.borrow_mut();
@@ -431,8 +415,9 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
         text
     };
 
-    let mut process = |stretches: Vec<crate::cut::Stretch>| {
-        for st in stretches {
+    let mut process = |stretches: Vec<crate::cut::Stretch>, rate: f64, offset: f64| {
+        for mut st in stretches {
+            st.start_secs = meeting_stretch_time(offset, st.start_secs);
             match handle_stretch(&dir, index, &st, rate, &transcribe, retain) {
                 Ok(Some(seg)) => {
                     if let Ok(mut l) = live.lock() {
@@ -452,22 +437,24 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
 
     loop {
         let ending = stop.load(Ordering::Relaxed);
-        let mut got = cap.drain();
-        if ending {
-            cap.pause();
-            let last = cap.drain();
-            got.mine.extend(last.mine);
-            got.theirs.extend(last.theirs);
+        if let Ok(mut l) = live.lock() { l.elapsed = started.elapsed().as_secs_f32(); }
+        if let Some(active) = cap.as_ref() {
+            let mut got = active.drain();
+            if ending {
+                active.pause();
+                let last = active.drain();
+                got.mine.extend(last.mine);
+                got.theirs.extend(last.theirs);
+            }
+            if let Ok(mut l) = live.lock() {
+                l.samples += got.mine.len().max(got.theirs.len());
+                l.heard_you |= rms(&got.mine) > 0.001;
+                l.peak = l.peak.max(peak(&got.mine)).max(peak(&got.theirs));
+            }
+            process(cutter.push(&got.mine, &got.theirs, active.split_ok()), rate, offset);
         }
-        if let Ok(mut l) = live.lock() {
-            l.elapsed = started.elapsed().as_secs_f32();
-            l.samples += got.mine.len().max(got.theirs.len());
-            l.heard_you |= rms(&got.mine) > 0.001;
-            l.peak = l.peak.max(peak(&got.mine)).max(peak(&got.theirs));
-        }
-        process(cutter.push(&got.mine, &got.theirs, cap.split_ok()));
         if ending {
-            process(cutter.flush().into_iter().collect());
+            process(cutter.flush().into_iter().collect(), rate, offset);
             if let Ok(mut l) = live.lock() {
                 if no_audio_reached(l.samples) {
                     l.warning = Some("No audio reached the recorder.".into());
@@ -476,8 +463,37 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
             }
             break;
         }
+        if last_check.elapsed() >= std::time::Duration::from_secs(1) {
+            last_check = std::time::Instant::now();
+            let lost = cap.as_ref().and_then(|c| c.mic).is_some_and(|mic| !crate::tap::input_present(mic));
+            if lost {
+                if let Some(old) = cap.take() {
+                    old.pause();
+                    let last = old.drain();
+                    process(cutter.push(&last.mine, &last.theirs, old.split_ok()), rate, offset);
+                    process(cutter.flush().into_iter().collect(), rate, offset);
+                    drop(old);
+                }
+            }
+            if cap.is_none() {
+                match SystemCapture::start(crate::tap::default_input()) {
+                    Ok(next) if next.has_mic => {
+                        offset = started.elapsed().as_secs_f64();
+                        rate = next.rate;
+                        cutter = crate::cut::Cutter::new(rate);
+                        cap = Some(next);
+                        if let Ok(mut l) = live.lock() { l.warning = Some("Microphone disconnected; switched to the system input.".into()); }
+                        log(&dir, "microphone disconnected; switched to the system input");
+                    }
+                    Ok(_) | Err(_) => {
+                        if let Ok(mut l) = live.lock() { l.warning = Some("Microphone disconnected; waiting for the system input. Meeting audio is temporarily paused.".into()); }
+                    }
+                }
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+
 }
 
 fn start_server(s: &Settings, dir: &Path, stop: &AtomicBool) -> Option<crate::whisper_server::WhisperServer> {
@@ -525,7 +541,7 @@ fn handle_stretch(
     let result = transcribe(&wav);
     // Normally this is where a stretch's audio goes: 1.9 MB a minute, and a
     // week of meetings would fill a disk. It is kept only while the meeting
-    // is being recorded, if its speakers are to be told apart afterwards, or
+    // is being recorded or
     // for good if asked for.
     if !retain {
         let _ = std::fs::remove_file(&path);
@@ -1327,6 +1343,23 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_capture_offsets_stretches_to_the_existing_meeting_timeline() {
+        assert_eq!(meeting_stretch_time(12.5, 1.25), 13.75);
+        assert_eq!(meeting_stretch_time(0.0, 1.25), 1.25);
+    }
+
+    #[test]
+    fn legacy_speaker_settings_do_not_enable_individual_voice_processing() {
+        let s: Settings = serde_json::from_str(r#"{"label_speakers":true,"speaker_count":4,"keep_meeting_audio":false}"#).unwrap();
+        assert_eq!(audio_hold(&s), None);
+        let saved = serde_json::to_value(&s).unwrap();
+        assert!(saved.get("label_speakers").is_none());
+        assert!(saved.get("speaker_count").is_none());
+        let kept: Settings = serde_json::from_str(r#"{"label_speakers":true,"keep_meeting_audio":true}"#).unwrap();
+        assert_eq!(audio_hold(&kept), Some("kept"));
+    }
     use crate::cut::Stretch;
 
     const RATE: f64 = 48_000.0;

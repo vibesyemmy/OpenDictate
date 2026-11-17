@@ -1456,7 +1456,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ));
             }
             for seg in segments.iter().rev() {
-                transcript_line(app, ui, seg, w, false, &[], &[]);
+                transcript_line(app, ui, seg, w, false);
             }
             if stop {
                 app.toggle_meeting();
@@ -1487,7 +1487,6 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
             let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
             ui.label(t(format!("{} · {} · {length}", crate::stats::stamp(meta.started), meta.source), 13.0, theme::MUTED()));
             ui.add_space(16.0);
-            speakers_card(app, ui);
 
             // What it came to, before what was said.
             if app.summarising.as_deref() == Some(id.as_str()) {
@@ -1570,11 +1569,8 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ui.label(t("Levels for every chunk are in levels.log beside this transcript.", 12.5, theme::FAINT()));
             }
             let mut correction = None;
-            let roster = speaker_roster(app);
-            let lines = app.speaker_lines.clone();
-            for (i, seg) in segs.iter().enumerate() {
-                let who = lines.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                if transcript_line(app, ui, seg, w, true, who, &roster) {
+            for seg in &segs {
+                if transcript_line(app, ui, seg, w, true) {
                     correction = app.editing_line.take();
                 }
             }
@@ -1648,105 +1644,6 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
     });
 }
 
-/// One person on the far side of a meeting, as this page shows them.
-#[derive(Clone)]
-pub struct Chip {
-    pub name: String,
-    pub colour: Color32,
-    /// Whether they have been given a name, or are still a number.
-    pub named: bool,
-    /// Their share of the far side's speech.
-    pub share: f32,
-}
-
-/// Four tones, cycled. None is the green that means "you".
-fn speaker_colour(i: usize) -> Color32 {
-    [theme::ACCENT(), theme::WARN(), theme::RED(), theme::MUTED()][i % 4]
-}
-
-fn speaker_roster(app: &DictateApp) -> Vec<Chip> {
-    let Some(sp) = &app.open_speakers else { return Vec::new() };
-    let shares = sp.shares();
-    (0..sp.count)
-        .map(|i| Chip { name: sp.name(i), colour: speaker_colour(i), named: sp.is_named(i), share: shares.get(i).copied().unwrap_or(0.0) })
-        .collect()
-}
-
-/// Who is on the far side of the open meeting, with a name for each that can
-/// be changed and a head count that can be corrected.
-///
-/// The count is the person's to set. The model cannot work it out - left to
-/// it, a recording of two came back as fourteen - and a corrected count is
-/// grouped again from the voices kept for the purpose, with no audio needed.
-fn speakers_card(app: &mut DictateApp, ui: &mut egui::Ui) {
-    if app.labelling.is_some() && app.labelling == app.open_meeting {
-        let step = app.label_progress.lock().map(|p| p.clone()).unwrap_or_default();
-        status(ui, State::Warn, step);
-        ui.add_space(12.0);
-        return;
-    }
-    let chips = speaker_roster(app);
-    if chips.is_empty() {
-        return;
-    }
-    let (mut rename, mut regroup): (Option<(usize, String)>, Option<usize>) = (None, None);
-    theme::soft(theme::PANEL(), 10, 2.0, 2).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(t("On the far side", 13.0, theme::MUTED()));
-            ui.add_space(6.0);
-            for (i, chip) in chips.iter().enumerate() {
-                ui.label(t("●", 12.0, chip.colour));
-                let editing = app.renaming_speaker.as_ref().is_some_and(|(who, _)| *who == i);
-                if editing {
-                    let cancel = ui.input(|k| k.key_pressed(egui::Key::Escape));
-                    if let Some((_, text)) = app.renaming_speaker.as_mut() {
-                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(130.0).hint_text(format!("Speaker {}", i + 1)));
-                        if !r.has_focus() && !r.lost_focus() {
-                            r.request_focus();
-                        }
-                        // Enter, or clicking away, keeps it; Escape does not.
-                        if !cancel && r.lost_focus() {
-                            rename = Some((i, text.clone()));
-                        }
-                    }
-                    if cancel {
-                        app.renaming_speaker = None;
-                    }
-                } else {
-                    let r = ui.add(egui::Label::new(m(&chip.name, 14.0, theme::TEXT())).sense(Sense::click()));
-                    if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to rename").clicked() {
-                        app.renaming_speaker = Some((i, if chip.named { chip.name.clone() } else { String::new() }));
-                    }
-                }
-                ui.label(t(format!("{:.0}%", chip.share * 100.0), 12.5, theme::FAINT()));
-                ui.add_space(10.0);
-            }
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(t("People on the far side", 13.0, theme::MUTED()));
-            let n = chips.len();
-            if btn(ui, "-").clicked() && n > 1 {
-                regroup = Some(n - 1);
-            }
-            ui.label(t(format!("{n}"), 15.0, theme::TEXT()));
-            if btn(ui, "+").clicked() && n < crate::speakers::MAX_SPEAKERS {
-                regroup = Some(n + 1);
-            }
-            ui.label(t("Yours to set: the voices cannot be counted reliably.", 12.5, theme::FAINT()));
-        });
-    });
-    if let Some((who, name)) = rename {
-        app.rename_speaker(who, &name);
-        app.renaming_speaker = None;
-    }
-    if let Some(k) = regroup {
-        app.regroup_speakers(k);
-    }
-    ui.add_space(14.0);
-}
-
 /// One line of a transcript, correctable when the meeting is a stored one.
 ///
 /// Returns true when Save was pressed, leaving the edited text in
@@ -1761,16 +1658,11 @@ fn transcript_line(
     seg: &crate::meeting::Segment,
     w: f32,
     editable: bool,
-    speakers: &[usize],
-    roster: &[Chip],
 ) -> bool {
     let mut saved = false;
     ui.horizontal_top(|ui| {
         ui.add_space(2.0);
-        // Room for a name beside the time. Every line in a meeting whose
-        // voices were told apart gets the wider column, yours included, so
-        // the text still starts in one place.
-        let gutter = if roster.is_empty() { 88.0 } else { 160.0 };
+        let gutter = 88.0;
         let (r, _) = ui.allocate_exact_size(vec2(gutter, 20.0), Sense::hover());
         let p = ui.painter();
         p.text(
@@ -1787,35 +1679,7 @@ fn transcript_line(
             "both" => ("both", theme::FAINT()),
             _ => ("", theme::FAINT()),
         };
-        // On the far side of a meeting whose voices were told apart, "them"
-        // becomes whoever it was, and clicking it renames them. A speaker the
-        // roster does not know is a stale label, and gets the plain "them"
-        // rather than a number that points at no one.
-        let named: Vec<&Chip> = if seg.voice == "them" { speakers.iter().filter_map(|i| roster.get(*i)).collect() } else { Vec::new() };
-        if let Some(first) = named.first() {
-            // After the first, a speaker nobody has named is just their number:
-            // "Speaker 1 + 2", which fits, where "Speaker 1 + Speaker 2" did not.
-            let mut text = String::new();
-            for (n, c) in named.iter().enumerate() {
-                if n > 0 {
-                    text.push_str(" + ");
-                }
-                text.push_str(if n > 0 && !c.named { c.name.trim_start_matches("Speaker ") } else { &c.name });
-            }
-            if text.chars().count() > 17 {
-                text = text.chars().take(16).collect::<String>() + "…";
-            }
-            p.text(pos2(r.left() + 46.0, r.top()), Align2::LEFT_TOP, &text, FontId::new(11.5, theme::medium()), first.colour);
-            if editable {
-                let at = Rect::from_min_size(pos2(r.left() + 44.0, r.top() - 2.0), vec2(gutter - 44.0, 20.0));
-                let hit = ui.interact(at, ui.id().with(("speaker", seg.at_ms)), Sense::click());
-                if hit.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to name this speaker").clicked() {
-                    if let Some(&first_id) = speakers.first() {
-                        app.renaming_speaker = Some((first_id, if first.named { first.name.clone() } else { String::new() }));
-                    }
-                }
-            }
-        } else if !who.is_empty() {
+        if !who.is_empty() {
             p.text(pos2(r.left() + 46.0, r.top()), Align2::LEFT_TOP, who, FontId::new(11.5, theme::medium()), colour);
         }
         let editing = app.editing_line.as_ref().is_some_and(|(at, _)| *at == seg.at_ms);
