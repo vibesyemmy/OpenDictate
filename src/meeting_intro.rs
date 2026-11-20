@@ -97,7 +97,7 @@ pub fn draw(ui: &mut egui::Ui, settings: &crate::settings::Settings) -> Option<C
     ui.add_space(6.0);
     ui.label(para("Saved clips are not a complete recording: quiet or skipped parts may be missing, and a clip may contain only one side.", 13.5, theme::MUTED()));
     ui.add_space(10.0);
-    ui.label(para(format!("Speech: {}. Text: {}.", crate::privacy::speech_destination(settings), crate::privacy::text_destination(settings)), 12.5, theme::MUTED()));
+    ui.label(para(format!("Voice to text: {}. Text clean-up and summaries: {}.", crate::privacy::speech_place(settings), crate::privacy::text_place(settings)), 12.5, theme::MUTED()));
     ui.add_space(6.0);
     let settings = views::link(ui, "Audio settings");
     settings.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Audio settings"));
