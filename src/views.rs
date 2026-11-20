@@ -320,6 +320,14 @@ mod data_confirmation_tests {
     }
 
     #[test]
+    fn history_note_states_retention_in_plain_words() {
+        assert_eq!(super::retention_note(KeepHistory::Days7), "Kept for 7 days");
+        assert_eq!(super::retention_note(KeepHistory::Day1), "Kept for 24 hours");
+        assert_eq!(super::retention_note(KeepHistory::Forever), "Kept until you delete it");
+        assert_eq!(super::retention_note(KeepHistory::Never), "New dictations aren't kept");
+    }
+
+    #[test]
     fn history_dialogs_say_deletion_is_permanent_and_never_mention_trash() {
         let actions = [
             (PendingDataAction::DeleteHistoryEntry { when: 1 }, 1),
@@ -1128,6 +1136,16 @@ fn reserve_scrollbar_gutter(ui: &mut egui::Ui) {
     ui.style_mut().spacing.scroll.floating_allocated_width = 16.0;
 }
 
+/// The one line on History that says how long entries last; the setting
+/// itself lives in Settings › Privacy & data.
+fn retention_note(keep: KeepHistory) -> String {
+    match keep {
+        KeepHistory::Forever => "Kept until you delete it".into(),
+        KeepHistory::Never => "New dictations aren't kept".into(),
+        other => format!("Kept for {}", other.label()),
+    }
+}
+
 fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
     // Keep the floating scroll handle in its own gutter beside the rows.
     reserve_scrollbar_gutter(ui);
@@ -1149,40 +1167,14 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
             ui.label(t(format!("{} Stored only on this Mac", crate::icon::LOCK), 14.0, theme::MUTED()));
         });
     });
-    ui.add_space(10.0);
-    theme::soft(theme::PANEL(), 10, 2.0, 2).inner_margin(Margin::symmetric(12, 12)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(m(format!("{} Keep history", crate::icon::ARCHIVE), 14.0, theme::TEXT()));
-                ui.label(t("Choose how long to keep your history on this device.", 14.0, theme::MUTED()));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let mut k = app.s.keep_history;
-                egui::ComboBox::from_id_salt("keep").width(140.0).selected_text(m(k.label(), 14.0, theme::TEXT())).show_ui(ui, |ui| {
-                    for o in KeepHistory::ALL {
-                        combo_value(ui, &mut k, o, o.label());
-                    }
-                });
-                if k != app.s.keep_history {
-                    if crate::data_safety::shortens_history(app.s.keep_history, k) {
-                        app.pending_data_action = Some(PendingDataAction::ChangeRetention(k));
-                    } else if let Err(e) = app.set_keep_history(k) {
-                        app.notify(e, true);
-                    }
-                }
-            });
-        });
-        ui.add_space(6.0);
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().rect_filled(r, 0.0, theme::LINE());
-        ui.add_space(6.0);
-        ui.label(m(format!("{} Your data stays yours", crate::icon::LOCK), 14.0, theme::TEXT()));
-        ui.label(para(
-            "History is stored on this Mac. Your selected speech and text providers may process audio or text on another server; see Settings › Privacy & data.",
-            14.0,
-            theme::MUTED(),
-        ));
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(t(retention_note(app.s.keep_history), 13.0, theme::MUTED()));
+        ui.label(t("·", 13.0, theme::MUTED()));
+        if link(ui, "Change in Settings").clicked() {
+            app.settings_tab = Some(crate::app::SettingsTab::Privacy);
+        }
     });
     ui.add_space(14.0);
     pill_tabs(

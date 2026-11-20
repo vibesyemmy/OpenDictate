@@ -200,7 +200,10 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
                             SettingsTab::General => general_tab(app, ui),
                             SettingsTab::Audio => audio_tab(app, ui),
                             SettingsTab::Personalization => personal_tab(app, ui),
-                            SettingsTab::Privacy => crate::privacy::draw(ui, &app.s),
+                            SettingsTab::Privacy => {
+                                let s = app.s.clone();
+                                crate::privacy::draw(ui, &s, |ui| history_retention(app, ui));
+                            }
                             SettingsTab::About => about_tab(app, ui),
                         }
                     });
@@ -211,6 +214,26 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
     if resp.should_close() && app.capturing_key.is_none() {
         app.settings_tab = None;
     }
+}
+
+/// How long dictation history is kept. Shortening it deletes existing
+/// entries, so that goes through the same confirmation as any other delete.
+fn history_retention(app: &mut DictateApp, ui: &mut egui::Ui) {
+    row(ui, "Keep dictation history", "Older entries are permanently deleted when they pass this age.", 160.0, |ui| {
+        let mut k = app.s.keep_history;
+        egui::ComboBox::from_id_salt("keep-history").width(160.0).selected_text(m(k.label(), 13.5, theme::TEXT())).show_ui(ui, |ui| {
+            for o in crate::settings::KeepHistory::ALL {
+                crate::views::combo_value(ui, &mut k, o, o.label());
+            }
+        });
+        if k != app.s.keep_history {
+            if crate::data_safety::shortens_history(app.s.keep_history, k) {
+                app.pending_data_action = Some(crate::app::PendingDataAction::ChangeRetention(k));
+            } else if let Err(e) = app.set_keep_history(k) {
+                app.notify(e, true);
+            }
+        }
+    });
 }
 
 /// The kit's .fsec: icon, title in the display face, a hairline under both.

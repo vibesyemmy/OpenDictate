@@ -44,7 +44,9 @@ pub fn text_destination(s: &Settings) -> String {
     }
 }
 
-pub fn draw(ui: &mut eframe::egui::Ui, s: &Settings) {
+/// `retention` draws the history retention control; it sits under "What is
+/// stored" because that is where people look for how long things are kept.
+pub fn draw(ui: &mut eframe::egui::Ui, s: &Settings, retention: impl FnOnce(&mut eframe::egui::Ui)) {
     use crate::theme::{self, b, para};
     ui.add_space(18.0);
     ui.label(b("Where processing happens", 15.0, theme::TEXT()));
@@ -54,10 +56,12 @@ pub fn draw(ui: &mut eframe::egui::Ui, s: &Settings) {
     ui.label(para("Talking Points sends transcript excerpts to the text provider when enabled; servers outside this Mac require the existing per-host opt-in. Searches send only the selected text to Brave when you request a search.", 13.0, theme::MUTED()));
     ui.add_space(14.0);
     ui.label(b("What is stored", 15.0, theme::TEXT()));
-    ui.label(para(format!("Dictation history is stored on this Mac under your history setting: {}. Failed dictation may include audio for retry.", s.keep_history.label()), 13.0, theme::TEXT()));
+    retention(ui);
+    ui.add_space(8.0);
+    ui.label(para("Dictation history is stored on this Mac. Failed dictation may include audio for retry.", 13.0, theme::TEXT()));
     ui.label(para(if s.keep_meeting_audio { "Meeting transcripts and notes stay until you delete the meeting. Speech clips are saved for playback; they are not a complete recording." } else { "Meeting transcripts and notes stay until you delete the meeting. Speech clips are normally discarded after transcription." }, 13.0, theme::TEXT()));
     ui.label(para("Speech that could not be transcribed is kept on this Mac until recovery succeeds or you discard it or delete the meeting. Meeting diagnostic logs contain error details; older logs may also contain transcript excerpts.", 13.0, theme::TEXT()));
     ui.add_space(14.0);
     ui.label(b("Removing data", 15.0, theme::TEXT()));
-    ui.label(para("Delete meetings from Meetings and manage dictation retention in History. Deleting a meeting, history entry or discarded audio removes it from this Mac permanently; it does not go to the Trash and cannot be restored. Model providers and Brave may have their own retention policies.", 13.0, theme::TEXT()));
+    ui.label(para("Delete meetings from Meetings and dictation entries from History. Deleting a meeting, history entry or discarded audio removes it from this Mac permanently; it does not go to the Trash and cannot be restored. Model providers and Brave may have their own retention policies.", 13.0, theme::TEXT()));
 }
