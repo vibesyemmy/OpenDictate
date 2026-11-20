@@ -245,7 +245,7 @@ mod shortcut_default_tests {
     fn new_users_get_distinct_shortcuts_for_their_platform() {
         let settings = Settings::default();
         if cfg!(target_os = "macos") {
-            assert_eq!(settings.dictate_keys, ["RightOption"]);
+            assert_eq!(settings.dictate_keys, ["RightOption+D"]);
             assert_eq!(settings.translate_keys, ["RightOption+T"]);
             assert_eq!(settings.ask_keys, ["RightOption+A"]);
             assert_eq!(settings.meeting_keys, ["RightOption+M"]);
@@ -360,10 +360,10 @@ impl Default for Settings {
             translate_to: "Spanish".into(),
             custom_instructions: String::new(),
 
-            // One family on the right Option key, which nothing in macOS uses
-            // on its own: hold or tap it to dictate, and add a letter for the
-            // rest. The left Option key keeps typing special characters.
-            dictate_keys: vec![if cfg!(target_os = "macos") { "RightOption" } else { "Alt+Cmd+1" }.into()],
+            // One family on the right Option key plus a letter for each
+            // feature (D, T, A, M). Nothing in macOS uses Right Option, and
+            // the left Option key keeps typing special characters.
+            dictate_keys: vec![if cfg!(target_os = "macos") { "RightOption+D" } else { "Alt+Cmd+1" }.into()],
             meeting_keys: vec![if cfg!(target_os = "macos") { "RightOption+M" } else { "Alt+Cmd+4" }.into()],
             translate_keys: vec![if cfg!(target_os = "macos") { "RightOption+T" } else { "Alt+Cmd+2" }.into()],
             ask_keys: vec![if cfg!(target_os = "macos") { "RightOption+A" } else { "Alt+Cmd+3" }.into()],
