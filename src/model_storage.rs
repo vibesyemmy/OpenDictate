@@ -40,7 +40,9 @@ mod tests {
 
     #[test]
     fn sizes_read_the_way_finder_shows_them() {
-        assert_eq!(format_size(0), "0 MB");
+        assert_eq!(format_size(0), "None");
+        assert_eq!(format_size(120), "1 KB");
+        assert_eq!(format_size(48_000), "48 KB");
         assert_eq!(format_size(147_951_465), "148 MB");
         assert_eq!(format_size(999_000_000), "999 MB");
         assert_eq!(format_size(1_624_555_275), "1.6 GB");
@@ -156,10 +158,14 @@ pub fn local_ollama_url(url: &str) -> bool {
 /// A size in decimal units, as Finder shows it: whole MB below a gigabyte,
 /// one decimal place below ten gigabytes, whole GB above.
 pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1_000.0;
     const MB: f64 = 1_000_000.0;
     const GB: f64 = 1_000_000_000.0;
     let b = bytes as f64;
-    if b < GB { format!("{:.0} MB", b / MB) }
+    if bytes == 0 { "None".into() }
+    // Anything that exists shows as at least 1 KB, never as nothing.
+    else if b < MB { format!("{:.0} KB", (b / KB).max(1.0)) }
+    else if b < GB { format!("{:.0} MB", b / MB) }
     else if b < 10.0 * GB { format!("{:.1} GB", b / GB) }
     else { format!("{:.0} GB", b / GB) }
 }

@@ -202,7 +202,10 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
                             SettingsTab::Personalization => personal_tab(app, ui),
                             SettingsTab::Privacy => {
                                 let s = app.s.clone();
-                                crate::privacy::draw(ui, &s, |ui| history_retention(app, ui));
+                                crate::privacy::draw(ui, &s, |ui| {
+                                    storage_usage(app, ui);
+                                    history_retention(app, ui);
+                                });
                             }
                             SettingsTab::About => about_tab(app, ui),
                         }
@@ -214,6 +217,113 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
     if resp.should_close() && app.capturing_key.is_none() {
         app.settings_tab = None;
     }
+}
+
+/// Categorical colours for the usage bar, in the bar's fixed order. Both sets
+/// were checked with the dataviz palette validator against this theme's
+/// surfaces (#FFFFFF light, #1F1E18 dark): every adjacent pair clears the
+/// colour-blind and normal-vision separation floors. In light mode three of
+/// them sit below 3:1 against white, which is why every part also has a
+/// legend row with its name and size.
+fn usage_color(part: crate::usage::Part) -> Color32 {
+    use crate::usage::Part;
+    let light = theme::is_light();
+    let hex = match (part, light) {
+        (Part::SpeechModels, true) => 0x2a78d6, (Part::SpeechModels, false) => 0x3987e5,
+        (Part::MeetingAudio, true) => 0xeb6834, (Part::MeetingAudio, false) => 0xd95926,
+        (Part::MeetingNotes, true) => 0x1baf7a, (Part::MeetingNotes, false) => 0x199e70,
+        (Part::History, true) => 0xeda100, (Part::History, false) => 0xc98500,
+        (Part::Other, true) => 0xe87ba4, (Part::Other, false) => 0xd55181,
+    };
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+/// Where each part can be cleared, if anywhere.
+fn usage_destination(part: crate::usage::Part) -> Option<(&'static str, Box<dyn Fn(&mut DictateApp)>)> {
+    use crate::app::Page;
+    use crate::usage::Part;
+    match part {
+        Part::SpeechModels => Some(("Manage models", Box::new(|app: &mut DictateApp| app.settings_tab = Some(SettingsTab::Models)))),
+        Part::MeetingAudio | Part::MeetingNotes => Some(("Open Meetings", Box::new(|app: &mut DictateApp| { app.settings_tab = None; app.page = Page::Meetings; }))),
+        Part::History => Some(("Open History", Box::new(|app: &mut DictateApp| { app.settings_tab = None; app.page = Page::History; }))),
+        Part::Other => None,
+    }
+}
+
+/// How much space Open Dictate takes, as one thin bar split into parts with
+/// a legend that carries every name and size. Ollama's models are shared
+/// with other apps and sit in Ollama's folder, so they get a line of their
+/// own instead of a segment.
+fn storage_usage(app: &mut DictateApp, ui: &mut egui::Ui) {
+    use crate::model_storage::format_size;
+    use crate::usage::Part;
+    let ctx = ui.ctx().clone();
+    app.refresh_usage(&ctx);
+    let Some(usage) = app.usage.lock().unwrap().clone() else {
+        ui.label(t("Measuring storage…", 13.0, theme::MUTED()));
+        return;
+    };
+    let total = usage.total();
+    ui.add_space(4.0);
+    ui.label(m(format!("Open Dictate uses {} on this Mac", format_size(total)), 15.0, theme::TEXT()));
+    ui.add_space(10.0);
+
+    // The bar: 8px, rounded ends, 2px of surface between parts. A part with
+    // any data gets at least 3px so its colour can be found; the legend has
+    // the exact numbers.
+    let parts: Vec<(Part, u64)> = Part::ALL.iter().map(|&p| (p, usage.bytes(p))).filter(|&(_, b)| b > 0).collect();
+    let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+    if total == 0 || parts.is_empty() {
+        ui.painter().rect_filled(bar, CornerRadius::same(4), theme::LINE());
+    } else {
+        const GAP: f32 = 2.0;
+        const MIN: f32 = 3.0;
+        let usable = bar.width() - GAP * (parts.len() as f32 - 1.0);
+        let mut widths: Vec<f32> = parts.iter().map(|&(_, b)| (b as f32 / total as f32 * usable).max(MIN)).collect();
+        // Take what the minimums added back from the largest part.
+        let excess = widths.iter().sum::<f32>() - usable;
+        if let Some(widest) = widths.iter_mut().max_by(|a, b| a.total_cmp(b)) { *widest = (*widest - excess).max(MIN); }
+        let mut x = bar.left();
+        let last = parts.len() - 1;
+        for (i, (&(part, bytes), w)) in parts.iter().zip(&widths).enumerate() {
+            let rect = egui::Rect::from_min_size(egui::pos2(x, bar.top()), vec2(*w, bar.height()));
+            let round = |edge: bool| if edge { 4 } else { 0 };
+            let corners = CornerRadius { nw: round(i == 0), sw: round(i == 0), ne: round(i == last), se: round(i == last) };
+            ui.painter().rect_filled(rect, corners, usage_color(part));
+            let share = bytes as f64 / total as f64 * 100.0;
+            ui.interact(rect.expand2(vec2(0.0, 6.0)), ui.id().with(("usage-part", i)), Sense::hover())
+                .on_hover_text(format!("{}: {} ({:.0}%)", part.label(), format_size(bytes), share.max(if bytes > 0 { 1.0 } else { 0.0 })));
+            x += w + GAP;
+        }
+    }
+    ui.add_space(12.0);
+
+    // The legend, in bar order, every part listed even at zero so people can
+    // see what is not using space too.
+    for part in Part::ALL {
+        let bytes = usage.bytes(part);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (swatch, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+            ui.painter().rect_filled(swatch, CornerRadius::same(3), usage_color(part));
+            ui.label(t(part.label(), 13.0, theme::TEXT()));
+            ui.label(t(format_size(bytes), 13.0, theme::MUTED()));
+            if let Some((label, go)) = usage_destination(part) {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if crate::views::link(ui, label).clicked() { go(app); }
+                });
+            }
+        });
+        ui.add_space(2.0);
+    }
+
+    let health = app.health.lock().unwrap().clone();
+    let ollama: u64 = health.ollama_storage.iter().filter_map(|m| m.size).sum();
+    if crate::model_storage::local_ollama_url(&app.s.ollama_url) && ollama > 0 {
+        ui.add_space(6.0);
+        ui.label(para(format!("Text models in Ollama use {} more. They're stored by Ollama and shared with other apps on this Mac.", format_size(ollama)), 12.5, theme::MUTED()));
+    }
+    ui.add_space(6.0);
 }
 
 /// How long dictation history is kept. Shortening it deletes existing

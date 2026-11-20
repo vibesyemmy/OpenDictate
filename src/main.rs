@@ -23,6 +23,7 @@ mod talking;
 mod talking_view;
 mod tap;
 mod theme;
+mod usage;
 mod tray;
 mod views;
 mod whisper_server;
