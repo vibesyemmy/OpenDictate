@@ -320,14 +320,6 @@ mod data_confirmation_tests {
     }
 
     #[test]
-    fn history_note_states_retention_in_plain_words() {
-        assert_eq!(super::retention_note(KeepHistory::Days7), "Kept for 7 days");
-        assert_eq!(super::retention_note(KeepHistory::Day1), "Kept for 24 hours");
-        assert_eq!(super::retention_note(KeepHistory::Forever), "Kept until you delete it");
-        assert_eq!(super::retention_note(KeepHistory::Never), "New dictations aren't kept");
-    }
-
-    #[test]
     fn history_dialogs_say_deletion_is_permanent_and_never_mention_trash() {
         let actions = [
             (PendingDataAction::DeleteHistoryEntry { when: 1 }, 1),
@@ -1136,16 +1128,6 @@ fn reserve_scrollbar_gutter(ui: &mut egui::Ui) {
     ui.style_mut().spacing.scroll.floating_allocated_width = 16.0;
 }
 
-/// The one line on History that says how long entries last; the setting
-/// itself lives in Settings › Privacy & data.
-fn retention_note(keep: KeepHistory) -> String {
-    match keep {
-        KeepHistory::Forever => "Kept until you delete it".into(),
-        KeepHistory::Never => "New dictations aren't kept".into(),
-        other => format!("Kept for {}", other.label()),
-    }
-}
-
 fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
     // Keep the floating scroll handle in its own gutter beside the rows.
     reserve_scrollbar_gutter(ui);
@@ -1164,17 +1146,15 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
                     ui.close();
                 }
             });
+            // History's settings (how long entries are kept) live in
+            // Settings › Privacy & data; this opens that tab directly.
+            let settings = icon_button(ui, "gear", "History settings");
+            settings.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "History settings"));
+            if settings.clicked() {
+                app.settings_tab = Some(crate::app::SettingsTab::Privacy);
+            }
             ui.label(t(format!("{} Stored only on this Mac", crate::icon::LOCK), 14.0, theme::MUTED()));
         });
-    });
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(t(retention_note(app.s.keep_history), 13.0, theme::MUTED()));
-        ui.label(t("·", 13.0, theme::MUTED()));
-        if link(ui, "Change in Settings").clicked() {
-            app.settings_tab = Some(crate::app::SettingsTab::Privacy);
-        }
     });
     ui.add_space(14.0);
     pill_tabs(
