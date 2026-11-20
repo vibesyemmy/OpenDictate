@@ -152,6 +152,10 @@ pub struct DictateApp {
     /// The Ollama model being deleted in the background, and how it went.
     pub model_deleting: Option<ModelTarget>,
     pub model_delete_result: Arc<Mutex<Option<Result<String, String>>>>,
+    /// Disk use of the data folder, measured in the background for
+    /// Settings › Privacy & data, and when it was last asked for.
+    pub usage: Arc<Mutex<Option<crate::usage::Usage>>>,
+    pub usage_asked_at: Option<Instant>,
     pub test_input: String,
     pub test_output: Arc<Mutex<Option<Result<String, String>>>>,
     pub test_running: Arc<AtomicBool>,
@@ -319,6 +323,8 @@ impl DictateApp {
             test_output: Default::default(),
             model_deleting: None,
             model_delete_result: Default::default(),
+            usage: Default::default(),
+            usage_asked_at: None,
             test_running: Default::default(),
             dict_filter: 0,
             dict_search: None,
@@ -1254,6 +1260,19 @@ impl DictateApp {
                 Ok(None)
             }
         }
+    }
+
+    /// Re-measures the data folder at most every few seconds while someone is
+    /// looking at it, so a deletion elsewhere shows up without a reopen.
+    pub fn refresh_usage(&mut self, ctx: &egui::Context) {
+        if self.usage_asked_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(5)) { return; }
+        self.usage_asked_at = Some(Instant::now());
+        let (slot, ctx) = (self.usage.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let measured = crate::usage::scan(&settings::data_dir());
+            *slot.lock().unwrap() = Some(measured);
+            ctx.request_repaint();
+        });
     }
 
     /// Shows the outcome of a background model deletion once it is known.
