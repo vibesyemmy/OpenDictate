@@ -60,6 +60,7 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
         crate::settings_view::settings_window(app, &ctx);
     }
     crate::settings_view::capture_shortcut(app, &ctx);
+    app.poll_model_delete();
     confirm_data_action(app, &ctx);
     meeting_intro(app, &ctx);
     crate::setup_guide::show(app, &ctx);
@@ -113,6 +114,14 @@ fn data_confirmation_content(ui: &mut egui::Ui, action: &PendingDataAction, coun
             format!("Permanently delete {count} untranscribed {}? Those portions will stay missing from the transcript. This can’t be undone.", if *count == 1 { "clip" } else { "clips" }),
             "Delete audio",
         ),
+        PendingDataAction::DeleteModel { target, name, size } => (
+            "Delete model?",
+            match target {
+                crate::app::ModelTarget::Whisper(_) => format!("“{name}” ({size}) will be permanently deleted from this Mac. You can download it again from this page."),
+                crate::app::ModelTarget::Ollama(_) => format!("“{name}” ({size}) will be permanently deleted from Ollama on this Mac. Other apps that use Ollama will lose it too. You can download it again from this page."),
+            },
+            "Delete model",
+        ),
     };
     ui.set_max_width(440.0);
     ui.label(b(title, 20.0, theme::TEXT()));
@@ -141,6 +150,7 @@ fn confirm_data_action(app: &mut DictateApp, ctx: &egui::Context) {
         PendingDataAction::ChangeRetention(keep) => crate::data_safety::expired_count(&app.history, *keep, crate::settings::now_secs()),
         PendingDataAction::RegenerateSummary { .. } => 0,
         PendingDataAction::DiscardRecoveryAudio { count, .. } => *count,
+        PendingDataAction::DeleteModel { .. } => 1,
     };
     let response = egui::Modal::new(egui::Id::new("confirm-data-action"))
         .frame(theme::ink_panel().inner_margin(Margin::same(22)))
@@ -182,6 +192,15 @@ fn confirm_data_action(app: &mut DictateApp, ctx: &egui::Context) {
                 Ok(()) => Ok("Recovery audio deleted."),
                 Err(e) => Err(e),
             }
+        }
+        PendingDataAction::DeleteModel { target, .. } => {
+            // An Ollama deletion reports back later, through poll_model_delete.
+            match app.delete_model(ctx, target) {
+                Ok(Some(message)) => app.notify(message, false),
+                Ok(None) => {}
+                Err(error) => app.notify(error, true),
+            }
+            return;
         }
     };
     match result {
@@ -317,6 +336,28 @@ mod data_confirmation_tests {
         h.get_by_label_contains("portions will stay missing");
         h.get_by_label_contains("can’t be undone");
         h.get_by_label("DELETE AUDIO");
+    }
+
+    #[test]
+    fn model_dialog_names_size_and_warns_about_shared_ollama_models() {
+        let whisper = PendingDataAction::DeleteModel {
+            target: crate::app::ModelTarget::Whisper("/m/ggml-small.bin".into()), name: "Small".into(), size: "488 MB".into(),
+        };
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| { data_confirmation_content(ui, &whisper, 1); });
+        h.get_by_label("Delete model?");
+        h.get_by_label_contains("“Small” (488 MB) will be permanently deleted");
+        assert!(h.query_by_label_contains("Other apps").is_none());
+        h.get_by_label("DELETE MODEL");
+
+        let ollama = PendingDataAction::DeleteModel {
+            target: crate::app::ModelTarget::Ollama("qwen2.5:3b".into()), name: "qwen2.5:3b".into(), size: "1.9 GB".into(),
+        };
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| { data_confirmation_content(ui, &ollama, 1); });
+        h.get_by_label_contains("Other apps that use Ollama will lose it too");
     }
 
     #[test]

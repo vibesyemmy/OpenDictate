@@ -431,7 +431,11 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                                 // start used to leave this row reading "Not
                                 // running" over a server that was coming up.
                                 std::thread::spawn(move || {
-                                    h.lock().unwrap().ollama = Some(engines::start_ollama_and_wait(&url));
+                                    let started = engines::start_ollama_and_wait(&url);
+                                    let sizes = if started.is_ok() { crate::model_storage::ollama_inventory(&url).unwrap_or_default() } else { Vec::new() };
+                                    let mut h = h.lock().unwrap();
+                                    h.ollama = Some(started);
+                                    h.ollama_storage = sizes;
                                     c.request_repaint();
                                 });
                             }
@@ -657,9 +661,83 @@ fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         });
     }
 
+    storage_section(app, ui, &health);
+
     if changed {
         app.changed();
         app.refresh_health(&ctx);
+    }
+}
+
+/// What is taking up space: every downloaded speech and text model with its
+/// size, and a way to delete the ones not in use.
+fn storage_section(app: &mut DictateApp, ui: &mut egui::Ui, health: &crate::app::Health) {
+    use crate::app::{ModelTarget, PendingDataAction};
+    use crate::model_storage::{format_size, same_ollama_model};
+    let whisper = crate::model_storage::whisper_inventory(&crate::settings::models_dir()).unwrap_or_default();
+    let local_ollama = crate::model_storage::local_ollama_url(&app.s.ollama_url);
+    let ollama: &[crate::model_storage::OllamaModel] = if local_ollama { &health.ollama_storage } else { &[] };
+    let total: u64 = whisper.iter().map(|m| m.size).sum::<u64>() + ollama.iter().filter_map(|m| m.size).sum::<u64>();
+
+    section(ui, crate::icon::ARCHIVE, "Storage");
+    ui.label(para(format!("Models downloaded on this Mac use {}. Deleting one frees its space; you can download it again any time. A model in use can't be deleted.", format_size(total)), 13.0, theme::MUTED()));
+    ui.add_space(10.0);
+
+    // One card per model: name and size on the left, its state on the right.
+    let mut card = |ui: &mut egui::Ui, title: &str, size: Option<u64>, in_use: bool, deleting: bool, target: ModelTarget| {
+        theme::soft(theme::SURFACE(), 12, 2.0, 2).corner_radius(8).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(m(title, 13.5, theme::TEXT()));
+                    ui.label(t(size.map_or("Size unknown".into(), format_size), 12.5, theme::MUTED()));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if in_use {
+                        crate::views::status(ui, crate::views::State::Ok, "In use");
+                    } else if deleting {
+                        ui.label(t("Deleting…", 12.5, theme::MUTED()));
+                    } else {
+                        let delete = crate::views::btn(ui, "Delete");
+                        delete.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Delete {title}")));
+                        if delete.clicked() {
+                            app.pending_data_action = Some(PendingDataAction::DeleteModel {
+                                target: target.clone(), name: title.to_string(), size: size.map_or("size unknown".into(), format_size),
+                            });
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+    };
+
+    ui.label(m("Speech models", 14.0, theme::TEXT()));
+    ui.add_space(4.0);
+    if whisper.is_empty() {
+        ui.label(t("No speech models downloaded.", 12.5, theme::MUTED()));
+    }
+    for model in &whisper {
+        let title = engines::WHISPER_MODELS.iter().find(|c| c.file == model.name).map_or(model.name.clone(), |c| c.label.to_string());
+        let in_use = model.path.to_string_lossy() == app.s.whisper_model;
+        card(ui, &title, Some(model.size), in_use, false, ModelTarget::Whisper(model.path.clone()));
+    }
+
+    ui.add_space(10.0);
+    ui.label(m("Text models (Ollama)", 14.0, theme::TEXT()));
+    ui.add_space(4.0);
+    if !local_ollama {
+        ui.label(t("Ollama is set to another computer. Manage its models there.", 12.5, theme::MUTED()));
+    } else if !matches!(health.ollama, Some(Ok(_))) {
+        ui.label(t("Start Ollama to see the text models it has downloaded.", 12.5, theme::MUTED()));
+    } else if ollama.is_empty() {
+        ui.label(t("No text models downloaded.", 12.5, theme::MUTED()));
+    }
+    for model in ollama {
+        let in_use = same_ollama_model(&model.name, &app.s.ollama_model);
+        let target = ModelTarget::Ollama(model.name.clone());
+        let deleting = app.model_deleting.as_ref() == Some(&target);
+        card(ui, &model.name, model.size, in_use, deleting, target);
     }
 }
 

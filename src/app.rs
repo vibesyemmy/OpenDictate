@@ -43,6 +43,7 @@ pub enum PendingDataAction {
     ChangeRetention(settings::KeepHistory),
     RegenerateSummary { id: String },
     DiscardRecoveryAudio { id: String, count: usize },
+    DeleteModel { target: ModelTarget, name: String, size: String },
 }
 
 pub struct JobOut {
@@ -91,8 +92,17 @@ fn classify_recording(clip: &crate::audio::Clip, elapsed: f32, error: Option<&st
 pub struct Health {
     pub whisper_bin: Option<PathBuf>,
     pub ollama: Option<Result<Vec<String>, String>>,
+    /// The same Ollama models with their sizes, for Settings › Models › Storage.
+    pub ollama_storage: Vec<crate::model_storage::OllamaModel>,
     pub remote_text: Option<Result<Vec<String>, String>>,
     pub checked: bool,
+}
+
+/// A downloaded model the user asked to delete.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelTarget {
+    Whisper(PathBuf),
+    Ollama(String),
 }
 
 pub struct Toast {
@@ -139,6 +149,9 @@ pub struct DictateApp {
     pub health: Arc<Mutex<Health>>,
     pub download: Option<(String, SharedProgress)>,
     pub pull_name: String,
+    /// The Ollama model being deleted in the background, and how it went.
+    pub model_deleting: Option<ModelTarget>,
+    pub model_delete_result: Arc<Mutex<Option<Result<String, String>>>>,
     pub test_input: String,
     pub test_output: Arc<Mutex<Option<Result<String, String>>>>,
     pub test_running: Arc<AtomicBool>,
@@ -304,6 +317,8 @@ impl DictateApp {
             test_input: "um so I think we should, uh, meet on tuesday, no wait, wednesday at 3 and bring the the slides"
                 .into(),
             test_output: Default::default(),
+            model_deleting: None,
+            model_delete_result: Default::default(),
             test_running: Default::default(),
             dict_filter: 0,
             dict_search: None,
@@ -1205,6 +1220,54 @@ impl DictateApp {
         Ok(())
     }
 
+    /// Deletes a downloaded model the user has confirmed. A Whisper file is
+    /// removed here; an Ollama model is removed by Ollama on a background
+    /// thread, and the result arrives through `model_delete_result`.
+    /// A model that is in use is refused, so dictation never loses its model.
+    pub fn delete_model(&mut self, ctx: &egui::Context, target: ModelTarget) -> Result<Option<String>, String> {
+        match target {
+            ModelTarget::Whisper(path) => {
+                if path.to_string_lossy() == self.s.whisper_model {
+                    return Err("This speech model is in use. Choose another one first.".into());
+                }
+                crate::model_storage::delete_whisper(&settings::models_dir(), &path)?;
+                self.refresh_health(ctx);
+                Ok(Some("Model deleted.".into()))
+            }
+            ModelTarget::Ollama(name) => {
+                if crate::model_storage::same_ollama_model(&name, &self.s.ollama_model) {
+                    return Err("This text model is in use. Choose another one first.".into());
+                }
+                if self.model_deleting.is_some() { return Err("Another model is still being deleted.".into()); }
+                self.model_deleting = Some(ModelTarget::Ollama(name.clone()));
+                let (url, slot, health, ctx) = (self.s.ollama_url.clone(), self.model_delete_result.clone(), self.health.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let result = crate::model_storage::delete_ollama(&url, &name).map(|_| format!("Deleted {name}."));
+                    if let Ok(models) = crate::model_storage::ollama_inventory(&url) {
+                        let mut h = health.lock().unwrap();
+                        h.ollama = Some(Ok(models.iter().map(|m| m.name.clone()).collect()));
+                        h.ollama_storage = models;
+                    }
+                    *slot.lock().unwrap() = Some(result);
+                    ctx.request_repaint();
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    /// Shows the outcome of a background model deletion once it is known.
+    pub fn poll_model_delete(&mut self) {
+        let result = self.model_delete_result.lock().unwrap().take();
+        if let Some(result) = result {
+            self.model_deleting = None;
+            match result {
+                Ok(message) => self.notify(message, false),
+                Err(error) => self.notify(error, true),
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Model health
 
@@ -1227,9 +1290,12 @@ impl DictateApp {
         let health = self.health.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            // One request gives both the names and the sizes.
+            let inventory = crate::model_storage::ollama_inventory(&s.ollama_url);
             let h = Health {
                 whisper_bin: engines::find_whisper_bin(&s.whisper_bin),
-                ollama: Some(engines::ollama_models(&s.ollama_url)),
+                ollama: Some(inventory.clone().map(|models| models.into_iter().map(|m| m.name).collect())),
+                ollama_storage: inventory.unwrap_or_default(),
                 remote_text: (s.text_engine == TextEngine::OpenAiCompatible)
                     .then(|| engines::openai_models(&s.text_url, &s.text_key)),
                 checked: true,
@@ -1244,7 +1310,11 @@ impl DictateApp {
 
             if autostart && down {
                 let started = engines::start_ollama_and_wait(&s.ollama_url);
-                health.lock().unwrap().ollama = Some(started);
+                let sizes = if started.is_ok() { crate::model_storage::ollama_inventory(&s.ollama_url).unwrap_or_default() } else { Vec::new() };
+                let mut h = health.lock().unwrap();
+                h.ollama = Some(started);
+                h.ollama_storage = sizes;
+                drop(h);
                 ctx.request_repaint();
             }
         });

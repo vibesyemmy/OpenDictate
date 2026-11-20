@@ -39,6 +39,22 @@ mod tests {
     }
 
     #[test]
+    fn sizes_read_the_way_finder_shows_them() {
+        assert_eq!(format_size(0), "0 MB");
+        assert_eq!(format_size(147_951_465), "148 MB");
+        assert_eq!(format_size(999_000_000), "999 MB");
+        assert_eq!(format_size(1_624_555_275), "1.6 GB");
+        assert_eq!(format_size(12_000_000_000), "12 GB");
+    }
+
+    #[test]
+    fn ollama_models_are_never_deleted_from_another_machine() {
+        let err = delete_ollama("http://example.com:11434", "llama3.2").unwrap_err();
+        assert!(err.contains("on this Mac"), "{err}");
+        assert!(delete_ollama("http://evil.com@localhost:11434", "llama3.2").is_err());
+    }
+
+    #[test]
     fn model_identity_and_local_server_rules_are_safe() {
         assert!(same_ollama_model("llama3.2", "llama3.2:latest"));
         assert!(!same_ollama_model("llama3.2:3b", "llama3.2:latest"));
@@ -135,4 +151,46 @@ pub fn local_ollama_url(url: &str) -> bool {
     let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
     let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
     !authority.contains('@') && crate::talking::is_local(url)
+}
+
+/// A size in decimal units, as Finder shows it: whole MB below a gigabyte,
+/// one decimal place below ten gigabytes, whole GB above.
+pub fn format_size(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    let b = bytes as f64;
+    if b < GB { format!("{:.0} MB", b / MB) }
+    else if b < 10.0 * GB { format!("{:.1} GB", b / GB) }
+    else { format!("{:.0} GB", b / GB) }
+}
+
+fn ollama_base(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// The models Ollama has downloaded, with their sizes.
+pub fn ollama_inventory(url: &str) -> Result<Vec<OllamaModel>, String> {
+    let resp = crate::engines::agent(4)
+        .get(format!("{}/api/tags", ollama_base(url)))
+        .call()
+        .map_err(|_| "Ollama isn't running".to_string())?;
+    parse_ollama_inventory(&crate::engines::read_json(resp)?)
+}
+
+/// Asks Ollama to delete a model. Only an Ollama on this Mac is asked: a
+/// remote server's models belong to whoever runs it.
+pub fn delete_ollama(url: &str, name: &str) -> Result<(), String> {
+    if !local_ollama_url(url) {
+        return Err("Models can only be deleted from Ollama on this Mac.".into());
+    }
+    let resp = crate::engines::agent(30)
+        .delete(format!("{}/api/delete", ollama_base(url)))
+        .force_send_body()
+        .send_json(serde_json::json!({ "model": name }))
+        .map_err(|_| "Ollama isn't running".to_string())?;
+    match resp.status().as_u16() {
+        200..=299 => Ok(()),
+        404 => Err(format!("Ollama no longer has {name}.")),
+        code => Err(format!("Ollama could not delete {name} (error {code}).")),
+    }
 }
