@@ -132,12 +132,21 @@ pub struct DictateApp {
     pub hotkey_errors: Vec<String>,
     pub capturing_key: Option<Trigger>,
     pub capture_first_key: Option<egui::Key>,
+    /// While recording a shortcut: Right Option went down and nothing else
+    /// has been pressed with it yet, so letting go means "Right Option".
+    pub capture_right_option: bool,
     #[cfg(target_os = "macos")]
     chord_listener: Option<crate::chords::mac::Listener>,
     chord_tx: Sender<(usize, bool)>,
     chord_rx: Receiver<(usize, bool)>,
     chord_triggers: Vec<Trigger>,
     chord_ctx: egui::Context,
+    /// Right Option shortcuts: their signals, which trigger each id is, and
+    /// whether a dictation is running (read by the keyboard listener).
+    ro_tx: Sender<crate::right_option::Signal>,
+    ro_rx: Receiver<crate::right_option::Signal>,
+    ro_triggers: Vec<Trigger>,
+    ro_dictating: Arc<AtomicBool>,
 
     /// Microphones found on the system, and the system default's name.
     pub mics: Vec<String>,
@@ -276,6 +285,7 @@ impl DictateApp {
         let (jobs_tx, jobs_rx) = channel();
         let (hk_tx, hk_rx) = channel();
         let (chord_tx, chord_rx) = channel();
+        let (ro_tx, ro_rx) = channel();
         let ctx = cc.egui_ctx.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             let _ = hk_tx.send(e);
@@ -305,12 +315,17 @@ impl DictateApp {
             hotkey_errors: Vec::new(),
             capturing_key: None,
             capture_first_key: None,
+            capture_right_option: false,
             #[cfg(target_os = "macos")]
             chord_listener: None,
             chord_tx,
             chord_rx,
             chord_triggers: Vec::new(),
             chord_ctx: cc.egui_ctx.clone(),
+            ro_tx,
+            ro_rx,
+            ro_triggers: Vec::new(),
+            ro_dictating: Default::default(),
             mics: Vec::new(),
             default_mic: None,
             last_mic_refresh: Instant::now(),
@@ -551,7 +566,9 @@ impl DictateApp {
         #[cfg(target_os = "macos")]
         { self.chord_listener = None; }
         while self.chord_rx.try_recv().is_ok() {}
+        while self.ro_rx.try_recv().is_ok() {}
         self.chord_triggers.clear();
+        self.ro_triggers.clear();
         let Some(mgr) = &self.hotkeys else {
             if self.shot.is_none() && !self.preview {
                 self.hotkey_errors.push("Global shortcuts are unavailable on this system.".into());
@@ -565,7 +582,23 @@ impl DictateApp {
             .flat_map(|t| self.s.trigger_keys(*t).iter().map(|k| (k.clone(), *t)))
             .collect();
         let mut chords = Vec::new();
+        let mut ro_solo: Option<usize> = None;
+        let mut ro_combos: Vec<(u16, usize)> = Vec::new();
         for (k, trigger) in want {
+            if let Some(second) = crate::right_option::parse(&k) {
+                let taken = match second {
+                    None => ro_solo.is_some(),
+                    Some(key) => ro_combos.iter().any(|(x, _)| *x == key),
+                };
+                if taken {
+                    self.hotkey_errors.push(format!("{}: shortcut is already assigned.", crate::right_option::label(&k).unwrap_or(k.clone())));
+                    continue;
+                }
+                let id = self.ro_triggers.len();
+                self.ro_triggers.push(trigger);
+                match second { None => ro_solo = Some(id), Some(key) => ro_combos.push((key, id)) }
+                continue;
+            }
             if let Some((a, b)) = crate::chords::parse(&k) {
                 if chords.iter().any(|(x,y,_)| (*x == a && *y == b) || (*x == b && *y == a)) {
                     self.hotkey_errors.push(format!("{k}: shortcut is already assigned."));
@@ -584,15 +617,19 @@ impl DictateApp {
                 Err(e) => self.hotkey_errors.push(format!("{k}: {e}")),
             }
         }
+        let right_option = crate::right_option::RightOption::new(ro_solo, ro_combos);
         #[cfg(target_os = "macos")]
-        if !chords.is_empty() {
-            match crate::chords::mac::Listener::new(chords, self.chord_tx.clone(), self.chord_ctx.clone()) {
+        if !chords.is_empty() || !right_option.is_empty() {
+            let ro = (!right_option.is_empty()).then(|| crate::chords::mac::RightOptionSetup {
+                state: right_option, tx: self.ro_tx.clone(), dictating: self.ro_dictating.clone(),
+            });
+            match crate::chords::mac::Listener::new(chords, self.chord_tx.clone(), self.chord_ctx.clone(), ro) {
                 Ok(listener) => self.chord_listener = Some(listener),
                 Err(e) => self.hotkey_errors.push(e),
             }
         }
         #[cfg(not(target_os = "macos"))]
-        if !chords.is_empty() { self.hotkey_errors.push("Two-key shortcuts are currently available only on macOS.".into()); }
+        if !chords.is_empty() || !right_option.is_empty() { self.hotkey_errors.push("Right Option and two-key shortcuts are currently available only on macOS.".into()); }
     }
 
     pub fn pause_chord_capture(&mut self) {
@@ -606,6 +643,40 @@ impl DictateApp {
             return;
         };
         self.on_trigger(ctx, trigger, e.state);
+    }
+
+    /// Right Option shortcuts. On its own the key drives dictation directly:
+    /// Start begins, Stop transcribes, Cancel drops a recording that began
+    /// only because Right Option turned out to be a modifier. Combinations
+    /// behave like any other shortcut.
+    fn on_right_option(&mut self, ctx: &egui::Context, signal: crate::right_option::Signal) {
+        use crate::right_option::Signal;
+        let id = match signal { Signal::Start(i) | Signal::Stop(i) | Signal::Cancel(i) | Signal::Press(i) | Signal::Release(i) => i };
+        let Some(trigger) = self.ro_triggers.get(id).copied() else { return };
+        let action = match (signal, trigger) {
+            (Signal::Press(_), t) => return self.on_trigger(ctx, t, HotKeyState::Pressed),
+            (Signal::Release(_), t) => return self.on_trigger(ctx, t, HotKeyState::Released),
+            // A meeting runs for an hour; Right Option alone toggles it.
+            (Signal::Start(_), Trigger::Meeting) => return self.toggle_meeting(),
+            (_, Trigger::Meeting) => return,
+            (_, Trigger::Act(a)) => a,
+        };
+        let ours = |app: &Self| app.recording.as_ref().is_some_and(|(_, a, _)| *a == action);
+        if self.setup_open {
+            match signal {
+                Signal::Start(_) if !self.setup_practice_recording && action == Action::Dictate => self.start_setup_practice(),
+                Signal::Stop(_) if self.setup_practice_recording => self.stop_recording(ctx),
+                Signal::Cancel(_) if self.setup_practice_recording => self.cancel_recording(),
+                _ => {}
+            }
+            return;
+        }
+        match signal {
+            Signal::Start(_) if self.recording.is_none() && self.busy.is_none() && self.meeting.is_none() => self.start_recording(action),
+            Signal::Stop(_) if ours(self) => self.stop_recording(ctx),
+            Signal::Cancel(_) if ours(self) => self.cancel_recording(),
+            _ => {}
+        }
     }
 
     fn on_trigger(&mut self, ctx: &egui::Context, trigger: Trigger, state: HotKeyState) {
@@ -1695,6 +1766,10 @@ impl eframe::App for DictateApp {
                 }
             }
         }
+        while let Ok(signal) = self.ro_rx.try_recv() {
+            if self.capturing_key.is_none() { self.on_right_option(ctx, signal); }
+        }
+        self.ro_dictating.store(self.recording.is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some((recording, _, _)) = self.recording.as_mut() {
             if let Some(result) = recording.recover_if_needed() {
                 match result {

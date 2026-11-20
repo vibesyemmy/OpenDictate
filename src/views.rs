@@ -1096,6 +1096,7 @@ pub fn kbd_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
 pub fn pretty_key(k: &str) -> String {
     k.split('+')
         .map(|p| match p.trim().to_lowercase().as_str() {
+            "rightoption" => "Right ⌥".to_string(),
             "alt" | "option" => "⌥".to_string(),
             "shift" => "⇧".to_string(),
             "ctrl" | "control" => "⌃".to_string(),
