@@ -8,11 +8,26 @@ use objc2::{sel, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBox, NSBoxType, NSColor, NSImage, NSTitlePosition,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowOrderingMode,
+    NSWindowCollectionBehavior, NSWindowOrderingMode,
 };
 use objc2_foundation::NSData;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Keep the invisible frame-driving anchor and recording indicator visible on
+/// the active Space, including when another application is full screen.
+pub fn keep_recording_windows_on_all_spaces() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    for window in NSApplication::sharedApplication(mtm).windows().iter() {
+        let title = window.title().to_string();
+        let is_anchor = title == "Open Dictate" && window.frame().size.width <= 2.0;
+        if title != "Listening" && !is_anchor { continue; }
+        let mut behavior = window.collectionBehavior();
+        behavior.remove(NSWindowCollectionBehavior::MoveToActiveSpace | NSWindowCollectionBehavior::Managed | NSWindowCollectionBehavior::FullScreenPrimary | NSWindowCollectionBehavior::FullScreenNone);
+        behavior.insert(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary | NSWindowCollectionBehavior::Stationary | NSWindowCollectionBehavior::IgnoresCycle);
+        if behavior != window.collectionBehavior() { window.setCollectionBehavior(behavior); }
+    }
+}
 
 thread_local! {
     /// The wash of paper over the blur. Kept so a theme change can retint it

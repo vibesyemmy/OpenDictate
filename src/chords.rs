@@ -136,6 +136,21 @@ mod tests {
         }
     }
     #[test]
+    fn four_shortcuts_can_share_space_without_confusion() {
+        let arrows = ["Left", "Up", "Down", "Right"];
+        let shortcuts: Vec<_> = arrows.iter().enumerate().map(|(id, arrow)| {
+            let (space, key) = parse(&format!("Space+{arrow}")).unwrap();
+            (space, key, id)
+        }).collect();
+        for (id, &(space, key, _)) in shortcuts.iter().enumerate() {
+            let mut state = ChordState::new(shortcuts.clone());
+            assert_eq!(state.event(space, true, false), Outcome::Hold);
+            assert_eq!(state.event(key, true, false), Outcome::Press(id));
+            assert_eq!(state.event(key, false, false), Outcome::Release(id));
+            assert_eq!(state.event(space, false, false), Outcome::Suppress);
+        }
+    }
+    #[test]
     fn unrelated_typing_replays_first_key_before_the_next_key() {
         let mut state = ChordState::new(vec![(1, 2, 7)]);
         assert_eq!(state.event(1, true, false), Outcome::Hold);

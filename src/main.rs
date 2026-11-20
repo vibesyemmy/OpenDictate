@@ -1,14 +1,21 @@
 mod app;
 mod audio;
 mod cut;
+mod data_safety;
 mod engines;
 mod icon;
 mod lms;
 mod login_item;
 mod meeting;
+mod home_view;
+mod meeting_intro;
+mod model_storage;
+mod playback;
+mod privacy;
 #[cfg(target_os = "macos")]
 mod macos_look;
 mod search;
+mod setup_guide;
 mod settings;
 mod settings_view;
 mod stats;
@@ -200,11 +207,12 @@ fn main() -> eframe::Result<()> {
         .position(|a| a == "--screenshot")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from);
+    let preview = args.iter().any(|a| a == "--preview");
 
     // macOS only lets proper app bundles ask for the microphone; a bare program
     // just gets silence. Re-open ourselves as "Open Dictate.app" for normal use.
     #[cfg(target_os = "macos")]
-    if screenshot.is_none() && !args.iter().any(|a| a == "--no-bundle") && macos_bundle::relaunch() {
+    if screenshot.is_none() && !preview && !args.iter().any(|a| a == "--no-bundle") && macos_bundle::relaunch() {
         return Ok(());
     }
 
@@ -218,9 +226,9 @@ fn main() -> eframe::Result<()> {
     // Screenshot mode keeps the old shape, with the real window as the root,
     // because that is what gets captured.
     let options = eframe::NativeOptions {
-        viewport: if screenshot.is_some() {
+        viewport: if screenshot.is_some() || preview {
             eframe::egui::ViewportBuilder::default()
-                .with_title("Open Dictate")
+                .with_title(if preview { "Open Dictate — Development Preview" } else { "Open Dictate" })
                 .with_inner_size([1360.0, 920.0])
                 .with_min_inner_size([980.0, 640.0])
                 // Matches the real window, so a screenshot shows the page at
@@ -248,7 +256,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Open Dictate",
         options,
-        Box::new(move |cc| Ok(Box::new(app::DictateApp::new(cc, screenshot)))),
+        Box::new(move |cc| Ok(Box::new(app::DictateApp::new(cc, screenshot, preview)))),
     )
 }
 

@@ -72,7 +72,8 @@ impl WhisperServer {
             .map_err(|e| format!("no free port: {e}"))?
             .port();
         let stderr = std::fs::File::create(dir.join("whisper-server.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
-        let child = std::process::Command::new(bin)
+        let mut command = std::process::Command::new(&bin);
+        let child = command
             .arg("-m")
             .arg(&s.whisper_model)
             .args(["--host", "127.0.0.1", "--port", &port.to_string()])

@@ -82,17 +82,24 @@ pub fn transcribe(s: &Settings, wav: &[u8]) -> Result<String, String> {
 }
 
 pub fn find_whisper_bin(configured: &str) -> Option<PathBuf> {
-    let p = Path::new(configured.trim());
-    if p.components().count() > 1 {
-        return p.is_file().then(|| p.to_path_buf());
-    }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|v| std::env::split_paths(&v).collect())
         .unwrap_or_default();
     // Apps launched from Finder get a short PATH; look where Homebrew puts things too.
     dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    dirs.into_iter().map(|d| d.join(p)).find(|c| c.is_file())
+    let app_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    find_whisper_in(configured, app_dir.as_deref(), &dirs)
 }
+
+fn find_whisper_in(configured: &str, app_dir: Option<&Path>, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let p = Path::new(configured.trim());
+    if p.components().count() > 1 { return p.is_file().then(|| p.to_path_buf()); }
+    if matches!(configured.trim(), "whisper-cli" | "whisper-server") {
+        if let Some(path) = app_dir.map(|d| d.join(p)).filter(|p| p.is_file()) { return Some(path); }
+    }
+    dirs.iter().map(|d| d.join(p)).find(|c| c.is_file())
+}
+
 
 fn transcribe_local(s: &Settings, wav: &[u8]) -> Result<String, String> {
     let bin = find_whisper_bin(&s.whisper_bin)
@@ -103,7 +110,7 @@ fn transcribe_local(s: &Settings, wav: &[u8]) -> Result<String, String> {
     let wav_path = std::env::temp_dir().join(format!("open-dictate-{}.wav", std::process::id()));
     std::fs::write(&wav_path, wav).map_err(|e| e.to_string())?;
 
-    let mut cmd = std::process::Command::new(bin);
+    let mut cmd = std::process::Command::new(&bin);
     cmd.arg("-m").arg(&s.whisper_model).arg("-f").arg(&wav_path).args(["-nt", "-np"]);
     let lang = s.language.trim();
     cmd.arg("-l").arg(if lang.is_empty() { "auto" } else { lang });
@@ -141,7 +148,15 @@ pub(crate) fn clean_transcript(text: &str) -> String {
             _ => {}
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    let cleaned = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Whisper can return a standalone subtitle describing music instead of
+    // spoken words. Only treat explicitly marked non-speech as an annotation.
+    let marked = cleaned.strip_prefix('*').and_then(|s| s.strip_suffix('*'))
+        .or_else(|| cleaned.strip_prefix('(').and_then(|s| s.strip_suffix(')')));
+    if marked.is_some_and(|s| {
+        let s = s.trim().to_lowercase();
+        s == "music" || s.ends_with(" music") || s == "silence" || s == "noise"
+    }) { String::new() } else { cleaned }
 }
 
 pub(crate) fn multipart(fields: &[(&str, &str)], wav: &[u8]) -> (String, Vec<u8>) {
@@ -685,7 +700,28 @@ pub(crate) fn fake_server(replies: Vec<String>) -> (u16, std::sync::mpsc::Receiv
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standalone_music_annotations_are_not_dictated_words() {
+        assert_eq!(super::clean_transcript("*sad music*"), "");
+        assert_eq!(super::clean_transcript("(music)"), "");
+        assert_eq!(super::clean_transcript("I like sad music"), "I like sad music");
+        assert_eq!(super::clean_transcript("Thank you."), "Thank you.");
+    }
     use super::*;
+
+    #[test]
+    fn bundled_whisper_takes_priority_without_overriding_explicit_paths() {
+        let root = std::env::temp_dir().join(format!("opendictate-engine-search-{}", std::process::id()));
+        let bundled = root.join("bundle");
+        let external = root.join("external");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(bundled.join("whisper-cli"), b"bundled").unwrap();
+        std::fs::write(external.join("whisper-cli"), b"external").unwrap();
+        assert_eq!(find_whisper_in("whisper-cli", Some(&bundled), &[external.clone()]), Some(bundled.join("whisper-cli")));
+        assert_eq!(find_whisper_in(external.join("whisper-cli").to_str().unwrap(), Some(&bundled), &[]), Some(external.join("whisper-cli")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use std::time::{Duration, Instant};
 
     fn local_text(port: u16) -> Settings {

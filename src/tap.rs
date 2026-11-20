@@ -50,8 +50,38 @@ struct Sink {
     /// "them". Splitting on a layout that no longer holds does not produce an
     /// error, it produces a confident lie, so it is checked every callback.
     split_ok: AtomicBool,
+    last_frames_ms: std::sync::atomic::AtomicU64,
+    last_mic_sound_ms: std::sync::atomic::AtomicU64,
+    last_system_sound_ms: std::sync::atomic::AtomicU64,
     /// Set while diagnosing: the loudest sample seen on each channel.
     probe: Mutex<Vec<f32>>,
+}
+
+#[derive(Clone)]
+pub struct CaptureMonitor(Arc<Sink>);
+
+pub struct CaptureSnapshot {
+    pub frames_ms: u64,
+    pub microphone_ms: u64,
+    pub system_ms: u64,
+    pub has_mic: bool,
+    pub separated: bool,
+}
+
+pub fn clock_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+impl CaptureMonitor {
+    pub fn snapshot(&self) -> CaptureSnapshot {
+        CaptureSnapshot {
+            frames_ms: self.0.last_frames_ms.load(Ordering::Relaxed),
+            microphone_ms: self.0.last_mic_sound_ms.load(Ordering::Relaxed),
+            system_ms: self.0.last_system_sound_ms.load(Ordering::Relaxed),
+            has_mic: self.0.mic_channels > 0,
+            separated: self.0.split_ok.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub struct SystemCapture {
@@ -180,6 +210,14 @@ unsafe extern "C-unwind" fn io_proc(
         }
         index += ch;
     }
+    let now = clock_ms();
+    sink.last_frames_ms.store(now, Ordering::Relaxed);
+    let loud = |samples: &[f32], channels: usize| {
+        let scale = channels.max(1) as f32;
+        samples.iter().map(|x| (x / scale).powi(2)).sum::<f32>() / samples.len().max(1) as f32 > 0.001_f32.powi(2)
+    };
+    if n_mine > 0 && loud(&mine, n_mine) { sink.last_mic_sound_ms.store(now, Ordering::Relaxed); }
+    if n_theirs > 0 && loud(&theirs, n_theirs) { sink.last_system_sound_ms.store(now, Ordering::Relaxed); }
     if let Ok(mut out) = sink.mine.lock() {
         let scale = 1.0 / n_mine.max(1) as f32;
         out.extend(mine.iter().map(|s| s * scale));
@@ -462,6 +500,9 @@ impl SystemCapture {
                 mic_channels,
                 tap_channels,
                 split_ok: AtomicBool::new(mic_channels > 0 && tap_channels > 0),
+                last_frames_ms: std::sync::atomic::AtomicU64::new(0),
+                last_mic_sound_ms: std::sync::atomic::AtomicU64::new(0),
+                last_system_sound_ms: std::sync::atomic::AtomicU64::new(0),
                 probe: Mutex::new(Vec::new()),
             })));
             let mut proc_id: AudioDeviceIOProcID = None;
@@ -507,6 +548,10 @@ impl SystemCapture {
                 theirs: sink.theirs.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default(),
             }
         }
+    }
+
+    pub fn monitor(&self) -> CaptureMonitor {
+        unsafe { CaptureMonitor((&*self.sink).clone()) }
     }
 
     /// Loudest sample seen on each of the device's input channels since the

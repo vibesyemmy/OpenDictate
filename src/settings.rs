@@ -211,6 +211,12 @@ pub struct Settings {
     /// been transcribed. A meeting uses about 1.9 MB a minute.
     #[serde(default)]
     pub keep_meeting_audio: bool,
+    /// Other voices are also audible through the selected microphone.
+    #[serde(default)]
+    pub meeting_mixed_microphone: bool,
+    /// The first-meeting explanation is shown only until dismissed.
+    #[serde(default)]
+    pub meeting_intro_seen: bool,
     /// Open at login. Off for anyone upgrading: a background app that starts
     /// itself without being asked is the sort of thing people uninstall over.
     #[serde(default)]
@@ -227,7 +233,41 @@ pub struct Settings {
 }
 
 fn meeting_default() -> Vec<String> {
+    // Preserve the old default for existing settings that predate this field.
     vec!["F16".into()]
+}
+
+#[cfg(test)]
+mod shortcut_default_tests {
+    use super::*;
+
+    #[test]
+    fn new_users_get_distinct_shortcuts_for_their_platform() {
+        let settings = Settings::default();
+        if cfg!(target_os = "macos") {
+            assert_eq!(settings.dictate_keys, ["Space+Left"]);
+            assert_eq!(settings.translate_keys, ["Space+Up"]);
+            assert_eq!(settings.ask_keys, ["Space+Down"]);
+            assert_eq!(settings.meeting_keys, ["Space+Right"]);
+            for trigger in Trigger::ALL { assert!(crate::chords::parse(&settings.trigger_keys(trigger)[0]).is_some()); }
+        } else {
+            for trigger in Trigger::ALL { assert!(settings.trigger_keys(trigger)[0].parse::<global_hotkey::hotkey::HotKey>().is_ok()); }
+        }
+    }
+
+    #[test]
+    fn loading_existing_settings_keeps_their_shortcuts() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["dictate_keys"] = serde_json::json!(["F19", "Alt+Space"]);
+        saved["translate_keys"] = serde_json::json!(["F18"]);
+        saved["ask_keys"] = serde_json::json!(["F17"]);
+        saved.as_object_mut().unwrap().remove("meeting_keys");
+        let restored: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.dictate_keys, ["F19", "Alt+Space"]);
+        assert_eq!(restored.translate_keys, ["F18"]);
+        assert_eq!(restored.ask_keys, ["F17"]);
+        assert_eq!(restored.meeting_keys, ["F16"]);
+    }
 }
 
 fn system() -> Appearance {
@@ -320,10 +360,10 @@ impl Default for Settings {
             translate_to: "Spanish".into(),
             custom_instructions: String::new(),
 
-            dictate_keys: vec!["F19".into(), "Alt+Space".into()],
-            meeting_keys: meeting_default(),
-            translate_keys: vec!["F18".into()],
-            ask_keys: vec!["F17".into()],
+            dictate_keys: vec![if cfg!(target_os = "macos") { "Space+Left" } else { "Alt+Cmd+1" }.into()],
+            meeting_keys: vec![if cfg!(target_os = "macos") { "Space+Right" } else { "Alt+Cmd+4" }.into()],
+            translate_keys: vec![if cfg!(target_os = "macos") { "Space+Up" } else { "Alt+Cmd+2" }.into()],
+            ask_keys: vec![if cfg!(target_os = "macos") { "Space+Down" } else { "Alt+Cmd+3" }.into()],
             hold_to_talk: false,
             microphone: String::new(),
             input_gain: 1.0,
@@ -331,6 +371,8 @@ impl Default for Settings {
             restore_clipboard: true,
             show_indicator: true,
             keep_meeting_audio: false,
+            meeting_mixed_microphone: false,
+            meeting_intro_seen: false,
             start_at_login: false,
             hide_text_model_notice: false,
             typing_wpm: 40.0,
@@ -424,11 +466,22 @@ pub fn load_settings() -> Settings {
 pub fn save_settings(s: &Settings) {
     save("settings.json", s)
 }
+pub fn try_save_settings(s: &Settings) -> Result<(), String> {
+    let body = serde_json::to_vec_pretty(s).map_err(|e| format!("Could not save settings: {e}"))?;
+    let path = data_dir().join("settings.json");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("Could not save settings: {e}"))?;
+    std::fs::rename(tmp, path).map_err(|e| format!("Could not save settings: {e}"))
+}
 pub fn load_history() -> Vec<Entry> {
     load("history.json")
 }
-pub fn save_history(h: &[Entry]) {
-    save("history.json", &h.to_vec())
+pub fn try_save_history(h: &[Entry]) -> Result<(), String> {
+    let body = serde_json::to_vec_pretty(h).map_err(|e| format!("Could not save history: {e}"))?;
+    let path = data_dir().join("history.json");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("Could not save history: {e}"))?;
+    std::fs::rename(tmp, path).map_err(|e| format!("Could not save history: {e}"))
 }
 
 pub fn now_secs() -> u64 {

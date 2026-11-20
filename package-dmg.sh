@@ -28,6 +28,8 @@ rm -rf "$STAGE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 cp "target/release/$BIN_IN" "$BUNDLE/Contents/MacOS/$BIN_OUT"
 chmod +x "$BUNDLE/Contents/MacOS/$BIN_OUT"
+echo "==> Bundling the local speech engine"
+python3 tools/bundle-whisper.py "$BUNDLE"
 
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 cp assets/AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
@@ -78,6 +80,9 @@ if [ "$SIGN_ID" != "-" ]; then
 fi
 
 echo "==> Signing as: $SIGN_ID"
+for component in "$BUNDLE"/Contents/Frameworks/* "$BUNDLE"/Contents/MacOS/*.so "$BUNDLE"/Contents/MacOS/whisper-cli "$BUNDLE"/Contents/MacOS/whisper-server; do
+    codesign --force --options runtime --sign "$SIGN_ID" "$component"
+done
 codesign "${SIGN_FLAGS[@]}" --sign "$SIGN_ID" "$BUNDLE"
 codesign --verify --strict --verbose=1 "$BUNDLE"
 

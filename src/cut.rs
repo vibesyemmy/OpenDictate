@@ -236,7 +236,7 @@ impl Cutter {
         let identical = mine == theirs;
         let (voice, samples) = if identical || !self.split_ok {
             let theirs_silent = theirs.iter().all(|x| *x == 0.0);
-            ("both", if theirs_silent { mine } else { theirs })
+            ("mixed", if theirs_silent { mine } else { theirs })
         } else {
             match side_of(loudest(&mine, self.frame), loudest(&theirs, self.frame)) {
                 Side::You => ("you", mine),
@@ -419,7 +419,7 @@ mod tests {
         let mic = cat(&[speech(2.0), silence(0.6)]);
         let out = c.push(&mic, &[], false);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].voice, "both");
+        assert_eq!(out[0].voice, "mixed");
     }
 
     #[test]
@@ -469,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn labels_both_and_ignores_turns_when_sides_cannot_be_split() {
+    fn labels_mixed_and_ignores_turns_when_sides_cannot_be_split() {
         let mine = cat(&[silence(2.0), speech(2.0)]);
         let theirs = cat(&[speech(2.0), silence(2.0)]);
         let out = cut_all(&mine, &theirs, false);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].voice, "both");
+        assert_eq!(out[0].voice, "mixed");
     }
 
     #[test]

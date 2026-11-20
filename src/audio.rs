@@ -223,7 +223,24 @@ impl Clip {
             return true;
         }
         let peak = self.samples.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        peak < 0.01
+        if peak < 0.01 { return true; }
+        // A single click can exceed the peak threshold even in an otherwise
+        // quiet recording. Require a short run of sustained sound as well.
+        let mut active = 0;
+        for frame in self.samples.chunks_exact(320) {
+            let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len() as f32).sqrt();
+            active = if rms >= 0.003 { active + 1 } else { 0 };
+            if active >= 3 {
+                // Reuse the meeting cutter's adaptive noise floor so steady
+                // fan noise is not mistaken for a voice after a click.
+                let mut detector = crate::cut::Cutter::new(16_000.0);
+                for chunk in self.samples.chunks(16_000) {
+                    if !detector.push(chunk, &[], false).is_empty() { return false; }
+                }
+                return detector.flush().is_none();
+            }
+        }
+        true
     }
 
     /// 16-bit PCM mono WAV at 16 kHz, the format whisper.cpp expects.

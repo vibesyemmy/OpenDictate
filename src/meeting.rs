@@ -33,6 +33,14 @@ pub struct Meta {
     /// summarised. Until then - and for a meeting nothing was transcribed
     /// from - it is the day and time the recording started.
     pub title: String,
+    #[serde(default)]
+    pub title_user_edited: bool,
+    #[serde(default)]
+    pub title_error: Option<String>,
+    #[serde(default)]
+    pub summary_error: Option<String>,
+    #[serde(default)]
+    pub discarded_failed_clips: usize,
     /// One line under the title, from the same model pass. Empty when the
     /// meeting has not been summarised, or when what came back was no use.
     #[serde(default)]
@@ -89,9 +97,37 @@ pub struct Live {
     /// that says "you and everyone on the call" when your side was never
     /// recorded is worse than one that admits it.
     pub heard_you: bool,
+    pub capture: Option<crate::tap::CaptureMonitor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureActivity { Starting, Sound, Quiet, Stalled, Unavailable, Mixed }
+
+pub fn capture_activity(frames_ms: u64, sound_ms: u64, now_ms: u64, available: bool, separated: bool) -> CaptureActivity {
+    if !available { CaptureActivity::Unavailable }
+    else if frames_ms == 0 { CaptureActivity::Starting }
+    else if now_ms.saturating_sub(frames_ms) > 3000 { CaptureActivity::Stalled }
+    else if !separated { CaptureActivity::Mixed }
+    else if sound_ms != 0 && now_ms.saturating_sub(sound_ms) <= 2000 { CaptureActivity::Sound }
+    else { CaptureActivity::Quiet }
+}
+
+fn meeting_voice(voice: &'static str, mixed_microphone: bool) -> &'static str {
+    if mixed_microphone && voice == "you" { "mixed" } else { voice }
+}
+
+fn voice_context(voice: &str) -> &'static str {
+    match voice {
+        "you" => "Everything in this part was said by the person this summary is for.",
+        "them" => "Everything in this part was said by other people on the call, not by the person this summary is for.",
+        "mixed" => "This microphone may contain multiple people; you cannot identify who spoke from the audio channel.",
+        _ => "This part has several people talking.",
+    }
 }
 
 pub fn root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("OPENDICTATE_TEST_MEETINGS_ROOT") { return root.into(); }
     settings::data_dir().join("meetings")
 }
 
@@ -210,35 +246,70 @@ pub fn edit_segment(id: &str, at_ms: u64, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn rename(id: &str, title: &str) {
+pub fn rename(id: &str, title: &str) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
+    let title = title.trim();
+    if title.is_empty() { return Err("Enter a meeting title.".into()); }
     let path = root().join(id).join("meta.json");
-    if let Some(mut m) = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Meta>(&s).ok()) {
-        m.title = title.to_string();
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
-    }
+    let mut meta: Meta = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("Could not read meeting: {e}"))?)
+        .map_err(|e| format!("Could not read meeting: {e}"))?;
+    meta.title = title.to_string();
+    meta.title_user_edited = true;
+    meta.title_error = None;
+    atomic_json(&path, &meta)
 }
 
 /// Stores the name the model gave a meeting. A blank title is ignored, so a
 /// model that returns nothing useful leaves the day and time in place rather
 /// than wiping it.
-pub fn set_name(id: &str, title: &str, subtitle: &str) {
+pub fn set_name(id: &str, title: &str, subtitle: &str) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
     if title.trim().is_empty() {
-        return;
+        return Err("The generated title was empty.".into());
     }
     let path = root().join(id).join("meta.json");
-    if let Some(mut m) = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Meta>(&s).ok()) {
-        m.title = title.trim().to_string();
-        m.subtitle = subtitle.trim().to_string();
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
+    let mut m: Meta = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("Could not read meeting: {e}"))?).map_err(|e| format!("Could not read meeting: {e}"))?;
+    if m.title_user_edited { return Err("The meeting title has been edited manually.".into()); }
+    m.title = title.trim().to_string();
+    m.subtitle = subtitle.trim().to_string();
+    m.title_error = None;
+    atomic_json(&path, &m)
+}
+
+pub fn set_summary_error(id: &str, issue: Option<&str>) {
+    if !crate::data_safety::valid_meeting_id(id) { return; }
+    let path = root().join(id).join("meta.json");
+    if let Some(mut meta) = std::fs::read(&path).ok().and_then(|v| serde_json::from_slice::<Meta>(&v).ok()) {
+        meta.summary_error = issue.map(|s| s.chars().take(500).collect());
+        let _ = atomic_json(&path, &meta);
     }
 }
 
-pub fn delete(id: &str) {
-    // Guard against a crafted id walking out of the meetings directory.
-    if id.contains('/') || id.contains("..") {
-        return;
+fn set_title_error(id: &str, issue: &str) {
+    if !crate::data_safety::valid_meeting_id(id) { return; }
+    let path = root().join(id).join("meta.json");
+    if let Some(mut meta) = std::fs::read(&path).ok().and_then(|v| serde_json::from_slice::<Meta>(&v).ok()) {
+        if meta.title_user_edited { return; }
+        meta.title_error = Some(issue.chars().take(500).collect());
+        let _ = atomic_json(&path, &meta);
     }
-    let _ = std::fs::remove_dir_all(root().join(id));
+}
+
+pub fn retry_title(s: &Settings, id: &str) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
+    let sum = summary(id).ok_or("Create a summary before generating a title.")?;
+    let model = (!s.meeting_model.trim().is_empty()).then_some(s.meeting_model.trim());
+    match name_from_result(s, model, &sum.overview, &sum.decisions, &sum.actions) {
+        Ok((title, subtitle)) => set_name(id, &title, &subtitle),
+        Err(error) => { set_title_error(id, &error); Err(error) }
+    }
+}
+
+pub fn delete(id: &str) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) {
+        return Err("That meeting cannot be deleted.".into());
+    }
+    crate::data_safety::delete_permanently(&root().join(id))
 }
 
 /// Average every `ratio` samples. The tap runs at 48k and whisper wants 16k,
@@ -290,11 +361,115 @@ pub(crate) fn log(dir: &Path, line: &str) {
     }
 }
 
-fn append_segment(dir: &Path, seg: &Segment) {
+fn append_segment(dir: &Path, seg: &Segment) -> Result<(), String> {
     use std::io::Write;
-    if let Ok(line) = serde_json::to_string(seg) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("transcript.jsonl")) {
-            let _ = writeln!(f, "{line}");
+    let line = serde_json::to_string(seg).map_err(|e| format!("Could not prepare transcript: {e}"))?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("transcript.jsonl")).map_err(|e| format!("Could not save transcript: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("Could not save transcript: {e}"))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FailedClip { at_ms: u64, secs: f32, voice: String, retain: bool }
+
+fn failed_clips_in(dir: &Path) -> Vec<FailedClip> {
+    let mut clips: Vec<FailedClip> = std::fs::read_dir(dir.join("failed_audio")).into_iter().flatten().flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read(e.path()).ok().and_then(|v| serde_json::from_slice(&v).ok()))
+        .collect();
+    clips.sort_by_key(|x| x.at_ms);
+    clips
+}
+
+pub fn failed_clip_count(id: &str) -> usize {
+    if !crate::data_safety::valid_meeting_id(id) { return 0; }
+    failed_clips_in(&root().join(id)).len()
+}
+
+fn failed_paths(dir: &Path, at_ms: u64) -> (PathBuf, PathBuf) {
+    let wav = dir.join("failed_audio").join(stretch_file(at_ms));
+    let meta = wav.with_extension("json");
+    (wav, meta)
+}
+
+fn finish_recovered(dir: &Path, clip: &FailedClip, text: &str) -> Result<(), String> {
+    let transcript = dir.join("transcript.jsonl");
+    let body = match std::fs::read_to_string(&transcript) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Could not read the transcript: {e}")),
+    };
+    let mut segments: Vec<Segment> = body.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str)
+        .collect::<Result<_, _>>().map_err(|_| "The existing transcript could not be read safely. Recovery audio was kept.".to_string())?;
+    if !segments.iter().any(|s| s.at_ms == clip.at_ms) {
+        segments.push(Segment { at_ms: clip.at_ms, secs: clip.secs, voice: clip.voice.clone(), text: text.trim().into() });
+        segments.sort_by_key(|s| s.at_ms);
+        let body = segments.iter().map(|s| serde_json::to_string(s).map(|l| l + "\n")).collect::<Result<String, _>>().map_err(|e| e.to_string())?;
+        let temp = transcript.with_extension("jsonl.new");
+        std::fs::write(&temp, body).and_then(|_| std::fs::rename(&temp, &transcript)).map_err(|e| format!("Could not save recovered transcript: {e}"))?;
+    }
+    let (wav, meta) = failed_paths(dir, clip.at_ms);
+    if clip.retain {
+        std::fs::copy(&wav, dir.join("audio").join(stretch_file(clip.at_ms))).map_err(|e| format!("Could not save audio for playback: {e}"))?;
+    }
+    std::fs::remove_file(&wav).map_err(|e| format!("Could not remove temporary recovery audio: {e}"))?;
+    std::fs::remove_file(&meta).map_err(|e| format!("Could not finish recovery: {e}"))?;
+    Ok(())
+}
+
+fn retry_failed_in(dir: &Path, transcribe: &dyn Fn(&[u8]) -> Result<String, String>) -> Result<usize, String> {
+    let mut count = 0;
+    for clip in failed_clips_in(dir) {
+        let (wav, meta) = failed_paths(dir, clip.at_ms);
+        let already_saved = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap_or_default().lines()
+            .filter_map(|line| serde_json::from_str::<Segment>(line).ok()).any(|s| s.at_ms == clip.at_ms);
+        if !wav.exists() {
+            if already_saved && (!clip.retain || dir.join("audio").join(stretch_file(clip.at_ms)).exists()) {
+                std::fs::remove_file(meta).map_err(|e| format!("Could not finish recovery: {e}"))?;
+                continue;
+            }
+        }
+        if already_saved {
+            finish_recovered(dir, &clip, "")?;
+            continue;
+        }
+        let bytes = std::fs::read(wav).map_err(|e| format!("Could not read recovery audio: {e}"))?;
+        let text = transcribe(&bytes).map_err(|e| format!("Recovery stopped after {count} clips: {e}"))?;
+        if text.trim().is_empty() { return Err(format!("Recovery stopped after {count} clips: no speech was transcribed. The audio is still saved.")); }
+        finish_recovered(dir, &clip, &text)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn retry_failed(id: &str, settings: &Settings) -> Result<usize, String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
+    let dir = root().join(id);
+    retry_failed_in(&dir, &|wav| crate::engines::transcribe(settings, wav))
+}
+
+pub fn discard_failed_audio(id: &str) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
+    discard_failed_audio_in(&root().join(id))
+}
+
+/// Deletes the meeting's untranscribed audio for good and records how many
+/// clips were discarded, so the transcript can say it is incomplete.
+fn discard_failed_audio_in(dir: &Path) -> Result<(), String> {
+    let path = dir.join("meta.json");
+    let mut meta: Meta = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("Could not read meeting: {e}"))?).map_err(|e| format!("Could not read meeting: {e}"))?;
+    let count = failed_clips_in(dir).len();
+    crate::data_safety::delete_permanently(&dir.join("failed_audio"))?;
+    meta.discarded_failed_clips += count;
+    atomic_json(&path, &meta).map_err(|e| format!("Audio deleted, but the meeting could not be updated: {e}"))
+}
+
+pub fn mark_transcript_recovered(id: &str) {
+    if !crate::data_safety::valid_meeting_id(id) { return; }
+    let path = root().join(id).join("meta.json");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) {
+            meta.edited_at = Some(now().saturating_add(1));
+            let _ = atomic_json(&path, &meta);
         }
     }
 }
@@ -318,7 +493,7 @@ fn should_start_lm_studio(s: &Settings, memory: u64, lms_found: bool) -> bool {
 impl Session {
     pub fn start(s: &Settings) -> Result<Self, String> {
         let cap = SystemCapture::start(crate::tap::meeting_input(&s.microphone))?;
-        let source = if cap.has_mic { "You and everyone on the call" } else { "Everyone on the call" };
+        let source = if cap.has_mic { "Microphone and system audio" } else { "System audio · microphone unavailable" };
         let started = now();
         let id = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
         let dir = root().join(&id);
@@ -326,6 +501,10 @@ impl Session {
         let meta = Meta {
             id: id.clone(),
             title: chrono::Local::now().format("%A %H:%M").to_string(),
+            title_user_edited: false,
+            title_error: None,
+            summary_error: None,
+            discarded_failed_clips: 0,
             subtitle: String::new(),
             edited_at: None,
             audio_hold: audio_hold(s).map(str::to_string),
@@ -336,7 +515,7 @@ impl Session {
         };
         let _ = std::fs::write(dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap_or_default());
 
-        let live = Arc::new(Mutex::new(Live::default()));
+        let live = Arc::new(Mutex::new(Live { capture: Some(cap.monitor()), ..Live::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let worker = std::thread::spawn({
             let (dir, live, stop) = (dir.clone(), live.clone(), stop.clone());
@@ -374,7 +553,7 @@ impl Session {
             if let Ok(l) = self.live.lock() {
                 m.peak = l.peak;
                 if !l.heard_you && !no_audio_reached(l.samples) {
-                    m.source = "Everyone on the call · your microphone was not captured".into();
+                    m.source = "System audio · no microphone sound detected".into();
                 }
             }
             let _ = std::fs::write(&path, serde_json::to_string_pretty(&m).unwrap_or_default());
@@ -418,6 +597,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
     let mut process = |stretches: Vec<crate::cut::Stretch>, rate: f64, offset: f64| {
         for mut st in stretches {
             st.start_secs = meeting_stretch_time(offset, st.start_secs);
+            st.voice = meeting_voice(st.voice, s.meeting_mixed_microphone);
             match handle_stretch(&dir, index, &st, rate, &transcribe, retain) {
                 Ok(Some(seg)) => {
                     if let Ok(mut l) = live.lock() {
@@ -467,6 +647,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
             last_check = std::time::Instant::now();
             let lost = cap.as_ref().and_then(|c| c.mic).is_some_and(|mic| !crate::tap::input_present(mic));
             if lost {
+                if let Ok(mut l) = live.lock() { l.capture = None; }
                 if let Some(old) = cap.take() {
                     old.pause();
                     let last = old.drain();
@@ -481,6 +662,7 @@ fn run(cap: SystemCapture, dir: PathBuf, live: Arc<Mutex<Live>>, stop: Arc<Atomi
                         offset = started.elapsed().as_secs_f64();
                         rate = next.rate;
                         cutter = crate::cut::Cutter::new(rate);
+                        if let Ok(mut l) = live.lock() { l.capture = Some(next.monitor()); }
                         cap = Some(next);
                         if let Ok(mut l) = live.lock() { l.warning = Some("Microphone disconnected; switched to the system input.".into()); }
                         log(&dir, "microphone disconnected; switched to the system input");
@@ -535,31 +717,29 @@ fn handle_stretch(
     }
 
     let at_ms = (st.start_secs * 1000.0).round() as u64;
-    let path = dir.join("audio").join(stretch_file(at_ms));
     let wav = wav_16k_mono(&samples);
-    let _ = std::fs::write(&path, &wav);
+    let clip = FailedClip { at_ms, secs: st.secs, voice: st.voice.into(), retain };
+    let (path, metadata) = failed_paths(dir, at_ms);
+    std::fs::create_dir_all(dir.join("failed_audio")).map_err(|e| format!("Could not retain speech for recovery: {e}"))?;
+    atomic_json(&metadata, &clip).map_err(|e| format!("Could not save recovery details: {e}"))?;
+    std::fs::write(&path, &wav).map_err(|e| format!("Could not retain all speech for recovery: {e}"))?;
     let result = transcribe(&wav);
-    // Normally this is where a stretch's audio goes: 1.9 MB a minute, and a
-    // week of meetings would fill a disk. It is kept only while the meeting
-    // is being recorded or
-    // for good if asked for.
-    if !retain {
-        let _ = std::fs::remove_file(&path);
-    }
     match result {
         Ok(text) if !text.trim().is_empty() => {
-            log(dir, &format!("    {}: {}", st.voice, text.trim().chars().take(60).collect::<String>()));
             let seg = Segment { at_ms, secs: st.secs, text: text.trim().to_string(), voice: st.voice.to_string() };
-            append_segment(dir, &seg);
+            append_segment(dir, &seg)?;
+            if retain { std::fs::copy(&path, dir.join("audio").join(stretch_file(at_ms))).map_err(|e| format!("Could not save audio for playback; recovery copy kept: {e}"))?; }
+            std::fs::remove_file(&path).map_err(|e| format!("Could not remove recovery audio: {e}"))?;
+            std::fs::remove_file(&metadata).map_err(|e| format!("Could not finish recovery: {e}"))?;
             Ok(Some(seg))
         }
         Ok(text) => {
             log(dir, &format!("    transcribed to nothing ({} chars raw)", text.len()));
-            Ok(None)
+            Err("No speech was transcribed; audio was saved for retry.".into())
         }
         Err(e) => {
-            log(dir, &format!("    failed: {e}"));
-            Err(e)
+            log(dir, "    transcription failed; audio retained for retry");
+            Err(format!("Transcription failed; audio was saved for retry: {e}"))
         }
     }
 }
@@ -583,6 +763,35 @@ pub struct Summary {
     pub points: Vec<String>,
     pub model: String,
     pub made_at: u64,
+    #[serde(default)]
+    pub user_edited: bool,
+}
+
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| format!("Could not save: {e}"))?;
+    let temp = path.with_extension("json.new");
+    std::fs::write(&temp, bytes).map_err(|e| format!("Could not save: {e}"))?;
+    std::fs::rename(&temp, path).map_err(|e| format!("Could not save: {e}"))
+}
+
+pub fn save_reviewed_summary(id: &str, summary: &Summary) -> Result<(), String> {
+    if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
+    let mut reviewed = summary.clone();
+    reviewed.user_edited = true;
+    atomic_json(&summary_path(id), &reviewed)
+}
+
+fn may_replace_title(meta: &Meta) -> bool { !meta.title_user_edited }
+
+/// Suggest a transcript line for review, never a claim of evidential support.
+pub fn possible_source(item: &str, segments: &[Segment]) -> Option<usize> {
+    let words: std::collections::HashSet<_> = content_words(item).into_iter().collect();
+    if words.len() < 2 { return None; }
+    segments.iter().enumerate().filter_map(|(i, seg)| {
+        let found: std::collections::HashSet<_> = content_words(&seg.text).into_iter().collect();
+        let common = words.intersection(&found).count();
+        (common >= 2 && common * 10 >= words.len() * 5).then_some((i, common))
+    }).max_by_key(|(_, common)| *common).map(|(i, _)| i)
 }
 
 /// Small on purpose. At 450 words a 3B model stops listing and starts
@@ -643,10 +852,6 @@ Only what the transcript says. Nothing was decided and nobody took anything on, 
 not write as though they had: say what the subject was and what was said about it. \
 Never invent a project, a deadline, a team or a next meeting.";
 
-const STILL_OPEN: &str = "You are checking which questions from a meeting were left unanswered.\n\n\
-You get a list of questions and a list of what the meeting decided and assigned. Output only the \
-questions that nothing in those lists answers, one per line, exactly as they were written. \
-No numbering, no commentary. If all of them were answered, output nothing.";
 
 fn summary_path(id: &str) -> PathBuf {
     root().join(id).join("summary.json")
@@ -681,7 +886,7 @@ pub fn summary(id: &str) -> Option<Summary> {
 /// task in a way they miss - "Dami writes up the offer tonight" has no
 /// commitment word in it. Moving a line costs a reader nothing, where
 /// deleting one loses something that was actually said.
-fn is_decision(line: &str) -> bool {
+pub(crate) fn is_decision(line: &str) -> bool {
     let l = line.to_lowercase();
     // "adopted", not "adopt": a podcast about how widely companies use AI
     // had "adopting a new approach to building software" filed as a decision.
@@ -800,6 +1005,42 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
     kept.into_iter().map(|(i, _)| i).collect()
 }
 
+/// Review selects original candidates by index, so it cannot add invented
+/// claims or silently change owners and dates. Invalid replies leave them intact.
+fn reviewed_candidates(candidates: &[String], selected: &[usize]) -> Option<Vec<String>> {
+    if selected.iter().any(|&i| i >= candidates.len()) { return None; }
+    let mut seen = std::collections::HashSet::new();
+    Some(selected.iter().filter(|&&i| seen.insert(i)).map(|&i| candidates[i].clone()).collect())
+}
+
+fn is_transient_clarification(question: &str) -> bool {
+    let text = question.trim().to_lowercase();
+    let quoted = text.contains('"') || text.contains('“') || text.contains('”');
+    quoted && text.starts_with("what does ") && (text.ends_with(" mean?") || text.ends_with(" refer to?"))
+}
+
+fn review_meeting_candidates(s: &Settings, model: Option<&str>, spoken: &str, decisions: &[String], actions: &[String], questions: &[String], points: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    #[derive(Deserialize)]
+    struct Selection { questions: Vec<usize>, points: Vec<usize> }
+    if questions.is_empty() && points.is_empty() { return None; }
+    let indexed = |items: &[String]| items.iter().enumerate().map(|(i, item)| format!("{i}: {item}")).collect::<Vec<_>>().join("\n");
+    let context = sample(spoken, 900);
+    let user = format!("Transcript excerpt:\n{context}\n\nDecisions:\n{}\n\nActions:\n{}\n\nCandidate questions:\n{}\n\nCandidate key points:\n{}", decisions.join("\n"), actions.join("\n"), indexed(questions), indexed(points));
+    let index_array = |len: usize| if len == 0 {
+        serde_json::json!({"type":"array", "maxItems":0, "items":{"type":"integer"}})
+    } else {
+        serde_json::json!({"type":"array", "items":{"type":"integer", "minimum":0, "maximum":len-1}})
+    };
+    let schema = serde_json::json!({"type":"object", "properties": {"questions":index_array(questions.len()), "points":index_array(points.len())}, "required":["questions","points"], "additionalProperties":false});
+    let system = "Review a meeting's candidate notes. Return JSON arrays of zero-based candidate indices to keep. Keep only clear, consequential key points and substantive questions that remain unresolved after the meeting. Exclude requests to clarify wording, meanings of terms, or references in the conversation; for example, do not keep 'What does shadowed mean?' or 'What does that refer to?'. Exclude fragments and unclear or unsupported statements. When several key points concern the same topic, keep only the most informative one, not every detail. Omit anything already covered by decisions or actions. A short meeting normally needs only a few key points; keep additional points if they cover distinct important topics. Do not invent items. Empty arrays are valid.";
+    let answer = crate::engines::chat_json(s, model, system, &user, "meeting_review", &schema, &|| true).ok()?;
+    let selection: Selection = serde_json::from_str(&answer).ok()?;
+    // A model that collapses a substantial set to nothing (or to a single
+    // point) may have misunderstood the request; prefer the original notes.
+    if points.len() > 3 && selection.points.len() < 2 { return None; }
+    Some((reviewed_candidates(questions, &selection.questions)?, reviewed_candidates(points, &selection.points)?))
+}
+
 /// Puts the right person in front of an extracted line.
 ///
 /// Telling the model who was speaking is not enough: given "I will update the
@@ -832,8 +1073,7 @@ fn strip_bullet(line: &str) -> String {
 /// Reads a meeting's transcript and works out what it came to.
 ///
 /// Map then reduce: every block is listed separately, then the lists are
-/// merged here in code and the model is asked only for the two things code
-/// cannot do - the opening paragraph, and which questions went unanswered.
+/// merged here in code, reviewed across the meeting, and used to write an overview.
 fn name_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -911,7 +1151,7 @@ fn content_words(line: &str) -> Vec<String> {
 /// the example the prompt gave. Taking the example out is half the fix. The
 /// other half is not trusting the answer - most of what a name says has to
 /// appear in the notes it was made from.
-fn grounded(line: &str, notes: &str) -> bool {
+pub(crate) fn grounded(line: &str, notes: &str) -> bool {
     overlap(line, notes) >= 0.5
 }
 
@@ -958,30 +1198,34 @@ fn sample(text: &str, words: usize) -> String {
 /// asked to name "The meeting discussed recent developments..." answers
 /// "Recent Developments". The decisions and actions are where the nouns are.
 fn name_from(s: &Settings, model: Option<&str>, overview: &str, decisions: &[String], actions: &[String]) -> Option<(String, String)> {
+    name_from_result(s, model, overview, decisions, actions).ok()
+}
+
+fn name_from_result(s: &Settings, model: Option<&str>, overview: &str, decisions: &[String], actions: &[String]) -> Result<(String, String), String> {
     let mut notes = overview.to_string();
     for line in decisions.iter().chain(actions.iter()).take(8) {
         notes.push('\n');
         notes.push_str(line);
     }
     if notes.split_whitespace().count() < 8 {
-        return None;
+        return Err("Not enough meeting detail to generate a title.".into());
     }
-    let out = crate::engines::chat_json(s, model, NAME, &notes, "name", &name_schema(), &|| true).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let out = crate::engines::chat_json(s, model, NAME, &notes, "name", &name_schema(), &|| true).map_err(|e| format!("Title model unavailable: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&out).map_err(|_| "The title model returned an unreadable response.".to_string())?;
     let title = tidy(v["title"].as_str().unwrap_or(""), 6);
     let subtitle = tidy(v["subtitle"].as_str().unwrap_or(""), 14);
     // A one character answer is not a name, a name that could belong to any
     // meeting is no better than the date it replaces, and a name about
     // something the meeting never mentioned is worse than both.
     if title.len() < 3 || EMPTY_TITLES.contains(&title.to_lowercase().as_str()) || !grounded(&title, &notes) {
-        return None;
+        return Err("The suggested title did not match the meeting notes.".into());
     }
     let subtitle = if subtitle.eq_ignore_ascii_case(&title) || !grounded(&subtitle, &notes) {
         String::new()
     } else {
         subtitle
     };
-    Some((title, subtitle))
+    Ok((title, subtitle))
 }
 
 /// How many single-letter changes two words can differ by and still be the
@@ -1152,6 +1396,54 @@ fn clean_overview(out: &str) -> String {
     kept.join("\n").trim().to_string()
 }
 
+/// An overview cannot establish which entity a figure belongs to. Keep such
+/// details in the transcript until a claim-level verifier can prove them.
+pub(crate) fn safe_overview(text: &str, decisions: &[String], actions: &[String]) -> String {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if matches!(c, '.' | '!' | '?') && text[i + c.len_utf8()..].chars().next().is_none_or(char::is_whitespace) {
+            sentences.push(&text[start..i + c.len_utf8()]);
+            start = i + c.len_utf8();
+        }
+    }
+    if start < text.len() { sentences.push(&text[start..]); }
+    let mut omitted_numbers = false;
+    let mut kept = Vec::new();
+    for s in sentences.into_iter().map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = s.to_lowercase();
+        let numeric = s.chars().any(|c| c.is_ascii_digit())
+            || lower.split(|c: char| !c.is_alphabetic()).any(|w|
+                ["percent", "percentage", "million", "billion", "thousand",
+                 "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                 "eleven", "twelve", "twenty", "thirty", "forty", "fifty", "sixty",
+                 "seventy", "eighty", "ninety", "hundred"].contains(&w));
+        let claims_decision = ["decided", "agreed", "approved", "chose", "decision"].iter().any(|w| lower.contains(w));
+        let claims_action = ["tasked", "assigned", "committed", "will ", "action item"].iter().any(|w| lower.contains(w));
+        omitted_numbers |= numeric;
+        if !numeric && (!claims_decision || decisions.iter().any(|d| grounded(s, d)))
+            && (!claims_action || actions.iter().any(|a| grounded(s, a))) {
+            kept.push(s);
+        }
+    }
+    let mut out = kept.join(" ");
+    if omitted_numbers && !out.is_empty() {
+        out.push_str(" Figures omitted; check the transcript.");
+    }
+    out
+}
+
+fn overview_or_excerpt(overview: &str, spoken: &str) -> String {
+    if !overview.is_empty() && overlap(overview, spoken) >= OVERVIEW_FLOOR {
+        return overview.to_string();
+    }
+    let words: Vec<&str> = spoken.split_whitespace().collect();
+    if words.is_empty() { return String::new(); }
+    let excerpt = words.iter().take(40).copied().collect::<Vec<_>>().join(" ");
+    let ellipsis = if words.len() > 40 { "…" } else { "" };
+    format!("From the transcript: “{excerpt}{ellipsis}”")
+}
+
 /// The opening paragraph of a summary, and the check that it is true.
 fn write_overview(s: &Settings, model: Option<&str>, decisions: &[String], actions: &[String], spoken: &str) -> Result<String, String> {
     let (system, user) = overview_request(decisions, actions, spoken);
@@ -1166,10 +1458,11 @@ fn write_overview(s: &Settings, model: Option<&str>, decisions: &[String], actio
         }
     }
     let out = without_sentences_naming(&out, &names_outside(&out, spoken));
+    let out = safe_overview(&out, decisions, actions);
     // A summary that is merely thin is worth keeping. One that describes a
     // meeting that did not happen is not, and it is worse than none at all
     // because it reads like the real thing.
-    Ok(if overlap(&out, spoken) >= OVERVIEW_FLOOR { out } else { String::new() })
+    Ok(overview_or_excerpt(&out, spoken))
 }
 
 pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Summary, String> {
@@ -1208,11 +1501,7 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         if let Ok(mut p) = progress.lock() {
             *p = format!("Reading part {} of {}…", i + 1, blocks.len());
         }
-        let who = match voice.as_str() {
-            "you" => "Everything in this part was said by the person this summary is for.",
-            "them" => "Everything in this part was said by other people on the call, not by the person this summary is for.",
-            _ => "This part has several people talking.",
-        };
+        let who = voice_context(voice);
         let user = format!("Part {} of {}. {who}\n\n{block}", i + 1, blocks.len());
         let out = crate::engines::chat_as(s, model, MAP, &[], &user)?;
         // Per block, not per meeting: a long meeting should still be able to
@@ -1267,14 +1556,22 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         points.extend(rest);
         kept
     };
-    let decisions = sift(decisions, &is_decision);
-    let actions = sift(actions, &|x: &str| is_action(x, &spoken));
+    let decisions = sift(decisions, &|x: &str| is_decision(x) && crate::talking::supported_decision(x, &segments));
+    let actions = sift(actions, &|x: &str| is_action(x, &spoken) && crate::talking::supported_action(
+        &crate::talking::Action { who: String::new(), what: x.to_string() }, &segments,
+    ));
     let questions = sift(questions, &is_question);
 
     let decisions = dedupe(decisions);
     let actions = dedupe(actions);
-    let questions = dedupe(questions);
+    let questions = dedupe(questions).into_iter().filter(|question| !is_transient_clarification(question)).collect::<Vec<_>>();
     let points = dedupe(points);
+
+    if let Ok(mut p) = progress.lock() { *p = "Reviewing key points and open questions…".into(); }
+    // If the model is unavailable or returns an invalid selection, retain the
+    // extracted candidates instead of losing part of the meeting.
+    let (open, points) = review_meeting_candidates(s, model, &spoken, &decisions, &actions, &questions, &points)
+        .unwrap_or((questions, points));
 
     if let Ok(mut p) = progress.lock() {
         *p = "Writing it up…".into();
@@ -1306,26 +1603,12 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
     if let Ok(mut p) = progress.lock() {
         *p = "Naming it…".into();
     }
-    if let Some((title, subtitle)) = name_from(s, model, &overview, &decisions, &actions) {
-        set_name(id, &title, &subtitle);
-    }
-
-    let open = if questions.is_empty() {
-        Vec::new()
-    } else {
-        if let Ok(mut p) = progress.lock() {
-            *p = "Checking what went unanswered…".into();
+    if list().iter().find(|m| m.id == id).is_some_and(may_replace_title) {
+        match name_from_result(s, model, &overview, &decisions, &actions) {
+            Ok((title, subtitle)) => { if let Err(error) = set_name(id, &title, &subtitle) { set_title_error(id, &error); } },
+            Err(error) => set_title_error(id, &error),
         }
-        let asked = format!("Questions:\n{}\n\n{notes}", questions.join("\n"));
-        let kept = crate::engines::chat_as(s, model, STILL_OPEN, &[], &asked)?;
-        // Only questions that were actually asked: the filter is allowed to
-        // drop, never to invent.
-        let known: Vec<String> = questions.iter().map(|q| q.to_lowercase()).collect();
-        kept.lines()
-            .map(strip_bullet)
-            .filter(|l| known.contains(&l.to_lowercase()))
-            .collect()
-    };
+    }
 
     let out = Summary {
         overview,
@@ -1335,14 +1618,185 @@ pub fn summarise(s: &Settings, id: &str, progress: &Mutex<String>) -> Result<Sum
         points,
         model: model.unwrap_or(&s.ollama_model).to_string(),
         made_at: now(),
+        user_edited: false,
     };
-    let _ = std::fs::write(summary_path(id), serde_json::to_string_pretty(&out).unwrap_or_default());
+    atomic_json(&summary_path(id), &out)?;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn meeting_review_keeps_only_known_unique_candidates() {
+        let candidates = vec!["Dashboard shows targets".to_string(), "KPIs show targets".to_string(), "Research is undefined".to_string()];
+        assert_eq!(super::reviewed_candidates(&candidates, &[0, 0, 2]), Some(vec![candidates[0].clone(), candidates[2].clone()]));
+        assert!(super::reviewed_candidates(&candidates, &[99]).is_none());
+    }
+    #[test]
+    fn summary_omits_transient_wording_clarifications() {
+        assert!(super::is_transient_clarification("What does \"shadowed\" mean?"));
+        assert!(super::is_transient_clarification("what does \"car\" refer to?"));
+        assert!(!super::is_transient_clarification("What does the policy mean for budgets?"));
+        assert!(!super::is_transient_clarification("How will the team approach research?"));
+    }
     use super::*;
+
+    #[test]
+    #[ignore = "requires a local model and REVIEW_MEETING_ID; reads the saved meeting without modifying it"]
+    fn reviews_saved_meeting_without_changing_it() {
+        let id = std::env::var("REVIEW_MEETING_ID").unwrap();
+        let segments = transcript(&id);
+        let spoken = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        let saved: Summary = serde_json::from_slice(&std::fs::read(summary_path(&id)).unwrap()).unwrap();
+        let s = Settings { text_engine: crate::settings::TextEngine::Ollama, ollama_model: "qwen2.5:3b".into(), ..Settings::default() };
+        let (questions, points) = review_meeting_candidates(&s, None, &spoken, &saved.decisions, &saved.actions, &saved.questions, &saved.points).expect("review failed");
+        println!("QUESTIONS: {questions:#?}\nKEY POINTS: {points:#?}");
+    }
+
+    #[test]
+    fn failed_stretch_survives_and_retry_saves_transcript_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("open-dictate-failed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let st = crate::cut::Stretch { voice: "mixed", samples: vec![0.2; 32000], secs: 2.0, voiced_secs: 2.0, start_secs: 3.0 };
+        assert!(handle_stretch(&dir, 0, &st, 16000.0, &|_| Err("offline".into()), false).is_err());
+        assert_eq!(failed_clips_in(&dir).len(), 1);
+        assert!(retry_failed_in(&dir, &|_| Err("still offline".into())).is_err());
+        assert_eq!(failed_clips_in(&dir).len(), 1);
+        assert_eq!(retry_failed_in(&dir, &|_| Ok("Hello there".into())).unwrap(), 1);
+        assert!(failed_clips_in(&dir).is_empty());
+        let text = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("Hello there"));
+        assert_eq!(retry_failed_in(&dir, &|_| Ok("Duplicate".into())).unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_does_not_overwrite_a_damaged_transcript() {
+        let dir = std::env::temp_dir().join(format!("open-dictate-broken-transcript-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let st = crate::cut::Stretch { voice: "mixed", samples: vec![0.2; 32000], secs: 2.0, voiced_secs: 2.0, start_secs: 3.0 };
+        assert!(handle_stretch(&dir, 0, &st, 16000.0, &|_| Err("offline".into()), false).is_err());
+        std::fs::write(dir.join("transcript.jsonl"), b"broken transcript\n").unwrap();
+        assert!(retry_failed_in(&dir, &|_| Ok("Recovered".into())).is_err());
+        assert_eq!(std::fs::read(dir.join("transcript.jsonl")).unwrap(), b"broken transcript\n");
+        assert_eq!(failed_clips_in(&dir).len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_respects_the_playback_choice_and_keeps_timestamp_order() {
+        let dir = std::env::temp_dir().join(format!("open-dictate-recovery-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let st = crate::cut::Stretch { voice: "them", samples: vec![0.2; 32000], secs: 2.0, voiced_secs: 2.0, start_secs: 3.0 };
+        let existing = Segment { at_ms: 5000, secs: 1.0, text: "Later".into(), voice: "you".into() };
+        append_segment(&dir, &existing).unwrap();
+        assert!(handle_stretch(&dir, 0, &st, 16000.0, &|_| Err("offline".into()), true).is_err());
+        assert_eq!(retry_failed_in(&dir, &|_| Ok("Earlier".into())).unwrap(), 1);
+        assert!(dir.join("audio").join(stretch_file(3000)).exists());
+        let body = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
+        let segments: Vec<Segment> = body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(segments.iter().map(|s| s.at_ms).collect::<Vec<_>>(), [3000, 5000]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discarding_recovery_audio_preserves_meeting_and_marks_transcript_incomplete() {
+        let dir = std::env::temp_dir().join(format!("open-dictate-discard-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let meta = serde_json::json!({"id":"test", "title":"Example", "started":1, "ended":2, "source":"mic", "peak":0.2});
+        std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+        let st = crate::cut::Stretch { voice: "mixed", samples: vec![0.2; 32000], secs: 2.0, voiced_secs: 2.0, start_secs: 3.0 };
+        assert!(handle_stretch(&dir, 0, &st, 16000.0, &|_| Err("offline".into()), false).is_err());
+        assert!(dir.join("failed_audio").exists());
+        discard_failed_audio_in(&dir).unwrap();
+        assert!(!dir.join("failed_audio").exists(), "discarded audio is deleted, not kept anywhere");
+        let saved: Meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(saved.discarded_failed_clips, 1);
+        assert!(failed_clips_in(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn title_errors_explain_when_there_is_not_enough_detail() {
+        let error = name_from_result(&Settings::default(), None, "too brief", &[], &[]).unwrap_err();
+        assert!(error.contains("Not enough meeting detail"));
+    }
+
+    #[test]
+    fn mixed_microphone_does_not_claim_the_user_spoke() {
+        assert_eq!(meeting_voice("you", true), "mixed");
+        assert_eq!(meeting_voice("you", false), "you");
+        assert_eq!(meeting_voice("them", true), "them");
+        assert!(voice_context("mixed").contains("cannot identify"));
+    }
+
+    #[test]
+    fn capture_activity_distinguishes_sound_silence_and_missing_data() {
+        use CaptureActivity::*;
+        assert_eq!(capture_activity(0, 0, 1000, true, true), Starting);
+        assert_eq!(capture_activity(1000, 900, 1100, true, true), Sound);
+        assert_eq!(capture_activity(1000, 0, 1100, true, true), Quiet);
+        assert_eq!(capture_activity(1000, 900, 5000, true, true), Stalled);
+        assert_eq!(capture_activity(1000, 900, 1100, false, true), Unavailable);
+        assert_eq!(capture_activity(1000, 900, 1100, true, false), Mixed);
+    }
+
+    #[test]
+    fn older_summaries_are_unedited_and_user_edits_survive_a_round_trip() {
+        let old = r#"{"overview":"A meeting","decisions":[],"actions":[],"questions":[],"model":"local","made_at":10}"#;
+        let mut summary: Summary = serde_json::from_str(old).unwrap();
+        assert!(!summary.user_edited);
+        summary.overview = "Corrected overview".into();
+        summary.actions.push("Send the report".into());
+        summary.user_edited = true;
+        let decoded: Summary = serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+        assert!(decoded.user_edited);
+        assert_eq!(decoded.overview, "Corrected overview");
+        assert_eq!(decoded.actions, ["Send the report"]);
+    }
+
+    #[test]
+    fn writing_a_reviewed_summary_preserves_all_sections() {
+        let dir = std::env::temp_dir().join(format!("opendictate-review-summary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("summary.json");
+        let summary = Summary { overview: "Corrected".into(), decisions: vec!["Decision".into()],
+            actions: vec!["Action".into()], questions: vec![], points: vec!["Point".into()],
+            model: "local".into(), made_at: 123, user_edited: true };
+        atomic_json(&path, &summary).unwrap();
+        let saved: Summary = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.user_edited);
+        assert_eq!(saved.actions, ["Action"]);
+        assert_eq!(saved.points, ["Point"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn possible_source_requires_real_text_overlap_and_returns_a_matching_timestamp() {
+        let segments = vec![
+            Segment { at_ms: 10_000, secs: 2.0, voice: "you".into(), text: "We discussed hiring plans.".into() },
+            Segment { at_ms: 20_000, secs: 2.0, voice: "them".into(), text: "I will send the revised budget tomorrow.".into() },
+        ];
+        assert_eq!(possible_source("Send the revised budget", &segments), Some(1));
+        assert_eq!(possible_source("Raj will renew annual contracts", &segments), None);
+        assert_eq!(possible_source("the and to", &segments), None);
+    }
+
+    #[test]
+    fn manual_title_is_preserved_when_regenerating_a_summary() {
+        let old = r#"{"id":"x","title":"My title","subtitle":"","started":1,"ended":2,"source":"test","peak":0.0}"#;
+        let mut meta: Meta = serde_json::from_str(old).unwrap();
+        assert!(!meta.title_user_edited);
+        meta.title_user_edited = true;
+        assert!(!may_replace_title(&meta));
+        meta.title_user_edited = false;
+        assert!(may_replace_title(&meta));
+    }
 
     #[test]
     fn recovered_capture_offsets_stretches_to_the_existing_meeting_timeline() {
@@ -1395,6 +1849,19 @@ mod tests {
         assert_eq!(clean_overview(out), "The Deep Dive explores the Edison myth.");
         let out = "It was about the show.\n\nTwo tasks were taken on:\n\n1. Someone will check your ticket.";
         assert_eq!(clean_overview(out), "It was about the show.");
+    }
+
+    #[test]
+    fn meeting_regression_summary_does_not_reverse_figures_or_invent_a_decision() {
+        let text = "The discussion covered business sizes. Large firms represent 60% of businesses and 0.5% of GDP. The team decided to partner with Acme Bank.";
+        let filtered = safe_overview(text, &[], &[]);
+        assert_eq!(filtered, "The discussion covered business sizes. Figures omitted; check the transcript.");
+    }
+
+    #[test]
+    fn meeting_regression_overview_falls_back_to_the_original_transcript() {
+        let spoken = "Large businesses accounted for 0.5% of businesses and 60% of GDP.";
+        assert_eq!(overview_or_excerpt("", spoken), format!("From the transcript: “{spoken}”"));
     }
 
     #[test]
@@ -1724,6 +2191,10 @@ mod tests {
             serde_json::to_string(&Meta {
                 id: id.clone(),
                 title: "t".into(),
+                title_user_edited: false,
+                title_error: None,
+                summary_error: None,
+                discarded_failed_clips: 0,
                 subtitle: String::new(),
                 edited_at: None,
                 audio_hold: None,
@@ -1772,7 +2243,7 @@ mod tests {
         let s = Settings {
             text_engine: crate::settings::TextEngine::Ollama,
             ollama_url: "http://127.0.0.1:11434".into(),
-            ollama_model: "llama3.2:3b".into(),
+            ollama_model: std::env::var("OPENDICTATE_TEST_MODEL").unwrap_or_else(|_| "llama3.2:3b".into()),
             ..Settings::default()
         };
         let progress = Mutex::new(String::new());
@@ -1790,6 +2261,8 @@ mod tests {
         for x in &out.questions {
             println!("  - {x}");
         }
+        println!("KEY POINTS ({}):", out.points.len());
+        for x in &out.points { println!("  - {x}"); }
         let named = list().into_iter().find(|m| m.id == id).expect("meeting vanished");
         println!("TITLE:    {}", named.title);
         println!("SUBTITLE: {}", named.subtitle);
@@ -1882,9 +2355,9 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_transcription_failure_and_still_deletes_the_audio() {
+    fn reports_a_transcription_failure_and_retains_audio_for_retry() {
         let dir = temp_meeting("fails");
-        let wav = dir.join("audio").join(stretch_file(1500));
+        let wav = dir.join("failed_audio").join(stretch_file(1500));
         let r = handle_stretch(
             &dir,
             0,
@@ -1896,7 +2369,9 @@ mod tests {
             },
             false,
         );
-        assert_eq!(r.unwrap_err(), "boom");
+        assert!(r.unwrap_err().contains("boom"));
+        assert!(wav.exists());
+        assert_eq!(failed_clips_in(&dir).len(), 1);
         assert!(!dir.join("audio").join(stretch_file(1500)).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

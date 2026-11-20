@@ -31,7 +31,19 @@ pub enum SettingsTab {
     General,
     Audio,
     Personalization,
+    Privacy,
     About,
+}
+
+#[derive(Clone)]
+pub enum PendingDataAction {
+    DeleteMeeting { id: String, title: String },
+    DeleteHistoryEntry { when: u64 },
+    ClearHistory,
+    ChangeRetention(settings::KeepHistory),
+    RegenerateSummary { id: String },
+    DiscardRecoveryAudio { id: String, count: usize },
+    DeleteModel { target: ModelTarget, name: String, size: String },
 }
 
 pub struct JobOut {
@@ -43,10 +55,18 @@ pub struct JobOut {
     pub selection: String,
     pub wav: Vec<u8>,
     pub retry: bool,
+    pub copy_only: bool,
     pub speech_model: String,
     pub text_model: String,
     /// Something worth telling the person even though it worked.
     pub note: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryMode { Copy, Paste }
+
+fn delivery_mode(auto_paste: bool, copy_only: bool) -> DeliveryMode {
+    if auto_paste && !copy_only { DeliveryMode::Paste } else { DeliveryMode::Copy }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -72,8 +92,17 @@ fn classify_recording(clip: &crate::audio::Clip, elapsed: f32, error: Option<&st
 pub struct Health {
     pub whisper_bin: Option<PathBuf>,
     pub ollama: Option<Result<Vec<String>, String>>,
+    /// The same Ollama models with their sizes, for Settings › Models › Storage.
+    pub ollama_storage: Vec<crate::model_storage::OllamaModel>,
     pub remote_text: Option<Result<Vec<String>, String>>,
     pub checked: bool,
+}
+
+/// A downloaded model the user asked to delete.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelTarget {
+    Whisper(PathBuf),
+    Ollama(String),
 }
 
 pub struct Toast {
@@ -120,6 +149,9 @@ pub struct DictateApp {
     pub health: Arc<Mutex<Health>>,
     pub download: Option<(String, SharedProgress)>,
     pub pull_name: String,
+    /// The Ollama model being deleted in the background, and how it went.
+    pub model_deleting: Option<ModelTarget>,
+    pub model_delete_result: Arc<Mutex<Option<Result<String, String>>>>,
     pub test_input: String,
     pub test_output: Arc<Mutex<Option<Result<String, String>>>>,
     pub test_running: Arc<AtomicBool>,
@@ -133,12 +165,19 @@ pub struct DictateApp {
     /// The transcript line being corrected, keyed by its start in
     /// milliseconds: (at_ms, the text as it is being typed).
     pub editing_line: Option<(u64, String)>,
+    pub pending_data_action: Option<PendingDataAction>,
+    pub meeting_intro_open: bool,
+    pub setup_open: bool,
+    pub setup_practice_recording: bool,
+    pub setup_practice_pending: bool,
+    pub setup_practice_text: String,
 
     pub toast: Option<Toast>,
     told_no_cleanup: bool,
     dirty: bool,
 
     shot: Option<PathBuf>,
+    pub preview: bool,
     frames: u32,
     shot_done: Arc<AtomicBool>,
 
@@ -161,16 +200,33 @@ pub struct DictateApp {
     /// if one has been made - read once when it opens rather than off disk
     /// on every frame.
     pub open_meeting: Option<String>,
+    pub meeting_show_transcript: bool,
+    pub meeting_follow_playback: bool,
+    pub meeting_last_playing_segment: Option<usize>,
     pub open_summary: Option<crate::meeting::Summary>,
+    pub editing_summary: Option<crate::meeting::Summary>,
+    pub editing_title: Option<String>,
+    pub review_source: Option<(String, usize)>,
     /// Read once when a meeting is opened, not on every frame. Drawing the
     /// detail page used to re-read every meeting's meta.json and parse the
     /// whole transcript twice per frame - 15 KB of JSON, sixty times a
     /// second, to show text that had not changed.
     pub open_meta: Option<crate::meeting::Meta>,
     pub open_segments: Vec<crate::meeting::Segment>,
+    pub saved_audio: Vec<crate::playback::Clip>,
+    pub saved_audio_ranges: Result<Vec<(u64, u64)>, String>,
+    pub open_failed_count: usize,
+    pub retrying_meeting: Option<String>,
+    recovery_rx: Option<Receiver<(String, Result<usize, String>)>>,
+    pub title_retrying: Option<String>,
+    title_rx: Option<Receiver<(String, Result<(), String>)>>,
+    pub audio_player: Option<crate::playback::Player>,
     /// The list, and whether it needs reading again.
     pub meeting_list: Vec<crate::meeting::Meta>,
+    pub meeting_search: String,
     pub meetings_dirty: bool,
+    /// The newest meeting with recoverable audio or a failed summary.
+    pub home_attention: Option<(String, bool)>,
     /// The meeting being summarised, and how far it has got.
     pub summarising: Option<String>,
     pub summary_progress: Arc<Mutex<String>>,
@@ -209,7 +265,7 @@ fn system_light(ctx: &egui::Context) -> Option<bool> {
 }
 
 impl DictateApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, shot: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, shot: Option<PathBuf>, preview: bool) -> Self {
         let mut s = settings::load_settings();
         theme::set_light(s.appearance.is_light(system_light(&cc.egui_ctx)));
         theme::install(&cc.egui_ctx);
@@ -261,6 +317,8 @@ impl DictateApp {
             test_input: "um so I think we should, uh, meet on tuesday, no wait, wednesday at 3 and bring the the slides"
                 .into(),
             test_output: Default::default(),
+            model_deleting: None,
+            model_delete_result: Default::default(),
             test_running: Default::default(),
             dict_filter: 0,
             dict_search: None,
@@ -269,10 +327,17 @@ impl DictateApp {
             expanded: None,
             editing: None,
             editing_line: None,
+            pending_data_action: None,
+            meeting_intro_open: false,
+            setup_open: false,
+            setup_practice_recording: false,
+            setup_practice_pending: false,
+            setup_practice_text: String::new(),
             toast: None,
             told_no_cleanup: false,
             dirty: false,
             shot,
+            preview,
             frames: 0,
             shot_done: Default::default(),
             tray: None,
@@ -284,11 +349,27 @@ impl DictateApp {
             meeting: None,
             talking_view: None,
             open_meeting: None,
+            meeting_show_transcript: false,
+            meeting_follow_playback: true,
+            meeting_last_playing_segment: None,
             open_summary: None,
+            editing_summary: None,
+            editing_title: None,
+            review_source: None,
             open_meta: None,
             open_segments: Vec::new(),
+            saved_audio: Vec::new(),
+            saved_audio_ranges: Ok(Vec::new()),
+            open_failed_count: 0,
+            retrying_meeting: None,
+            recovery_rx: None,
+            title_retrying: None,
+            title_rx: None,
+            audio_player: None,
             meeting_list: Vec::new(),
+            meeting_search: String::new(),
             meetings_dirty: true,
+            home_attention: None,
             summarising: None,
             summary_progress: Arc::new(Mutex::new(String::new())),
             summary_rx: None,
@@ -309,11 +390,14 @@ impl DictateApp {
             match p.as_str() {
                 "history" => app.page = Page::History,
                 "meetings" => app.page = Page::Meetings,
+                "setup" => app.setup_open = true,
                 "dictionary" => app.page = Page::Dictionary,
                 "models" => app.settings_tab = Some(SettingsTab::Models),
                 "settings" => app.settings_tab = Some(SettingsTab::General),
                 "audio" => app.settings_tab = Some(SettingsTab::Audio),
                 "personal" => app.settings_tab = Some(SettingsTab::Personalization),
+                "privacy" => app.settings_tab = Some(SettingsTab::Privacy),
+                "meeting-intro" => app.meeting_intro_open = true,
                 _ => {}
             }
         }
@@ -322,6 +406,7 @@ impl DictateApp {
         if let Some(id) = args.iter().position(|a| a == "--open").and_then(|i| args.get(i + 1)) {
             app.page = Page::Meetings;
             app.open_meeting(id.clone());
+            if args.iter().any(|a| a == "--transcript") { app.meeting_show_transcript = true; }
         }
         // Started by the login item, not by a person: come up in the menu
         // bar with no window. Logging in is not a request to be shown
@@ -335,9 +420,9 @@ impl DictateApp {
         if !app.s.keep_meeting_audio {
             std::thread::spawn(crate::meeting::sweep_audio);
         }
-        app.prune_history();
+        if let Err(error) = app.prune_history() { app.notify(error, true); }
         app.refresh_mics();
-        if app.shot.is_none() {
+        if app.shot.is_none() && !app.preview {
             app.hotkeys = GlobalHotKeyManager::new().ok();
             app.register_hotkeys();
             if let Some((t, rx)) = crate::tray::build(&cc.egui_ctx) {
@@ -350,7 +435,7 @@ impl DictateApp {
         // the moment the app is moved - out of Downloads into Applications,
         // most often. Rewriting it on every launch keeps it pointing here.
         #[cfg(target_os = "macos")]
-        if app.shot.is_none() {
+        if app.shot.is_none() && !app.preview {
             crate::login_item::sync(app.s.start_at_login);
         }
         app
@@ -462,7 +547,7 @@ impl DictateApp {
         while self.chord_rx.try_recv().is_ok() {}
         self.chord_triggers.clear();
         let Some(mgr) = &self.hotkeys else {
-            if self.shot.is_none() {
+            if self.shot.is_none() && !self.preview {
                 self.hotkey_errors.push("Global shortcuts are unavailable on this system.".into());
             }
             return;
@@ -518,6 +603,17 @@ impl DictateApp {
     }
 
     fn on_trigger(&mut self, ctx: &egui::Context, trigger: Trigger, state: HotKeyState) {
+        if self.setup_open {
+            if trigger == Trigger::Act(Action::Dictate) {
+                match state {
+                    HotKeyState::Pressed if self.setup_practice_recording && !self.s.hold_to_talk => self.stop_recording(ctx),
+                    HotKeyState::Pressed if !self.setup_practice_recording => self.start_setup_practice(),
+                    HotKeyState::Released if self.s.hold_to_talk && self.setup_practice_recording => self.stop_recording(ctx),
+                    _ => {}
+                }
+            }
+            return;
+        }
         // A meeting is always a toggle: hold-to-talk makes no sense for
         // something that runs for an hour.
         let action = match trigger {
@@ -553,7 +649,12 @@ impl DictateApp {
     /// Starts or ends a meeting. Dictation and meetings do not overlap:
     /// they would be fighting over the same microphone.
     pub fn toggle_meeting(&mut self) {
-        if let Some(session) = self.meeting.take() {
+        use crate::meeting_intro::StartDecision;
+        let decision = crate::meeting_intro::start_decision(
+            self.meeting.is_some(), self.recording.is_some() || self.busy.is_some(), self.s.meeting_intro_seen,
+        );
+        if decision == StartDecision::Stop {
+            let Some(session) = self.meeting.take() else { return };
             self.notify("Finishing the meeting…", false);
             let id = session.stop();
             self.meetings_dirty = true;
@@ -569,23 +670,68 @@ impl DictateApp {
             }
             return;
         }
-        if self.recording.is_some() || self.busy.is_some() {
+        if decision == StartDecision::Busy {
             self.notify("Finish the dictation first.", true);
             return;
         }
+        if decision == StartDecision::ShowIntro {
+            self.meeting_intro_open = true;
+            self.settings_tab = None;
+            self.page = Page::Meetings;
+            self.window_open = true;
+            self.focus_main = true;
+            #[cfg(target_os = "macos")]
+            crate::macos_look::activate();
+            return;
+        }
+        self.start_meeting();
+    }
+
+    fn start_meeting(&mut self) {
+        if self.meeting.is_some() || self.recording.is_some() || self.busy.is_some() {
+            self.notify("Finish the current recording first.", true);
+            return;
+        }
+        self.audio_player = None;
         match crate::meeting::Session::start(&self.s) {
             Ok(session) => {
                 self.notify(format!("Recording: {}", session.source.to_lowercase()), false);
                 self.meeting = Some(session);
+                self.open_meeting = None;
+                self.page = Page::Meetings;
                 self.talking_view = Some(Default::default());
             }
             Err(e) => self.notify(e, true),
         }
     }
 
+    pub fn finish_meeting_intro(&mut self, choice: crate::meeting_intro::Choice) {
+        self.meeting_intro_open = false;
+        crate::meeting_intro::acknowledge(&mut self.s);
+        self.changed();
+        let save_error = settings::try_save_settings(&self.s).err();
+        match choice {
+            crate::meeting_intro::Choice::Start => self.start_meeting(),
+            crate::meeting_intro::Choice::AudioSettings => self.settings_tab = Some(SettingsTab::Audio),
+            crate::meeting_intro::Choice::PrivacySettings => self.settings_tab = Some(SettingsTab::Privacy),
+            crate::meeting_intro::Choice::NotNow => {}
+        }
+        if let Some(error) = save_error {
+            self.notify(format!("Could not save the meeting introduction preference: {error}"), true);
+        }
+    }
+
     /// Reads the meeting back and works out what it came to, on a thread:
     /// a long meeting is a dozen model calls and the window must stay alive.
     pub fn start_summary(&mut self, id: String) {
+        if self.title_retrying.as_deref() == Some(id.as_str()) || (self.editing_title.is_some() && self.open_meeting.as_deref() == Some(id.as_str())) {
+            self.notify("Finish editing the meeting title first.", true);
+            return;
+        }
+        if self.retrying_meeting.as_deref() == Some(id.as_str()) {
+            self.notify("Wait for audio recovery to finish before summarising.", true);
+            return;
+        }
         if self.summarising.is_some() {
             self.notify("Already summarising a meeting.", true);
             return;
@@ -613,6 +759,7 @@ impl DictateApp {
         self.summarising = None;
         match out {
             Ok(summary) => {
+                crate::meeting::set_summary_error(&id, None);
                 if self.open_meeting.as_deref() == Some(id.as_str()) {
                     self.open_summary = Some(summary);
                 }
@@ -627,12 +774,27 @@ impl DictateApp {
                 }
                 self.notify("Meeting summarised", false);
             }
-            Err(e) => self.notify(e, true),
+            Err(e) => {
+                crate::meeting::set_summary_error(&id, Some(&e));
+                self.refresh_meetings();
+                if self.open_meeting.as_deref() == Some(id.as_str()) { self.open_meta = self.meeting_list.iter().find(|m| m.id == id).cloned(); }
+                self.notify(e, true);
+            }
         }
     }
 
     /// Opens a stored meeting, reading it from disk once.
     pub fn open_meeting(&mut self, id: String) {
+        self.editing_summary = None;
+        self.meeting_show_transcript = false;
+        self.meeting_follow_playback = true;
+        self.meeting_last_playing_segment = None;
+        self.editing_title = None;
+        self.review_source = None;
+        self.audio_player = None;
+        self.saved_audio = crate::playback::clips(&id);
+        self.saved_audio_ranges = crate::playback::clip_ranges(&self.saved_audio);
+        self.open_failed_count = crate::meeting::failed_clip_count(&id);
         // A half-typed correction belongs to the meeting it was started in.
         self.editing_line = None;
         self.open_summary = crate::meeting::summary(&id);
@@ -642,14 +804,89 @@ impl DictateApp {
         self.open_meeting = Some(id);
     }
 
+    pub fn retry_meeting_audio(&mut self, id: String) {
+        if self.retrying_meeting.is_some() { return; }
+        if self.editing_line.is_some() && self.open_meeting.as_deref() == Some(id.as_str()) {
+            self.notify("Save or cancel the transcript edit before recovering audio.", true);
+            return;
+        }
+        if self.summarising.as_deref() == Some(id.as_str()) {
+            self.notify("Wait for the summary to finish before recovering audio.", true);
+            return;
+        }
+        if self.title_retrying.as_deref() == Some(id.as_str()) {
+            self.notify("Wait for the title to finish before recovering audio.", true);
+            return;
+        }
+        let settings = self.s.clone();
+        let worker_id = id.clone();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let result = crate::meeting::retry_failed(&worker_id, &settings);
+            let _ = tx.send((worker_id, result));
+        });
+        self.retrying_meeting = Some(id);
+        self.recovery_rx = Some(rx);
+    }
+
+    pub fn retry_meeting_title(&mut self, id: String) {
+        if self.title_retrying.is_some() || self.summarising.is_some() || self.retrying_meeting.as_deref() == Some(id.as_str()) { return; }
+        let settings = self.s.clone();
+        let worker_id = id.clone();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let result = crate::meeting::retry_title(&settings, &worker_id);
+            let _ = tx.send((worker_id, result));
+        });
+        self.title_retrying = Some(id);
+        self.title_rx = Some(rx);
+    }
+
+    fn collect_title(&mut self) {
+        let Some(rx) = &self.title_rx else { return };
+        let Ok((id, result)) = rx.try_recv() else { return };
+        self.title_rx = None;
+        self.title_retrying = None;
+        self.refresh_meetings();
+        if self.open_meeting.as_deref() == Some(id.as_str()) { self.open_meta = self.meeting_list.iter().find(|m| m.id == id).cloned(); }
+        match result { Ok(()) => self.notify("Meeting title updated", false), Err(e) => self.notify(e, true) }
+    }
+
+    fn collect_recovery(&mut self) {
+        let Some(rx) = &self.recovery_rx else { return };
+        let Ok((id, result)) = rx.try_recv() else { return };
+        self.recovery_rx = None;
+        self.retrying_meeting = None;
+        // A retry can save a transcript before a later cleanup error. Mark
+        // summaries stale even when the job reports an error.
+        crate::meeting::mark_transcript_recovered(&id);
+        if self.open_meeting.as_deref() == Some(&id) {
+            self.open_failed_count = crate::meeting::failed_clip_count(&id);
+            self.open_segments = crate::meeting::transcript(&id);
+            self.saved_audio = crate::playback::clips(&id);
+            self.saved_audio_ranges = crate::playback::clip_ranges(&self.saved_audio);
+        }
+        self.refresh_meetings();
+        match result {
+            Ok(n) => self.notify(format!("Recovered {n} speech clip(s). Review the transcript and update the summary."), false),
+            Err(error) => self.notify(error, true),
+        }
+    }
+
     /// Re-reads the list of meetings. Called when the page is opened and
     /// when a meeting is added or removed, not once a frame.
     pub fn refresh_meetings(&mut self) {
         self.meeting_list = crate::meeting::list();
+        self.home_attention = self.meeting_list.iter().filter(|m| self.meeting.as_ref().is_none_or(|active| active.id != m.id)).find_map(|m| {
+            if crate::meeting::failed_clip_count(&m.id) > 0 { Some((m.id.clone(), true)) }
+            else if m.summary_error.is_some() { Some((m.id.clone(), false)) }
+            else { None }
+        });
         self.meetings_dirty = false;
     }
 
     pub fn start_recording(&mut self, action: Action) {
+        self.audio_player = None;
         // The selection is not needed until the speaking stops, seconds from
         // now, so fetching it must not hold the microphone shut meanwhile.
         let selection = if action == Action::Ask { begin_selection_grab() } else { None };
@@ -679,10 +916,31 @@ impl DictateApp {
 
     pub fn cancel_recording(&mut self) {
         self.recording = None;
+        self.setup_practice_recording = false;
+    }
+
+    pub fn start_setup_practice(&mut self) {
+        if self.meeting.is_some() || self.recording.is_some() || self.busy.is_some() {
+            self.notify("Finish the current recording first.", true);
+            return;
+        }
+        self.setup_practice_text.clear();
+        self.start_recording(Action::Dictate);
+        self.setup_practice_recording = self.recording.is_some();
     }
 
     pub fn stop_recording(&mut self, ctx: &egui::Context) {
+        self.stop_recording_with_mode(ctx, false);
+    }
+
+    /// A stop clicked in our own window has no external text field to paste into.
+    pub fn stop_recording_from_home(&mut self, ctx: &egui::Context) {
+        self.stop_recording_with_mode(ctx, true);
+    }
+
+    fn stop_recording_with_mode(&mut self, ctx: &egui::Context, copy_only: bool) {
         let Some((rec, action, selection)) = self.recording.take() else { return };
+        let practice = std::mem::take(&mut self.setup_practice_recording);
         // Long finished by now; joining only collects it.
         let selection = selection.and_then(|h| h.join().ok()).unwrap_or_default();
         let elapsed = rec.elapsed();
@@ -691,13 +949,19 @@ impl DictateApp {
         let when = settings::now_secs();
         let seconds = clip.seconds();
         match classify_recording(&clip, elapsed, stream_error.as_deref()) {
-            RecordingResult::NoSpeech => { self.notify("No speech detected.", false); return; }
+            RecordingResult::NoSpeech => {
+                if practice { self.setup_practice_text = "No speech detected. Try again.".into(); }
+                else { self.notify("No speech detected.", false); }
+                return;
+            }
             RecordingResult::NoAudio => {
-                self.notify("No audio received. Check your microphone in Settings › Audio input.", true);
+                if practice { self.setup_practice_text = "No audio received. Check your microphone below.".into(); }
+                else { self.notify("No audio received. Check your microphone in Settings › Audio input.", true); }
                 return;
             }
             RecordingResult::StreamError(error) => {
                 let message = format!("Microphone error: {error}");
+                if practice { self.setup_practice_text = message; return; }
                 if !clip.samples.is_empty() {
                     self.add_failure(action, when, seconds, &selection, &message, &clip.to_wav());
                 }
@@ -706,7 +970,8 @@ impl DictateApp {
             }
             RecordingResult::Speech => {}
         }
-        self.run_job(ctx, action, when, clip.to_wav(), seconds, selection, false);
+        self.setup_practice_pending = practice;
+        self.run_job(ctx, action, when, clip.to_wav(), seconds, selection, false, copy_only);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -719,6 +984,7 @@ impl DictateApp {
         seconds: f32,
         selection: String,
         retry: bool,
+        copy_only: bool,
     ) {
         self.busy = Some((action, Instant::now()));
         let s = self.s.clone();
@@ -754,6 +1020,7 @@ impl DictateApp {
                 selection,
                 wav,
                 retry,
+                copy_only,
                 speech_model: engines::speech_model_label(&s),
                 text_model,
                 note,
@@ -764,18 +1031,23 @@ impl DictateApp {
 
     fn finish_job(&mut self, out: JobOut) {
         self.busy = None;
+        if crate::setup_guide::take_practice(&mut self.setup_practice_pending, &mut self.setup_practice_text, &out.result) {
+            return;
+        }
         match out.result {
             Ok(text) => {
-                if self.s.auto_paste {
+                if delivery_mode(self.s.auto_paste, out.copy_only) == DeliveryMode::Paste {
                     if let Err(e) = paste(&text, self.s.restore_clipboard) {
                         self.notify(format!("Copied, but couldn't paste: {e}"), true);
                     }
                 } else {
-                    let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone()));
-                    self.notify("Copied to clipboard", false);
+                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+                        Ok(()) => self.notify(if out.copy_only { "Copied to clipboard. Paste it into your app." } else { "Copied to clipboard" }, false),
+                        Err(e) => self.notify(format!("Could not copy the text: {e}"), true),
+                    }
                 }
                 // Say it once per session; after that it's just how dictation works without a text model.
-                if let Some(n) = out.note.filter(|_| !self.told_no_cleanup) {
+                if let Some(n) = out.note.filter(|_| !self.told_no_cleanup && !out.copy_only) {
                     self.told_no_cleanup = true;
                     self.notify(n, false);
                 }
@@ -792,6 +1064,9 @@ impl DictateApp {
                     selection: out.selection,
                 };
                 self.stats.record(entry.when, entry.words(), entry.seconds);
+                if !crate::data_safety::keeps_new_history(self.s.keep_history) && !out.retry {
+                    return;
+                }
                 if out.retry {
                     if let Some(old) = self.history.iter_mut().find(|e| e.when == out.when) {
                         if let Some(a) = old.audio.take() {
@@ -822,6 +1097,7 @@ impl DictateApp {
     }
 
     fn add_failure(&mut self, action: Action, when: u64, seconds: f32, selection: &str, error: &str, wav: &[u8]) {
+        if !crate::data_safety::keeps_new_history(self.s.keep_history) { return; }
         let path = settings::audio_dir().join(format!("{when}.wav"));
         let audio = std::fs::write(&path, wav).ok().map(|_| path.to_string_lossy().into_owned());
         self.history.push(Entry {
@@ -849,26 +1125,33 @@ impl DictateApp {
             return;
         };
         let (action, seconds, selection) = (e.action, e.seconds, e.selection.clone());
-        self.run_job(ctx, action, when, wav, seconds, selection, true);
+        self.run_job(ctx, action, when, wav, seconds, selection, true, false);
     }
 
-    pub fn delete_entry(&mut self, when: u64) {
-        if let Some(i) = self.history.iter().position(|e| e.when == when) {
-            let e = self.history.remove(i);
-            if let Some(a) = e.audio {
-                let _ = std::fs::remove_file(a);
+    fn remove_history(&mut self, remove: impl Fn(&Entry) -> bool) -> Result<(), String> {
+        let (removed, kept) = crate::data_safety::prepare_removal(&self.history, &remove, &settings::try_save_history)?;
+        if removed.is_empty() { return Ok(()); }
+        self.history = kept;
+        let mut failed = false;
+        for entry in removed {
+            if let Some(path) = entry.audio {
+                if !self.history.iter().any(|e| e.audio.as_deref() == Some(&path))
+                    && std::path::Path::new(&path).exists()
+                    && std::fs::remove_file(&path).is_err() {
+                    failed = true;
+                }
             }
-            self.save_history();
         }
+        if failed { return Err("History was removed, but some audio files could not be deleted.".into()); }
+        Ok(())
     }
 
-    pub fn clear_history(&mut self) {
-        for e in self.history.drain(..) {
-            if let Some(a) = e.audio {
-                let _ = std::fs::remove_file(a);
-            }
-        }
-        self.save_history();
+    pub fn delete_entry(&mut self, when: u64) -> Result<(), String> {
+        self.remove_history(|e| e.when == when)
+    }
+
+    pub fn clear_history(&mut self) -> Result<(), String> {
+        self.remove_history(|_| true)
     }
 
     /// Saves a correction and learns new names/terms from it into the dictionary.
@@ -898,30 +1181,91 @@ impl DictateApp {
         self.save_history();
     }
 
-    fn prune_history(&mut self) {
-        if let Some(max) = self.s.keep_history.max_age() {
-            let now = settings::now_secs();
-            let (keep, drop): (Vec<Entry>, Vec<Entry>) =
-                self.history.drain(..).partition(|e| now.saturating_sub(e.when) < max);
-            for e in drop {
-                if let Some(a) = e.audio {
-                    let _ = std::fs::remove_file(a);
-                }
+    /// Learn distinctive spellings explicitly introduced by a transcript correction.
+    pub fn learn_transcript_correction(&mut self, before: &str, after: &str) -> usize {
+        let mut added = 0;
+        for word in corrected_terms(before, after) {
+            if !self.s.dictionary.iter().any(|entry| entry.word.eq_ignore_ascii_case(&word)) {
+                self.s.dictionary.push(DictWord { word, auto: true });
+                added += 1;
             }
-            self.history = keep;
-            settings::save_history(&self.history);
         }
+        if added > 0 { self.changed(); }
+        added
+    }
+
+    fn prune_to(&mut self, keep: settings::KeepHistory) -> Result<(), String> {
+        if let Some(max) = keep.max_age() {
+            let now = settings::now_secs();
+            self.remove_history(|e| now.saturating_sub(e.when) >= max)?;
+        }
+        Ok(())
+    }
+
+    fn prune_history(&mut self) -> Result<(), String> {
+        self.prune_to(self.s.keep_history)
     }
 
     fn save_history(&mut self) {
-        self.prune_history();
-        settings::save_history(&self.history);
+        if let Err(error) = self.prune_history() {
+            self.notify(error, true);
+        }
+        if let Err(error) = settings::try_save_history(&self.history) { self.notify(error, true); }
     }
 
-    pub fn set_keep_history(&mut self, k: settings::KeepHistory) {
+    pub fn set_keep_history(&mut self, k: settings::KeepHistory) -> Result<(), String> {
+        self.prune_to(k)?;
         self.s.keep_history = k;
         self.changed();
-        self.prune_history();
+        Ok(())
+    }
+
+    /// Deletes a downloaded model the user has confirmed. A Whisper file is
+    /// removed here; an Ollama model is removed by Ollama on a background
+    /// thread, and the result arrives through `model_delete_result`.
+    /// A model that is in use is refused, so dictation never loses its model.
+    pub fn delete_model(&mut self, ctx: &egui::Context, target: ModelTarget) -> Result<Option<String>, String> {
+        match target {
+            ModelTarget::Whisper(path) => {
+                if path.to_string_lossy() == self.s.whisper_model {
+                    return Err("This speech model is in use. Choose another one first.".into());
+                }
+                crate::model_storage::delete_whisper(&settings::models_dir(), &path)?;
+                self.refresh_health(ctx);
+                Ok(Some("Model deleted.".into()))
+            }
+            ModelTarget::Ollama(name) => {
+                if crate::model_storage::same_ollama_model(&name, &self.s.ollama_model) {
+                    return Err("This text model is in use. Choose another one first.".into());
+                }
+                if self.model_deleting.is_some() { return Err("Another model is still being deleted.".into()); }
+                self.model_deleting = Some(ModelTarget::Ollama(name.clone()));
+                let (url, slot, health, ctx) = (self.s.ollama_url.clone(), self.model_delete_result.clone(), self.health.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let result = crate::model_storage::delete_ollama(&url, &name).map(|_| format!("Deleted {name}."));
+                    if let Ok(models) = crate::model_storage::ollama_inventory(&url) {
+                        let mut h = health.lock().unwrap();
+                        h.ollama = Some(Ok(models.iter().map(|m| m.name.clone()).collect()));
+                        h.ollama_storage = models;
+                    }
+                    *slot.lock().unwrap() = Some(result);
+                    ctx.request_repaint();
+                });
+                Ok(None)
+            }
+        }
+    }
+
+    /// Shows the outcome of a background model deletion once it is known.
+    pub fn poll_model_delete(&mut self) {
+        let result = self.model_delete_result.lock().unwrap().take();
+        if let Some(result) = result {
+            self.model_deleting = None;
+            match result {
+                Ok(message) => self.notify(message, false),
+                Err(error) => self.notify(error, true),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -946,9 +1290,12 @@ impl DictateApp {
         let health = self.health.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            // One request gives both the names and the sizes.
+            let inventory = crate::model_storage::ollama_inventory(&s.ollama_url);
             let h = Health {
                 whisper_bin: engines::find_whisper_bin(&s.whisper_bin),
-                ollama: Some(engines::ollama_models(&s.ollama_url)),
+                ollama: Some(inventory.clone().map(|models| models.into_iter().map(|m| m.name).collect())),
+                ollama_storage: inventory.unwrap_or_default(),
                 remote_text: (s.text_engine == TextEngine::OpenAiCompatible)
                     .then(|| engines::openai_models(&s.text_url, &s.text_key)),
                 checked: true,
@@ -963,7 +1310,11 @@ impl DictateApp {
 
             if autostart && down {
                 let started = engines::start_ollama_and_wait(&s.ollama_url);
-                health.lock().unwrap().ollama = Some(started);
+                let sizes = if started.is_ok() { crate::model_storage::ollama_inventory(&s.ollama_url).unwrap_or_default() } else { Vec::new() };
+                let mut h = health.lock().unwrap();
+                h.ollama = Some(started);
+                h.ollama_storage = sizes;
+                drop(h);
                 ctx.request_repaint();
             }
         });
@@ -1146,7 +1497,7 @@ impl DictateApp {
         if !self.s.show_indicator || self.shot.is_some() {
             return;
         }
-        let size = egui::vec2(236.0, 46.0);
+        let size = egui::vec2(if action.is_none() { 236.0 } else { 200.0 }, 46.0);
         let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1440.0, 900.0));
         let pos = egui::pos2((monitor.x - size.x) / 2.0, monitor.y - size.y - 90.0);
         let builder = egui::ViewportBuilder::default()
@@ -1197,7 +1548,7 @@ impl DictateApp {
                 egui::FontId::new(14.0, theme::medium()),
                 theme::TEXT(),
             );
-            p.text(
+            if action.is_none() { p.text(
                 egui::pos2(rect.right() - 20.0, rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 {
@@ -1210,7 +1561,7 @@ impl DictateApp {
                 },
                 egui::FontId::new(13.0, egui::FontFamily::Proportional),
                 theme::MUTED(),
-            );
+            ); }
         });
     }
 
@@ -1291,6 +1642,11 @@ impl DictateApp {
 
 impl eframe::App for DictateApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if !self.preview && self.shot.is_none() { crate::macos_look::keep_recording_windows_on_all_spaces(); }
+        if self.page != Page::Meetings || self.settings_tab.is_some() {
+            self.audio_player = None;
+        }
         // On System this follows the OS while the app is open, and it is also
         // what applies the switch in Settings a frame after it is clicked.
         let light = self.s.appearance.is_light(system_light(ctx));
@@ -1301,7 +1657,13 @@ impl eframe::App for DictateApp {
             crate::macos_look::set_backdrop_tint(theme::sheer_rgba());
         }
         self.collect_summary();
-        self.window_lifecycle(ctx);
+        self.collect_recovery();
+        self.collect_title();
+        if let Some(Err(error)) = self.audio_player.as_mut().map(|player| player.poll()) {
+            self.audio_player = None;
+            self.notify(error, true);
+        }
+        if !self.preview { self.window_lifecycle(ctx); }
         while let Ok(e) = self.hk_rx.try_recv() {
             if self.capturing_key.is_none() {
                 self.on_hotkey(ctx, e);
@@ -1355,7 +1717,7 @@ impl eframe::App for DictateApp {
                 }
             }
         }
-        if self.mic_test.is_some() && self.settings_tab != Some(SettingsTab::Audio) {
+        if self.mic_test.is_some() && self.settings_tab != Some(SettingsTab::Audio) && !self.setup_open {
             self.mic_test = None;
         }
         if self.settings_tab == Some(SettingsTab::Audio) && self.last_mic_refresh.elapsed() >= std::time::Duration::from_secs(2) {
@@ -1371,6 +1733,9 @@ impl eframe::App for DictateApp {
             || self.mic_test.is_some()
             || self.meeting.is_some()
             || self.summarising.is_some()
+            || self.retrying_meeting.is_some()
+            || self.title_retrying.is_some()
+            || self.audio_player.as_ref().is_some_and(|player| !player.ready() || player.playing())
             || self.settings_tab == Some(SettingsTab::Audio)
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -1387,14 +1752,16 @@ impl eframe::App for DictateApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.screenshot_step(&ctx);
-        if self.shot.is_some() {
+        if self.shot.is_some() || self.preview {
             // Screenshot mode: the root really is the window being captured.
             crate::views::draw(self, ui);
         } else {
             self.main_window(&ctx);
         }
-        self.indicator(&ctx);
-        self.talking_window(&ctx);
+        if !self.preview {
+            self.indicator(&ctx);
+            self.talking_window(&ctx);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1404,6 +1771,25 @@ impl eframe::App for DictateApp {
 
 fn clean_word(w: &str) -> &str {
     w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '/')
+}
+
+fn corrected_terms(before: &str, after: &str) -> Vec<String> {
+    let existing: std::collections::HashSet<&str> = before.split_whitespace().map(clean_word).collect();
+    let mut learned = Vec::new();
+    let mut sentence_start = true;
+    for raw in after.split_whitespace() {
+        let word = clean_word(raw);
+        let letters: Vec<char> = word.chars().filter(|c| c.is_alphabetic()).collect();
+        let acronym = letters.len() >= 2 && letters.iter().all(|c| c.is_uppercase());
+        let proper_name = !sentence_start && word.chars().next().is_some_and(char::is_uppercase)
+            && letters.len() > 2 && !existing.iter().any(|old| old.eq_ignore_ascii_case(word));
+        let distinctive = acronym || proper_name || word.chars().skip(1).any(|c| c.is_uppercase() || c.is_ascii_digit());
+        if distinctive && !existing.contains(word) && !learned.iter().any(|w: &String| w.eq_ignore_ascii_case(word)) {
+            learned.push(word.to_string());
+        }
+        sentence_start = raw.ends_with(['.', '!', '?']);
+    }
+    learned
 }
 
 fn send_combo(modifier: enigo::Key, key: char) -> Result<(), String> {
@@ -1523,8 +1909,30 @@ fn paste(text: &str, restore: bool) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod correction_vocabulary_tests {
+    use super::*;
+
+    #[test]
+    fn learns_new_acronym_and_recased_acronym_but_not_normal_sentence_words() {
+        assert_eq!(corrected_terms("When Moose opens", "When MOOS opens"), vec!["MOOS"]);
+        assert_eq!(corrected_terms("open moos", "Open MOOS"), vec!["MOOS"]);
+        assert_eq!(corrected_terms("speak to opyemi", "speak to Opeyemi"), vec!["Opeyemi"]);
+        assert!(corrected_terms("hello there", "Hello there").is_empty());
+        assert!(corrected_terms("hello there. cats sleep", "Hello there. Cats sleep").is_empty());
+        assert!(corrected_terms("MOOS works", "MOOS works well").is_empty());
+    }
+}
+
+#[cfg(test)]
 mod silence_tests {
     use super::*;
+
+    #[test]
+    fn stopping_from_home_copies_instead_of_pasting_into_open_dictate() {
+        assert_eq!(delivery_mode(true, true), DeliveryMode::Copy);
+        assert_eq!(delivery_mode(true, false), DeliveryMode::Paste);
+        assert_eq!(delivery_mode(false, false), DeliveryMode::Copy);
+    }
 
     #[test]
     fn silent_audio_is_a_neutral_empty_dictation_including_digital_silence() {
@@ -1532,6 +1940,36 @@ mod silence_tests {
         let zero = crate::audio::Clip { samples: vec![0.0; 16_000] };
         assert_eq!(classify_recording(&room, 1.0, None), RecordingResult::NoSpeech);
         assert_eq!(classify_recording(&zero, 1.0, None), RecordingResult::NoSpeech);
+    }
+
+    #[test]
+    fn room_noise_with_isolated_clicks_is_not_treated_as_speech() {
+        let mut samples = vec![0.001; 16_000];
+        samples[4_000] = 0.25;
+        samples[10_000] = -0.2;
+        assert_eq!(classify_recording(&crate::audio::Clip { samples }, 1.0, None), RecordingResult::NoSpeech);
+    }
+
+    #[test]
+    fn steady_fan_noise_and_clicks_are_not_treated_as_speech() {
+        let mut seed = 12345u32;
+        let mut samples: Vec<f32> = (0..32_000).map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.0173
+        }).collect();
+        for i in 0..80 { samples[8_000 + i] += if i % 2 == 0 { 0.06 } else { -0.06 }; }
+        assert_eq!(classify_recording(&crate::audio::Clip { samples }, 2.0, None), RecordingResult::NoSpeech);
+    }
+
+    #[test]
+    fn quiet_real_speech_still_passes_the_silence_check() {
+        for fixture in [include_bytes!("../tests/fixtures/yes.wav").as_slice(), include_bytes!("../tests/fixtures/question.wav").as_slice()] {
+            let at = fixture.windows(4).position(|w| w == b"data").unwrap() + 8;
+            let raw: Vec<f32> = fixture[at..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32).collect();
+            let peak = raw.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+            let samples = raw.iter().map(|x| x / peak * 0.025).collect();
+            assert_eq!(classify_recording(&crate::audio::Clip { samples }, 2.0, None), RecordingResult::Speech);
+        }
     }
 
     #[test]
