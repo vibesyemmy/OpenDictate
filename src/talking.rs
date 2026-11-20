@@ -34,6 +34,7 @@ pub struct Suggestions {
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct NotesReply {
     pub summary: String,
+    pub decisions: Vec<String>,
     pub actions: Vec<Action>,
 }
 
@@ -71,11 +72,11 @@ macro_rules! data_rule {
 }
 
 pub const SUGGEST_SYSTEM: &str = concat!(data_rule!(), "You help the user, labelled [you], during a live meeting. \
-Lines are labelled [you], [them] or [both]; [both] means the speaker could not be told apart. \
+Lines are labelled [you], [them], [both] or [mixed]. [mixed] means the channel may contain anyone; do not infer who spoke or who was addressed. \
 Use only the transcript and the search results you are given; never add facts from anywhere else. \
 Return JSON with \"reason\" and \"items\". \
-Look at the latest lines. A question or request in a [them] or [both] line is aimed at [you], even when it starts with a person's name, \
-because that name may be the user's. \
+Look at the latest lines. A question or request in a [them] line may be aimed at [you]. \
+For [both] or [mixed], do not assume the speaker or the person addressed; only suggest a reply if the context makes this clear. \
 When there is one, the first item must have kind \"reply\": a short answer or commitment [you] could say back, \
 in the first person, that fits what was asked. \
 Add an item with kind \"ask\" only for something the transcript leaves open; never ask about anything the transcript already says. \
@@ -84,17 +85,17 @@ Offer at most 3 items, each with a text under 25 words. \
 Set \"reason\" to one short sentence saying what prompted the items, or why there are none.");
 
 pub const NOTES_SYSTEM: &str = concat!(data_rule!(), "You keep running notes of a meeting. \
-Lines are labelled [you], [them] or [both]. \
+Lines are labelled [you], [them], [both] or [mixed]. [mixed] may contain anyone; do not infer who spoke or owns an action from that label. \
 Use only the transcript and the notes so far; never add facts. \
 Return JSON with \"summary\", \"decisions\" and \"actions\". \
 \"summary\" is the notes so far updated with the recent transcript, in at most 120 words of plain prose \
-in the third person, such as \"Ann agreed to book the venue.\" \
-Never copy or quote lines from the transcript, and never write the [you], [them] or [both] labels. \
+in the third person. Do not include numbers or quantities. \
+Never copy or quote lines from the transcript, and never write the [you], [them], [both] or [mixed] labels. \
 \"decisions\" lists what the meeting decided or agreed (\"we decided...\"); a decision goes there and never in \"actions\". \
 \"actions\" lists every action point so far, one per person and task. \
 Someone asked to do something has an action point; someone who says they or another person will do something has one too. \
-For each, \"who\" is the person's name (such as \"Raj\"), or \"you\" or \"them\", \
-and \"what\" is the task with its object, such as \"list the renewing annual contracts\". \
+For each, \"who\" is the person's name if explicitly spoken, otherwise \"you\" or \"them\", \
+and \"what\" is the task with its object. \
 Do not leave out any person who was given a task. \
 Keep earlier action points; add only commitments someone actually made or was asked to make.");
 
@@ -259,7 +260,7 @@ pub fn parse_suggestions(raw: &str) -> Result<Suggestions, String> {
 
 fn without_labels(text: &str) -> String {
     text.split_whitespace()
-        .filter(|w| !matches!(w.to_lowercase().as_str(), "[you]" | "[them]" | "[both]"))
+        .filter(|w| !matches!(w.to_lowercase().as_str(), "[you]" | "[them]" | "[both]" | "[mixed]"))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -278,7 +279,9 @@ pub fn parse_notes(raw: &str) -> Result<NotesReply, String> {
                 (!what.is_empty()).then(|| Action { who: text_of(a, "who"), what })
             })
             .collect();
-        Some(NotesReply { summary: without_labels(&text_of(v, "summary")), actions })
+    let decisions = v.get("decisions").and_then(|d| d.as_array()).into_iter().flatten()
+        .filter_map(|d| d.as_str()).map(str::to_string).collect();
+    Some(NotesReply { summary: without_labels(&text_of(v, "summary")), decisions, actions })
     })
 }
 
@@ -291,13 +294,45 @@ pub fn merge_actions(list: &mut Vec<Tracked>, incoming: Vec<Action>) {
         t.new = false;
     }
     for action in incoming {
-        if action.what.split_whitespace().count() >= 2 && !list.iter().any(|t| key(&t.action.what) == key(&action.what)) {
+        if action.what.split_whitespace().count() >= 2 && !list.iter().any(|t| same_action(&t.action, &action)) {
             list.push(Tracked { action, new: true });
         }
     }
     if list.len() > TRACKED_CAP {
         list.drain(..list.len() - TRACKED_CAP);
     }
+}
+
+fn same_action(a: &Action, b: &Action) -> bool {
+    if !a.who.eq_ignore_ascii_case(&b.who) { return false; }
+    let a = key(&a.what);
+    let b = key(&b.what);
+    if a == b { return true; }
+    let words = |s: &str| s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && !["the", "and", "for", "its", "you", "them"].contains(w))
+        .map(str::to_string).collect::<std::collections::HashSet<_>>();
+    let (a, b) = (words(&a), words(&b));
+    a.len().min(b.len()) >= 4 && a.intersection(&b).count() * 10 >= a.len().min(b.len()) * 9
+}
+
+pub(crate) fn supported_action(action: &Action, segments: &[Segment]) -> bool {
+    let who = action.who.trim().to_lowercase();
+    let named = !who.is_empty() && !["you", "them", "someone", "both"].contains(&who.as_str());
+    let spoken = segments.iter().map(|s| s.text.to_lowercase()).collect::<Vec<_>>().join(" ");
+    if named && !spoken.split(|c: char| !c.is_alphanumeric()).any(|w| w == who) { return false; }
+    segments.iter().any(|s| {
+        let text = s.text.to_lowercase();
+        let commitment = ["will ", "going to", "need to", "needs to", "please ", "could you", "can you", "agreed to", "i'll", "we'll", "shall "].iter().any(|w| text.contains(w));
+        commitment && crate::meeting::grounded(&action.what, &s.text)
+    })
+}
+
+pub(crate) fn supported_decision(decision: &str, segments: &[Segment]) -> bool {
+    segments.iter().any(|s| {
+        let text = s.text.to_lowercase();
+        ["decided", "agreed", "approved", "we chose", "we'll go with"].iter().any(|w| text.contains(w))
+            && crate::meeting::grounded(decision, &s.text)
+    })
 }
 
 pub fn add_chip(chips: &mut Vec<Chip>, mut chip: Chip) {
@@ -447,6 +482,7 @@ impl Scheduler {
 #[derive(Clone, Default, Serialize)]
 pub struct Live {
     pub summary: String,
+    pub decisions: Vec<String>,
     pub actions: Vec<Tracked>,
     pub suggestions: Option<Suggestions>,
     pub chips: Vec<Chip>,
@@ -489,10 +525,24 @@ pub fn step(live: &Mutex<Live>, job: Job, segments: &[Segment], now_ms: u64, cha
             },
             (Job::Notes, Ok(raw)) => match parse_notes(&raw) {
                 Ok(notes) => {
-                    if !notes.summary.is_empty() {
-                        l.summary = notes.summary;
+                    for decision in notes.decisions {
+                        if supported_decision(&decision, segments) && !l.decisions.iter().any(|d| key(d) == key(&decision)) {
+                            l.decisions.push(decision);
+                        }
                     }
-                    merge_actions(&mut l.actions, notes.actions);
+                    let actions = notes.actions.into_iter().filter(|a| supported_action(a, segments)).collect();
+                    merge_actions(&mut l.actions, actions);
+                    let task_text: Vec<String> = l.actions.iter().map(|a| a.action.what.clone()).collect();
+                    let summary = crate::meeting::safe_overview(&notes.summary, &l.decisions, &task_text);
+                    if !summary.is_empty() {
+                        l.summary = summary;
+                    } else if l.summary.is_empty() {
+                        if let Some(text) = segments.iter().rev().filter(|s| s.at_ms <= now_ms)
+                            .map(|s| s.text.trim()).find(|s| s.split_whitespace().count() >= 5) {
+                            let end = floor_boundary(text, text.len().min(240));
+                            l.summary = format!("From the transcript: “{}”", &text[..end]);
+                        }
+                    }
                     Ok(())
                 }
                 Err(_) => {
@@ -510,7 +560,7 @@ pub fn step(live: &Mutex<Live>, job: Job, segments: &[Segment], now_ms: u64, cha
         }
     }
     if let Some(raw) = unreadable {
-        log(&format!("    talking points: unreadable reply: {}", raw.chars().take(200).collect::<String>().replace(['\n', '\r'], " ")));
+        log(&format!("    talking points: unreadable reply ({} characters)", raw.chars().count()));
     }
 }
 
@@ -657,6 +707,64 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    #[test]
+    fn meeting_regression_rejects_example_action_and_keeps_spoken_commitment() {
+        let live = Mutex::new(Live::default());
+        let segs = [seg(1_000, "them", "I will send the revised budget tomorrow.")];
+        let raw = r#"{"summary":"A budget was discussed.","decisions":[],"actions":[{"who":"Raj","what":"list the renewing annual contracts"},{"who":"them","what":"send the revised budget tomorrow"}]}"#;
+        step(&live, Job::Notes, &segs, 30_000, &|_,_,_| Ok(raw.into()), &|_| {});
+        let l = live.lock().unwrap();
+        assert_eq!(l.actions.iter().map(|a| a.action.what.as_str()).collect::<Vec<_>>(), ["send the revised budget tomorrow"]);
+        assert!(!NOTES_SYSTEM.contains("Raj"));
+        assert!(!NOTES_SYSTEM.contains("renewing annual contracts"));
+    }
+
+    #[test]
+    fn meeting_regression_deduplicates_reworded_actions_per_person() {
+        let mut list = vec![];
+        merge_actions(&mut list, vec![act("You", "find out more about send money and its application for businesses"), act("you", "find out more about send money and its application for businesses, including who pays charges when sending money"), act("them", "find out more about send money and its application for businesses")]);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn meeting_regression_keeps_only_supported_decisions() {
+        let live = Mutex::new(Live::default());
+        let segs = [seg(1_000, "them", "We decided to launch the pilot on Monday.")];
+        let raw = r#"{"summary":"The pilot was discussed.","decisions":["We decided to launch the pilot on Monday","We decided to partner with Acme Bank"],"actions":[]}"#;
+        step(&live, Job::Notes, &segs, 30_000, &|_,_,_| Ok(raw.into()), &|_| {});
+        assert_eq!(live.lock().unwrap().decisions, ["We decided to launch the pilot on Monday"]);
+    }
+
+    #[test]
+    fn meeting_regression_uses_transcript_when_generated_summary_is_all_figures() {
+        let live = Mutex::new(Live::default());
+        let segs = [seg(1_000, "them", "The team reviewed the business payment methods in the region.")];
+        let raw = r#"{"summary":"Large businesses are 60% of the market.","decisions":[],"actions":[]}"#;
+        step(&live, Job::Notes, &segs, 30_000, &|_,_,_| Ok(raw.into()), &|_| {});
+        assert_eq!(live.lock().unwrap().summary, "From the transcript: “The team reviewed the business payment methods in the region.”");
+    }
+
+    #[test]
+    #[ignore = "requires the local Ollama model and OPENDICTATE_REPLAY_DIR with saved transcripts"]
+    fn replay_recent_meetings_with_local_model() {
+        let root = std::path::PathBuf::from(std::env::var("OPENDICTATE_REPLAY_DIR").unwrap());
+        let s = crate::settings::load_settings();
+        assert!(matches!(s.text_engine, TextEngine::Ollama));
+        assert!(is_local(&s.ollama_url));
+        for id in ["2026-11-17-150506", "2026-11-17-151058"] {
+            let input = std::fs::read_to_string(root.join(id).join("transcript.jsonl")).unwrap();
+            let segments: Vec<Segment> = input.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let live = Mutex::new(Live::default());
+            step(&live, Job::Notes, &segments, 150_000, &|job, system, user| json_chat(&s, job, system, user, &|| true), &|_| {});
+            let l = live.lock().unwrap();
+            assert!(l.status.is_none(), "local model request failed");
+            assert!(!l.actions.iter().any(|a| a.action.who.eq_ignore_ascii_case("raj")));
+            assert!(!l.actions.iter().any(|a| a.action.what.to_lowercase().contains("renewing annual contracts")));
+            assert!(!l.summary.is_empty(), "model did not produce usable notes");
+            println!("{id}: usable notes; {} actions; {} decisions", l.actions.len(), l.decisions.len());
+        }
+    }
+
     fn suggesting() -> Scheduler {
         let mut s = Scheduler::new();
         s.on_segment();
@@ -676,7 +784,11 @@ mod tests {
 
     fn run_step_logged(live: &Mutex<Live>, job: Job, reply: Result<&str, &str>, log: &dyn Fn(&str)) -> Vec<(Job, String, String)> {
         let calls = RefCell::new(vec![]);
-        let segs = [seg(29_000, "them", "When can you ship the beta?")];
+        let segs = [
+            seg(29_000, "them", "When can you ship the beta?"),
+            seg(29_100, "you", "I will send the build."),
+            seg(29_200, "them", "Ann will book the room."),
+        ];
         step(live, job, &segs, 30_000, &|j, system, user| {
             calls.borrow_mut().push((j, system.to_string(), user.to_string()));
             reply.map(str::to_string).map_err(str::to_string)
@@ -771,13 +883,14 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_that_cannot_be_read_is_logged_cut_to_200_chars() {
+    fn an_unreadable_reply_is_logged_without_its_private_content() {
         let live = Mutex::new(Live::default());
         let logged = RefCell::new(String::new());
         let raw = format!("nope\n{}", "x".repeat(500));
         run_step_logged(&live, Job::Suggest, Ok(&raw), &|l| logged.borrow_mut().push_str(l));
         let logged = logged.into_inner();
-        assert!(logged.contains("nope"), "{logged}");
+        assert!(logged.contains("unreadable reply"), "{logged}");
+        assert!(!logged.contains("nope") && !logged.contains("xxxxx"), "{logged}");
         assert!(!logged.contains('\n'));
         assert!(logged.len() < 300, "{}", logged.len());
     }
@@ -812,12 +925,12 @@ mod tests {
     #[test]
     fn the_notes_reply_merges_actions_instead_of_replacing_them() {
         let live = Mutex::new(Live::default());
-        run_step(&live, Job::Notes, Ok(r#"{"summary":"s1","actions":[{"who":"you","what":"send the build"}]}"#));
-        run_step(&live, Job::Notes, Ok(r#"{"summary":"s2","actions":[{"who":"Ann","what":"book the room"}]}"#));
+        run_step(&live, Job::Notes, Ok(r#"{"summary":"The build was discussed.","actions":[{"who":"you","what":"send the build"}]}"#));
+        run_step(&live, Job::Notes, Ok(r#"{"summary":"The room was discussed.","actions":[{"who":"Ann","what":"book the room"}]}"#));
         let l = live.lock().unwrap();
         let whats: Vec<_> = l.actions.iter().map(|t| t.action.what.as_str()).collect();
         assert_eq!(whats, ["send the build", "book the room"]);
-        assert_eq!(l.summary, "s2");
+        assert_eq!(l.summary, "The room was discussed.");
     }
 
     fn temp_dir(name: &str) -> PathBuf {

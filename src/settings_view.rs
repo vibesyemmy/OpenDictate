@@ -74,6 +74,7 @@ fn tab_header(tab: SettingsTab) -> (&'static str, &'static str) {
         SettingsTab::General => ("Settings", "Shortcuts, language and what happens to the text."),
         SettingsTab::Audio => ("Audio input", "Which microphone to listen to, and how loud it comes in."),
         SettingsTab::Personalization => ("Personalization", "How your dictation should read once it is tidied up."),
+        SettingsTab::Privacy => ("Privacy & data", "Where your audio and text go, and how to remove them."),
         SettingsTab::About => ("About", "What this is and where your data lives."),
     }
 }
@@ -153,6 +154,7 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
                 (SettingsTab::General, "gear", "Settings"),
                 (SettingsTab::Audio, "mic", "Audio input"),
                 (SettingsTab::Personalization, "spark", "Personalization"),
+                (SettingsTab::Privacy, "lock", "Privacy & data"),
                 (SettingsTab::About, "info", "About"),
             ] {
                 if nav_item(&mut nav_ui, icon, label, tab == tab_).clicked() {
@@ -198,6 +200,7 @@ pub fn settings_window(app: &mut DictateApp, ctx: &egui::Context) {
                             SettingsTab::General => general_tab(app, ui),
                             SettingsTab::Audio => audio_tab(app, ui),
                             SettingsTab::Personalization => personal_tab(app, ui),
+                            SettingsTab::Privacy => crate::privacy::draw(ui, &app.s),
                             SettingsTab::About => about_tab(app, ui),
                         }
                     });
@@ -235,6 +238,7 @@ fn section(ui: &mut egui::Ui, icon: &str, title: &str) {
 fn row(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, control: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(13.0);
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         let left = ui.available_width() - control_w - 18.0;
         ui.vertical(|ui| {
             ui.set_width(left);
@@ -260,6 +264,9 @@ fn row(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, control: impl
 }
 
 fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
+    ui.add_space(12.0);
+    ui.label(para(format!("Speech audio: {}. Text: {}.", crate::privacy::speech_destination(&app.s), crate::privacy::text_destination(&app.s)), 12.5, theme::MUTED()));
+    if crate::views::link(ui, "Privacy & data details").clicked() { app.settings_tab = Some(SettingsTab::Privacy); }
     egui::Frame::new()
         .fill(theme::SURFACE())
         .stroke(Stroke::new(1.0, theme::LINE()))
@@ -653,6 +660,11 @@ fn general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         |ui| {
             let mut want = app.s.start_at_login;
             if crate::views::kit_checkbox(ui, &mut want).changed() {
+                if app.preview {
+                    app.s.start_at_login = want;
+                    app.changed();
+                    return;
+                }
                 // The setting only moves if the file did. A tick that saved
                 // itself while the login item failed to write would promise
                 // something that will not happen.
@@ -835,8 +847,7 @@ fn audio_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             } else if r.sample_count() == 0 && r.elapsed() > 1.5 {
                 ui.label(para(format!("{} No sound is arriving from this microphone. Try another one or reconnect it.", crate::icon::WARN), 12.5, theme::RED()));
             } else if r.elapsed() > 1.5 && r.peak() == 0.0 {
-                // Exact digital silence on a live device is what macOS sends when access is blocked.
-                crate::views::status(ui, crate::views::State::Bad, "macOS is blocking the microphone (it only sends silence).");
+                crate::views::status(ui, crate::views::State::Warn, "No signal detected. Check that the microphone is connected, unmuted, and has permission.");
                 if crate::views::btn(ui, "Open microphone privacy settings").clicked() {
                     open_mic_privacy();
                 }
@@ -860,8 +871,19 @@ fn audio_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     section(ui, crate::icon::FLASK, "Meeting audio");
     row(
         ui,
-        "Keep meeting audio",
-        "Normally a meeting's audio is deleted once it has been transcribed. This keeps it on this Mac for good, using about 1.9 MB a minute.",
+        "Other voices through my microphone",
+        "Turn this on when a call plays on another computer or a speaker in the room. Those voices cannot be separated from yours and microphone speech will be marked mixed.",
+        260.0,
+        |ui| {
+            if crate::views::kit_checkbox(ui, &mut app.s.meeting_mixed_microphone).changed() {
+                app.changed();
+            }
+        },
+    );
+    row(
+        ui,
+        "Keep speech clips",
+        "Save speech clips on this Mac for playback. They are not a complete recording: quiet or skipped parts may be missing, and a clip may contain only one side. Uses about 1.9 MB a minute.",
         260.0,
         |ui| {
             if crate::views::kit_checkbox(ui, &mut app.s.keep_meeting_audio).changed() {
@@ -1029,6 +1051,17 @@ fn about_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     ));
 }
 
+fn shortcut_with_modifiers(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
+    let mut parts = Vec::new();
+    if modifiers.ctrl { parts.push("Ctrl"); }
+    if modifiers.alt { parts.push("Alt"); }
+    if modifiers.shift { parts.push("Shift"); }
+    if modifiers.mac_cmd { parts.push("Cmd"); }
+    if parts.is_empty() { return None; }
+    parts.push(key.name());
+    Some(parts.join("+"))
+}
+
 pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
     let Some(trigger) = app.capturing_key else { return };
     let mut done: Option<Option<String>> = None;
@@ -1048,22 +1081,8 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
                     }
                     continue;
                 }
-                let mut parts = Vec::new();
-                if modifiers.ctrl {
-                    parts.push("Ctrl");
-                }
-                if modifiers.alt {
-                    parts.push("Alt");
-                }
-                if modifiers.shift {
-                    parts.push("Shift");
-                }
-                if modifiers.mac_cmd {
-                    parts.push("Cmd");
-                }
-                if !parts.is_empty() {
-                    parts.push(key.name());
-                    done = Some(Some(parts.join("+")));
+                if let Some(shortcut) = shortcut_with_modifiers(physical, *modifiers) {
+                    done = Some(Some(shortcut));
                     break;
                 }
                 if let Some(first) = app.capture_first_key {
@@ -1086,7 +1105,7 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
             .inner_margin(Margin::same(20))
             .show(ui, |ui| {
                 ui.label(b(format!("Press the shortcut for {}", trigger.label()), 16.0, theme::TEXT()));
-                ui.label(para("Hold two keys together, use a modifier such as Option + Space, or press one function key. Esc cancels.", 13.0, theme::MUTED()));
+                ui.label(para("Hold one or more modifiers, such as Option + Command, and press a key. You can also press two ordinary keys together or one function key. Esc cancels.", 13.0, theme::MUTED()));
             });
     });
     if let Some(r) = done {
@@ -1118,6 +1137,36 @@ fn talking_switch(saved: bool, needs_memory: bool) -> (bool, bool) {
 mod tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn shortcut_capture_accepts_option_command_and_a_key() {
+        let mods = egui::Modifiers { alt: true, mac_cmd: true, command: true, ..Default::default() };
+        for key in [egui::Key::D, egui::Key::T, egui::Key::A, egui::Key::M, egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4] {
+            let captured = shortcut_with_modifiers(key, mods).unwrap();
+            assert_eq!(captured, format!("Alt+Cmd+{}", key.name()));
+            assert!(captured.parse::<global_hotkey::hotkey::HotKey>().is_ok());
+        }
+    }
+
+    #[test]
+    fn long_program_path_does_not_push_settings_rows_outside_the_sheet() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(660.0, 500.0))
+            .with_context_setup(theme::install)
+            .build_ui_state(|ui, width: &mut f32| {
+                ui.set_width(620.0);
+                row(ui, "whisper.cpp program", "The whisper-cli command.", 300.0, |ui| {
+                    crate::views::status(ui, crate::views::State::Ok, "Found at /Applications/Open Dictate.app/Contents/MacOS/whisper-cli");
+                });
+                row(ui, "Model", "Choose a model.", 300.0, |ui| {
+                    egui::ComboBox::from_id_salt("layout-test-model").width(300.0)
+                        .selected_text("an-extraordinarily-long-model-name-that-should-not-expand-beyond-the-settings-column")
+                        .show_ui(ui, |ui| { ui.label("Model"); }).response
+                        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Speech model"));
+                });
+                *width = ui.min_rect().width();
+            }, 0.0_f32);
+        assert!(*h.state() <= 621.0, "rows grew to {} points", h.state());
+    }
 
     #[test]
     fn mlx_setup_does_not_change_models_until_use_is_clicked() {

@@ -1,3 +1,6 @@
 /target
 .DS_Store
 .superpowers/
+
+# Screenshots can show real meeting and dictation content
+docs/**/*.png

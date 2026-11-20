@@ -1,11 +1,10 @@
 //! Drawing: sidebar, Home insights, History and Dictionary. The Settings window
 //! lives in `settings_view`.
 
-use crate::app::{DictateApp, Page, SettingsTab};
+use crate::app::{DictateApp, Page, PendingDataAction, SettingsTab};
 use crate::settings::{Action, DictWord, KeepHistory, Trigger};
 use crate::stats;
 use crate::theme::{self, b, d, m, para, t};
-use chrono::{Datelike, Duration, Local};
 use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Margin, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -16,8 +15,8 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
         .exact_size(216.0)
         .resizable(false)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(theme::BG_SHEER()).inner_margin(Margin { left: 10, right: 8, top: 10, bottom: 10 }))
-        .show(ui, |ui| sidebar(app, ui));
+        .frame(egui::Frame::new().fill(theme::BG_SHEER()))
+        .show(ui, |ui| sidebar(app, ui, SidebarVariant::Attached));
 
     egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG_SHEER())).show(ui, |ui| {
         let full = ui.available_width();
@@ -37,6 +36,14 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
                 });
             });
         } else {
+            // The player belongs to the whole page; its controls line up with
+            // the reading column while the background reaches both edges.
+            if app.page == Page::Meetings && app.open_meeting.is_some() && app.meeting.is_none() {
+                let player_height = if app.saved_audio.is_empty() { 78.0 } else { 140.0 };
+                egui::Panel::bottom("meeting-audio-player").exact_size(player_height)
+                    .frame(egui::Frame::new().fill(theme::PAPER()).inner_margin(Margin::symmetric(0, 12)))
+                    .show(ui, |ui| column(ui, pad, width, |ui| meeting_player(ui, app)));
+            }
             column(ui, pad, width, |ui| {
                 ui.add_space(36.0);
                 match app.page {
@@ -53,7 +60,295 @@ pub fn draw(app: &mut DictateApp, ui: &mut egui::Ui) {
         crate::settings_view::settings_window(app, &ctx);
     }
     crate::settings_view::capture_shortcut(app, &ctx);
+    confirm_data_action(app, &ctx);
+    meeting_intro(app, &ctx);
+    crate::setup_guide::show(app, &ctx);
     toast(app, &ctx);
+}
+
+fn meeting_intro(app: &mut DictateApp, ctx: &egui::Context) {
+    if !app.meeting_intro_open { return; }
+    let response = egui::Modal::new(egui::Id::new("meeting-intro"))
+        .frame(theme::ink_panel().inner_margin(Margin::same(22)))
+        .show(ctx, |ui| crate::meeting_intro::draw(ui, &app.s));
+    if let Some(choice) = response.inner {
+        app.finish_meeting_intro(choice);
+    } else if response.should_close() {
+        app.finish_meeting_intro(crate::meeting_intro::Choice::NotNow);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice { Cancel, Confirm }
+
+fn data_confirmation_content(ui: &mut egui::Ui, action: &PendingDataAction, count: usize) -> Option<ConfirmChoice> {
+    let (title, body, confirm) = match action {
+        PendingDataAction::DeleteMeeting { title, .. } => (
+            "Delete meeting?",
+            format!("“{title}” and its transcript, notes and saved audio will be removed from Open Dictate. This can’t be undone in the app."),
+            "Delete meeting",
+        ),
+        PendingDataAction::DeleteHistoryEntry { .. } => (
+            "Remove history entry?",
+            format!("{count} matching {} will be removed. A backup of the text and any saved audio will be placed in macOS Trash. You can restore the most recent backup from History until Trash is emptied.", if count == 1 { "entry" } else { "entries" }),
+            "Remove",
+        ),
+        PendingDataAction::ClearHistory => (
+            "Clear all history?",
+            format!("This removes {count} {} from History. A backup of the text and any saved audio will be placed in macOS Trash. You can restore the most recent backup from History until Trash is emptied.", if count == 1 { "entry" } else { "entries" }),
+            "Clear history",
+        ),
+        PendingDataAction::ChangeRetention(keep) => (
+            "Change history retention?",
+            format!("Changing to {} removes {count} existing {} now and applies to future entries. Backups of removed text and saved audio go to macOS Trash. You can restore the most recent backup from History until Trash is emptied.", keep.label(), if count == 1 { "entry" } else { "entries" }),
+            "Change retention",
+        ),
+        PendingDataAction::RestoreHistory => (
+            "Restore history backup?",
+            "The most recent backup in Trash will be merged with your current history. History retention will be set to Forever so restored entries are kept. The backup will remain in Trash.".into(),
+            "Restore history",
+        ),
+        PendingDataAction::RegenerateSummary { .. } => (
+            "Replace your edited summary?",
+            "Summarising again replaces your edits with a new model-generated summary. The transcript and saved audio stay unchanged.".into(),
+            "Replace summary",
+        ),
+        PendingDataAction::DiscardRecoveryAudio { count, .. } => (
+            "Discard recovery audio?",
+            format!("Move {count} untranscribed {} to Trash? Those portions will remain missing from the transcript. The audio stays in Trash until it is emptied.", if *count == 1 { "clip" } else { "clips" }),
+            "Move to Trash",
+        ),
+    };
+    ui.set_max_width(440.0);
+    ui.label(b(title, 20.0, theme::TEXT()));
+    ui.add_space(10.0);
+    ui.label(para(body, 14.0, theme::MUTED()));
+    ui.add_space(18.0);
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        let cancel = kit_button(ui, "Cancel", Btn::Secondary, 100.0);
+        cancel.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "CANCEL"));
+        if cancel.clicked() { choice = Some(ConfirmChoice::Cancel); }
+        ui.add_space(8.0);
+        let accept = kit_button(ui, confirm, Btn::Primary, 120.0);
+        accept.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, confirm.to_uppercase()));
+        if accept.clicked() { choice = Some(ConfirmChoice::Confirm); }
+    });
+    choice
+}
+
+fn confirm_data_action(app: &mut DictateApp, ctx: &egui::Context) {
+    let Some(action) = app.pending_data_action.clone() else { return };
+    let count = match &action {
+        PendingDataAction::DeleteMeeting { .. } => 1,
+        PendingDataAction::DeleteHistoryEntry { when } => app.history.iter().filter(|e| e.when == *when).count(),
+        PendingDataAction::ClearHistory => app.history.len(),
+        PendingDataAction::ChangeRetention(keep) => crate::data_safety::expired_count(&app.history, *keep, crate::settings::now_secs()),
+        PendingDataAction::RestoreHistory => 0,
+        PendingDataAction::RegenerateSummary { .. } => 0,
+        PendingDataAction::DiscardRecoveryAudio { count, .. } => *count,
+    };
+    let response = egui::Modal::new(egui::Id::new("confirm-data-action"))
+        .frame(theme::ink_panel().inner_margin(Margin::same(22)))
+        .show(ctx, |ui| data_confirmation_content(ui, &action, count));
+    if response.inner == Some(ConfirmChoice::Cancel) || response.should_close() {
+        app.pending_data_action = None;
+        return;
+    }
+    if response.inner != Some(ConfirmChoice::Confirm) { return; }
+    app.pending_data_action = None;
+    let result = match action {
+        PendingDataAction::DeleteMeeting { id, .. } => {
+            app.audio_player = None;
+            match crate::meeting::delete(&id) {
+                Ok(()) => {
+                    if app.open_meeting.as_deref() == Some(id.as_str()) {
+                        app.open_meeting = None;
+                        app.open_segments.clear();
+                        app.open_meta = None;
+                    }
+                    app.meetings_dirty = true;
+                    Ok("Meeting deleted.")
+                }
+                Err(e) => Err(e),
+            }
+        }
+        PendingDataAction::DeleteHistoryEntry { when } => app.delete_entry(when).map(|_| "History removed; backup is in Trash."),
+        PendingDataAction::ClearHistory => app.clear_history().map(|_| "History cleared; backup is in Trash."),
+        PendingDataAction::ChangeRetention(keep) => app.set_keep_history(keep).map(|_| "History retention updated."),
+        PendingDataAction::RestoreHistory => app.restore_history().map(|_| "History restored. Retention is set to Forever."),
+        PendingDataAction::RegenerateSummary { id } => { app.start_summary(id); return; }
+        PendingDataAction::DiscardRecoveryAudio { id, .. } => {
+            let result = crate::meeting::trash_failed_audio(&id);
+            app.refresh_meetings();
+            if app.open_meeting.as_deref() == Some(id.as_str()) {
+                app.open_failed_count = crate::meeting::failed_clip_count(&id);
+                app.open_meta = app.meeting_list.iter().find(|m| m.id == id).cloned();
+            }
+            match result {
+                Ok(()) => Ok("Recovery audio moved to Trash."),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    match result {
+        Ok(message) => app.notify(message, false),
+        Err(error) => app.notify(error, true),
+    }
+}
+
+#[cfg(test)]
+mod data_confirmation_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn shortcut_hint_is_compact_next_to_a_button() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(500.0, 120.0))
+            .with_context_setup(theme::install).build_ui_state(|ui, height| {
+                ui.horizontal(|ui| {
+                    kit_button_compact_on(ui, "Start dictating", Btn::Primary, 0.0, true);
+                    *height = kbd_label(ui, "Option + Space").rect.height();
+                });
+            }, 0.0_f32);
+        let height = *h.state();
+        assert!(height <= 24.0, "shortcut hint was {height} points high");
+    }
+
+    #[test]
+    fn meeting_search_matches_titles_and_subtitles_without_case_sensitivity() {
+        assert!(meeting_matches("Project Review", "Payment options", "review"));
+        assert!(meeting_matches("Project Review", "Payment options", " PAYMENT "));
+        assert!(!meeting_matches("Project Review", "Payment options", "budget"));
+        assert!(meeting_matches("Project Review", "", "   "));
+    }
+
+    #[test]
+    fn meeting_search_sits_to_the_right_of_the_heading() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(700.0, 100.0))
+            .with_context_setup(theme::install).build_ui_state(|ui, query| {
+                meeting_header(ui, query, true);
+            }, String::new());
+        let heading = h.get_by_label("Meetings").rect();
+        let search = h.get_by_label("Search meetings").rect();
+        assert!(search.left() > heading.right());
+        assert!((search.center().y - heading.center().y).abs() < 20.0);
+    }
+
+    #[test]
+    fn meeting_tabs_switch_between_summary_and_transcript() {
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 100.0))
+            .with_context_setup(theme::install).build_ui_state(|ui, transcript| {
+                pill_tabs(ui, transcript, &[(false, "Summary"), (true, "Transcript")]);
+            }, false);
+        h.get_by_label("Transcript").click(); h.run();
+        assert!(*h.state());
+        h.get_by_label("Summary").click(); h.run();
+        assert!(!*h.state());
+    }
+
+    #[test]
+    fn meeting_more_menu_requests_delete() {
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(400.0, 300.0))
+            .with_context_setup(theme::install).build_ui_state(|ui, requested| {
+                if meeting_more_actions(ui, "Planning", false) { *requested = true; }
+            }, false);
+        h.get_by_label("More actions for Planning").click(); h.run();
+        h.get_by_label("Delete").click(); h.run();
+        assert!(*h.state());
+    }
+
+    #[test]
+    fn scrolling_lists_reserve_space_for_the_scrollbar() {
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 150.0))
+            .with_context_setup(theme::install).build_ui_state(|ui, bounds: &mut (f32, f32)| {
+                reserve_scrollbar_gutter(ui);
+                let outer_right = ui.available_rect_before_wrap().right();
+                let area = egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    for _ in 0..20 { ui.label("Example row"); }
+                });
+                *bounds = (outer_right, area.inner_rect.right());
+            }, (0.0, 0.0));
+        h.run(); h.run();
+        let (outer, inner) = *h.state();
+        assert!(outer - inner >= 15.0, "scrollbar overlaps the content: outer={outer}, inner={inner}");
+    }
+
+    #[test]
+    fn capture_panel_reports_each_channel_without_claiming_a_speaker() {
+        let sample = crate::tap::CaptureSnapshot { frames_ms: 10_000, microphone_ms: 9_900, system_ms: 0, has_mic: true, separated: true };
+        let h = egui_kittest::Harness::builder().with_size(vec2(700.0, 200.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| capture_status_detail(ui, &sample, 20.0, 10_100));
+        h.get_by_label("Microphone · Sound detected");
+        h.get_by_label("System audio · No sound right now");
+        h.get_by_label_contains("Speak or play call audio");
+        h.get_by_label("Sound levels show activity, not who is speaking.");
+    }
+
+    #[test]
+    fn retention_dialog_shows_affected_count_and_cancel_keeps_the_choice_unconfirmed() {
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui_state(|ui, choice| {
+                if let Some(result) = data_confirmation_content(ui, &PendingDataAction::ChangeRetention(KeepHistory::Days7), 3) {
+                    *choice = Some(result);
+                }
+            }, None::<ConfirmChoice>);
+        h.get_by_label("Change history retention?");
+        h.get_by_label_contains("removes 3 existing entries now");
+        h.get_by_label("CANCEL").click();
+        h.run();
+        assert!(h.state() == &Some(ConfirmChoice::Cancel));
+    }
+
+    #[test]
+    fn meeting_dialog_explains_what_is_removed() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| {
+                data_confirmation_content(ui, &PendingDataAction::DeleteMeeting { id: "id".into(), title: "Project review".into() }, 1);
+            });
+        h.get_by_label("Delete meeting?");
+        h.get_by_label_contains("Project review");
+        h.get_by_label_contains("can’t be undone in the app");
+        h.get_by_label("DELETE MEETING");
+    }
+
+    #[test]
+    fn recovery_audio_discard_confirmation_explains_missing_speech_and_trash() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| { data_confirmation_content(ui, &PendingDataAction::DiscardRecoveryAudio { id: "meeting".into(), count: 2 }, 2); });
+        h.get_by_label("Discard recovery audio?");
+        h.get_by_label_contains("portions will remain missing");
+        h.get_by_label_contains("stays in Trash");
+        h.get_by_label("CANCEL");
+    }
+
+    #[test]
+    fn confirmation_button_returns_an_explicit_confirm() {
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui_state(|ui, choice| {
+                if let Some(result) = data_confirmation_content(ui, &PendingDataAction::ClearHistory, 2) {
+                    *choice = Some(result);
+                }
+            }, None::<ConfirmChoice>);
+        h.get_by_label_contains("removes 2 entries from History");
+        h.get_by_label("CLEAR HISTORY").click();
+        h.run();
+        assert!(h.state() == &Some(ConfirmChoice::Confirm));
+    }
+
+    #[test]
+    fn restore_dialog_explains_retention_change() {
+        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+            .with_context_setup(theme::install)
+            .build_ui(|ui| { data_confirmation_content(ui, &PendingDataAction::RestoreHistory, 0); });
+        h.get_by_label_contains("retention will be set to Forever");
+        h.get_by_label("RESTORE HISTORY");
+    }
 }
 
 /// The centred reading column every page sits in.
@@ -75,128 +370,29 @@ fn column(ui: &mut egui::Ui, pad: f32, width: f32, add: impl FnOnce(&mut egui::U
 
 /// The kit's NOTICE, warning and error variants.
 ///
-/// The variant recolours the whole box so the tone reads before the words do:
-/// yellow when something is merely missing, red when nothing can run. It takes
-/// the side panel's hard offset shadow rather than the soft one, because a
-/// notice is meant to stop you.
-///
-/// One deviation: the kit shadows these in --on-yellow and --on-red, both of
-/// which are paper. On a dark page paper is the page, so the shadow would be
-/// invisible; it uses ink here, as the side panel does.
-fn setup_notice(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
-    let (speech_ok, _) = app.speech_ready();
-    let (text_ok, text) = app.text_ready();
-    // On a cold start the text model is still being looked for. Saying
-    // something is missing before we know would be a lie that fixes itself.
-    let still_looking = text.starts_with("Checking");
-    if speech_ok && (text_ok || still_looking || app.s.hide_text_model_notice) {
-        return;
-    }
-    // The model names mean nothing to someone who never picked one. Say what
-    // works, what does not, and what it is for; the detail lives in Models.
-    let (fill, head, body, action) = if speech_ok {
-        (
-            theme::Y1(),
-            "ONE OPTIONAL EXTRA",
-            "Dictation works. If you also want \"um\" and \"uh\" taken out and small slips tidied up, that needs one more download. Without it your words are pasted exactly as you said them.",
-            "SET IT UP",
-        )
-    } else {
-        (
-            theme::RED(),
-            "DICTATION ISN'T READY YET",
-            "Your shortcut will not do anything yet. To turn what you say into text, Open Dictate needs a speech model downloaded onto this Mac.",
-            "SET UP DICTATION",
-        )
-    };
-    // Yellow is one value in both themes, red is not, so what goes on top
-    // of them cannot be one token either.
-    let fg = if speech_ok { theme::ON_YELLOW() } else { theme::ON_FILL() };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(2.5, fg))
-        .corner_radius(16)
-        .shadow(egui::epaint::Shadow { offset: [5, 6], blur: 0, spread: 0, color: theme::INK() })
-        .inner_margin(Margin { left: 14, right: 14, top: 11, bottom: 12 })
-        .show(ui, |ui| {
-            ui.set_width(w - 33.0);
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    // Reserve for the actions: both are the width of the
-                    // widest label, so two cost twice one plus the gap.
-                    let widest = if speech_ok { "NO THANKS" } else { action };
-                    let one = ui.painter()
-                        .layout_no_wrap(widest.to_string(), FontId::new(11.0, theme::display()), fg)
-                        .rect
-                        .width()
-                        + 38.0;
-                    let actions = if speech_ok { one * 2.0 + 6.0 } else { one } + 16.0;
-                    ui.set_width(w - 33.0 - actions);
-                    ui.spacing_mut().item_spacing.y = 5.0;
-                    ui.horizontal(|ui| {
-                        // Allocated rather than painted at the cursor, so the
-                        // horizontal layout centres glyph and caption together.
-                        let (ir, _) = ui.allocate_exact_size(vec2(19.0, 19.0), Sense::hover());
-                        kit_icon(ui.painter(), if speech_ok { "bell" } else { "x" }, ir.center(), fg);
-                        ui.add_space(3.0);
-                        ui.label(b(head, 10.0, fg));
-                    });
-                    ui.label(para(body, 13.0, fg));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    // The kit gives .notice-btns buttons flex: 1 1 0, so they
-                    // share one width. Measure every label that will be shown
-                    // and size them all to the widest.
-                    let font = FontId::new(11.0, theme::display());
-                    let labels: &[&str] = if speech_ok { &[action, "NO THANKS"] } else { &[action] };
-                    let bw = labels
-                        .iter()
-                        .map(|l| ui.painter().layout_no_wrap(l.to_string(), font.clone(), fg).rect.width())
-                        .fold(0.0_f32, f32::max)
-                        + 38.0;
-                    // Painted rather than egui Buttons: giving a Button an
-                    // explicit fill and stroke freezes it, so it never showed
-                    // a hover. The kit inverts these on hover.
-                    let notice_btn = |ui: &mut egui::Ui, label: &str| {
-                        let (br, bresp) = ui.allocate_exact_size(vec2(bw, 30.0), Sense::click());
-                        let hot = bresp.hovered();
-                        let p = ui.painter();
-                        p.rect_filled(br, 8.0, if hot { fg } else { fill });
-                        p.rect_stroke(br, 8.0, Stroke::new(2.0, fg), egui::StrokeKind::Inside);
-                        p.text(br.center(), Align2::CENTER_CENTER, label, font.clone(), if hot { fill } else { fg });
-                        bresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
-                    };
-                    if notice_btn(ui, action) {
-                        app.settings_tab = Some(SettingsTab::Models);
-                        app.refresh_health(ui.ctx());
-                    }
-                    // Declining is only offered for the optional download.
-                    // Hiding the blocking one would leave a shortcut that
-                    // silently does nothing and no sign of why.
-                    if speech_ok {
-                        ui.add_space(6.0);
-                        if notice_btn(ui, "NO THANKS") {
-                            app.s.hide_text_model_notice = true;
-                            app.changed();
-                        }
-                    }
-                });
-            });
-        });
-}
 
-fn sidebar(app: &mut DictateApp, ui: &mut egui::Ui) {
-    // The kit's .sidepanel: a 3px ink outline over a hard ink shadow. Inset so
-    // the shadow has somewhere to fall inside the pane.
-    let rect = ui.max_rect().shrink2(vec2(7.0, 10.0));
-    // Solid, like the cards. A see-through panel put the backdrop between
-    // the outline and the exposed sliver of the shadow, so the two read as a
-    // doubled border; filled, they meet and the shadow is one rounded mass
-    // again. Only the strip the panel sits in lets the backdrop through.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum SidebarVariant { Floating, Attached }
+
+fn sidebar(app: &mut DictateApp, ui: &mut egui::Ui, variant: SidebarVariant) {
+    let bounds = ui.max_rect();
+    let rect = match variant {
+        SidebarVariant::Floating => bounds.shrink2(vec2(17.0, 20.0)),
+        SidebarVariant::Attached => bounds,
+    };
     let p = ui.painter();
-    p.rect_filled(rect.translate(vec2(5.0, 6.0)), 18.0, theme::INK());
-    p.rect_filled(rect, 18.0, theme::SURFACE());
-    p.rect_stroke(rect, 18.0, Stroke::new(3.0, theme::INK()), egui::StrokeKind::Inside);
+    match variant {
+        SidebarVariant::Floating => {
+            p.rect_filled(rect.translate(vec2(5.0, 6.0)), 18.0, theme::INK());
+            p.rect_filled(rect, 18.0, theme::SURFACE());
+            p.rect_stroke(rect, 18.0, Stroke::new(3.0, theme::INK()), egui::StrokeKind::Inside);
+        }
+        SidebarVariant::Attached => {
+            p.rect_filled(rect, 0.0, theme::SIDEBAR());
+            p.line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(2.0, theme::INK()));
+        }
+    }
 
     let inner = rect.shrink2(vec2(10.0, 12.0));
     let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
@@ -248,6 +444,7 @@ pub fn draw_icon(p: &egui::Painter, name: &str, c: egui::Pos2, color: Color32) {
         "mic" => crate::icon::MIC,
         "gear" => crate::icon::SETTINGS,
         "help" | "info" => crate::icon::HELP,
+        "lock" => crate::icon::LOCK,
         "spark" => crate::icon::SPARKLES,
         "close" => crate::icon::X,
         // Anything unknown still shows itself, which is easier to spot than a blank.
@@ -377,6 +574,8 @@ pub fn kit_icon_at(p: &egui::Painter, name: &str, c: egui::Pos2, color: Color32,
             p.add(egui::Shape::circle_stroke(at(10.0, 10.0), 6.2 * k, Stroke::new(2.4 * k, color)));
             p.add(line((14.6, 14.6), (20.5, 20.5)));
         }
+        "chev-down" => { p.add(poly(&[(6.5, 9.0), (12.0, 14.5), (17.5, 9.0)])); }
+        "chev-up" => { p.add(poly(&[(6.5, 14.5), (12.0, 9.0), (17.5, 14.5)])); }
         // i-x
         "x" => {
             p.add(line((7.0, 7.0), (17.0, 17.0)));
@@ -488,7 +687,7 @@ pub fn status(ui: &mut egui::Ui, state: State, text: impl Into<String>) {
         ui.spacing_mut().item_spacing.x = 7.0;
         let (ir, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
         kit_icon(ui.painter(), glyph, ir.center(), tint);
-        ui.label(m(text, 12.0, tint));
+        ui.add(egui::Label::new(m(text, 12.0, tint)).wrap());
     });
 }
 
@@ -702,14 +901,36 @@ pub fn kit_button(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32) -> egui
 /// nothing to press. Only the fill and the edge fade - the label is already
 /// paper, which is what fading the whole thing onto paper would leave.
 pub fn kit_button_on(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32, on: bool) -> egui::Response {
-    let font = FontId::new(15.0, theme::display());
+    kit_button_sized(ui, label, kind, min_w, on, false, None)
+}
+
+/// Compact size of the same Paper & Ink primary and secondary buttons.
+pub fn kit_button_compact_on(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32, on: bool) -> egui::Response {
+    kit_button_sized(ui, label, kind, min_w, on, true, None)
+}
+
+/// Compact Paper & Ink action with a non-interactive key hint inside the button.
+pub fn kit_button_with_hint(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32, on: bool, hint: Option<&str>) -> egui::Response {
+    kit_button_sized(ui, label, kind, min_w, on, true, hint)
+}
+
+fn kit_button_sized(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32, on: bool, compact: bool, hint: Option<&str>) -> egui::Response {
+    let size = if compact { 13.0 } else { 15.0 };
+    let height = if compact { 36.0 } else { 44.0 };
+    let slot_height = height + 6.0;
+    let radius = if compact { 11.0 } else { 16.0 };
+    let font = FontId::new(size, theme::display());
     let text = label.to_uppercase();
-    let pad = if kind == Btn::Primary { 32.0 } else { 22.0 };
+    let pad = if compact { 14.0 } else if kind == Btn::Primary { 32.0 } else { 22.0 };
     let measured = ui.painter().layout_no_wrap(text.clone(), font.clone(), theme::INK()).rect.width();
-    let w = (measured + pad * 2.0).max(min_w);
+    let hint_font = FontId::new(10.0, theme::bold());
+    let hint_galley = hint.map(|key| ui.painter().layout_no_wrap(key.to_owned(), hint_font, theme::INK()));
+    let hint_width = hint_galley.as_ref().map_or(0.0, |g| g.rect.width() + 12.0);
+    let hint_gap = if hint_galley.is_some() { 10.0 } else { 0.0 };
+    let w = (measured + pad * 2.0 + hint_gap + hint_width).max(min_w);
     let sense = if on { Sense::click() } else { Sense::hover() };
-    let (slot, resp) = ui.allocate_exact_size(vec2(w + 5.0, 50.0), sense);
-    let base = Rect::from_min_size(slot.min, vec2(w, 44.0));
+    let (slot, resp) = ui.allocate_exact_size(vec2(w + 5.0, slot_height), sense);
+    let base = Rect::from_min_size(slot.min, vec2(w, height));
     let (shift, lift) = if !on {
         (vec2(0.0, 0.0), 0.0)
     } else if resp.is_pointer_button_down_on() {
@@ -730,18 +951,26 @@ pub fn kit_button_on(ui: &mut egui::Ui, label: &str, kind: Btn, min_w: f32, on: 
     let (fill, edge) = if on { (fill, edge) } else { (fill.gamma_multiply(0.38), edge.gamma_multiply(0.38)) };
     let p = ui.painter();
     if lift > 0.0 {
-        p.rect_filled(r.translate(vec2(lift, lift + 1.0)), 16.0, theme::INK());
+        p.rect_filled(r.translate(vec2(lift, lift + 1.0)), radius, theme::INK());
     }
-    p.rect_filled(r, 16.0, fill);
-    p.rect_stroke(r, 16.0, Stroke::new(3.0, edge), egui::StrokeKind::Inside);
+    p.rect_filled(r, radius, fill);
+    p.rect_stroke(r, radius, Stroke::new(3.0, edge), egui::StrokeKind::Inside);
     let mut job = egui::text::LayoutJob::default();
     job.append(
         &text,
         0.0,
-        egui::TextFormat { font_id: font, color: fg, extra_letter_spacing: 15.0 * 0.045, ..Default::default() },
+        egui::TextFormat { font_id: font, color: fg, extra_letter_spacing: size * 0.045, ..Default::default() },
     );
     let g = p.layout_job(job);
-    p.galley(pos2(r.center().x - g.rect.width() / 2.0, r.center().y - g.rect.height() / 2.0), g, fg);
+    let content_width = g.rect.width() + hint_gap + hint_width;
+    let text_x = r.center().x - content_width / 2.0;
+    let text_width = g.rect.width();
+    p.galley(pos2(text_x, r.center().y - g.rect.height() / 2.0), g, fg);
+    if hint_galley.is_some() {
+        let key_rect = Rect::from_center_size(pos2(text_x + text_width + hint_gap + hint_width / 2.0, r.center().y), vec2(hint_width, 22.0));
+        p.rect_stroke(key_rect, 5.0, Stroke::new(1.5, fg), StrokeKind::Inside);
+        p.text(key_rect.center(), Align2::CENTER_CENTER, hint.unwrap_or_default(), FontId::new(10.0, theme::bold()), fg);
+    }
     if on { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
 }
 
@@ -772,335 +1001,53 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> egui::Response {
 // ---------------------------------------------------------------------------
 // Home
 
-fn home(app: &mut DictateApp, ui: &mut egui::Ui, width: f32) {
-    let right_w = 186.0;
-    let gap = (width * 0.085).clamp(24.0, 92.0);
-    let main_w = width - right_w - gap;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.set_width(main_w);
-            setup_notice(app, ui, main_w);
-            ui.label(d("Say it, skip the typing", 46.0, theme::TEXT()));
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                start_button(app, ui, 196.0);
-                // The shortcut was only discoverable inside a rail card most
-                // people stop seeing. Next to the button it is learned once.
-                if let Some(k) = app.s.keys(Action::Dictate).first() {
-                    ui.add_space(14.0);
-                    // A key chip fills the height of the row it is in. This
-                    // row is 50pt tall because of the button, so the hint
-                    // gets a row of the rail's height instead.
-                    ui.allocate_ui_with_layout(vec2(220.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(t("or press", 13.5, theme::MUTED()));
-                        ui.add_space(2.0);
-                        kbd(ui, k);
-                    });
-                }
-            });
-            ui.add_space(30.0);
-            insights(app, ui, main_w);
-        });
-        ui.add_space(gap);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.set_width(right_w);
-            ui.add_space(181.0);
-            right_column(app, ui);
-        });
-    });
-}
-
-fn insights(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
-    // Dotted backdrop, filled in once we know how tall the cards are.
-    let bg_idx = ui.painter().add(egui::Shape::Noop);
-    let top = ui.cursor().top();
-    let left = ui.cursor().left();
-    let s = &app.stats;
-    let mut share = false;
-    ui.horizontal(|ui| {
-        ui.add_space(0.0);
-        ui.label(d("Insights", 24.0, theme::MUTED()));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            share = kit_button(ui, &format!("{}  Share", crate::icon::SHARE), Btn::Secondary, 0.0).clicked();
-        });
-    });
-    if share {
-        let summary = format!(
-            "{} words dictated, {} saved, {:.0} WPM, {} active days.",
-            s.words,
-            duration_text(s.minutes_saved(app.s.typing_wpm)),
-            s.wpm(),
-            s.active_days()
-        );
-        ui.ctx().copy_text(summary);
-        app.notify("Insights copied to clipboard", false);
-    }
-    ui.add_space(8.0);
-
-    let s = &app.stats;
-    let card_w = (w - 16.0) / 2.0;
-    let saved = s.minutes_saved(app.s.typing_wpm);
-    let total = s.seconds / 60.0;
-    let cards = [
-        (vec![(compact(s.words as f64), "words")], "Words dictated"),
-        (duration_parts(saved), "Time saved"),
-        (vec![(format!("{:.0}", s.wpm()), "WPM")], "Average dictation speed"),
-        (duration_parts(total), "Total dictation time"),
-    ];
-    for row in cards.chunks(2) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            for (parts, label) in row {
-                stat_card(ui, card_w, parts, label);
-            }
-        });
-        ui.add_space(8.0);
-    }
-    activity_card(app, ui, w);
-    ui.add_space(8.0);
-    personalization_card(app, ui, w);
-
-    let rect = Rect::from_min_max(pos2(left - 12.0, top - 12.0), pos2(left + w + 12.0, ui.cursor().top() + 4.0));
-    let mut shapes = vec![egui::Shape::rect_filled(rect, 14.0, theme::PANEL_SHEER())];
-    let mut y = rect.top() + 4.0;
-    while y < rect.bottom() - 2.0 {
-        let mut x = rect.left() + 4.0;
-        while x < rect.right() - 2.0 {
-            shapes.push(egui::Shape::rect_filled(Rect::from_min_size(pos2(x, y), vec2(1.0, 1.0)), 0.0, theme::INK().gamma_multiply(0.08)));
-            x += 6.0;
-        }
-        y += 6.0;
-    }
-    ui.painter().set(bg_idx, egui::Shape::Vec(shapes));
-}
-
-fn stat_card(ui: &mut egui::Ui, w: f32, parts: &[(String, &str)], label: &str) {
-    theme::ink_card().inner_margin(Margin { left: 16, right: 16, top: 16, bottom: 14 }).show(ui, |ui| {
-        ui.set_width(w - 32.0);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (v, unit) in parts {
-                    ui.label(d(v.clone(), 25.0, theme::TEXT()));
-                    ui.label(b(*unit, 12.5, theme::MUTED()));
-                    ui.add_space(2.0);
-                }
-            });
-            ui.label(t(label, 14.0, theme::MUTED()));
-        });
-    });
-}
-
-fn activity_card(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
-    let s = &app.stats;
-    theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
-        ui.set_width(w - 32.0);
-        let col = (w - 32.0) / 3.0;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (n, label) in [(s.active_days(), "Active days"), (s.current_streak(), "Current streak"), (s.longest_streak(), "Longest streak")] {
-                ui.vertical(|ui| {
-                    ui.set_width(col);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(d(n.to_string(), 23.0, theme::TEXT()));
-                        ui.label(b(if n == 1 { "day" } else { "days" }, 12.5, theme::MUTED()));
-                    });
-                    ui.label(t(label, 13.0, theme::MUTED()));
-                });
-            }
-        });
-        ui.add_space(14.0);
-
-        // One column per week, rows Sunday..Saturday, this week on the right.
-        let label_w = 16.0;
-        let cell = 16.0;
-        let avail = w - 32.0 - label_w;
-        let weeks = ((avail + 6.0) / (cell + 6.0)).floor().max(4.0) as i64;
-        let gapx = (avail - weeks as f32 * cell) / (weeks as f32 - 1.0);
-        let today = Local::now().date_naive();
-        let this_sunday = today - Duration::days(today.weekday().num_days_from_sunday() as i64);
-        let start = this_sunday - Duration::weeks(weeks - 1);
-        let first = s.first_day().unwrap_or(today);
-        let busiest = s.busiest_day().max(1);
-        let (r, _) = ui.allocate_exact_size(vec2(w - 32.0, 7.0 * 22.0 + 14.0), Sense::hover());
-        let p = ui.painter();
-        for (i, d) in ["S", "M", "T", "W", "T", "F", "S"].iter().enumerate() {
-            p.text(pos2(r.left() + 4.0, r.top() + i as f32 * 22.0 + cell / 2.0), Align2::CENTER_CENTER, d, FontId::proportional(9.0), theme::MUTED());
-        }
-        let hatch = Stroke::new(1.0, theme::LINE());
-        let mut last_month = 0;
-        for wk in 0..weeks {
-            let x = r.left() + label_w + wk as f32 * (cell + gapx);
-            for dow in 0..7 {
-                let d = start + Duration::days(wk * 7 + dow);
-                let cr = Rect::from_min_size(pos2(x, r.top() + dow as f32 * 22.0), vec2(cell, cell));
-                if d > today {
-                    p.rect_stroke(cr, 3.0, Stroke::new(1.0, theme::LINE()), StrokeKind::Inside);
-                } else if d < first {
-                    // Before the first dictation: striped, like the original.
-                    p.rect_filled(cr, 3.0, theme::TRACK());
-                    for k in [4.0, 9.0, 14.0] {
-                        p.line_segment([pos2(cr.left() + k - 4.0, cr.bottom() - 1.0), pos2(cr.left() + k + 1.0, cr.top() + 1.0)], hatch);
-                    }
-                } else {
-                    let n = s.count_on(d);
-                    let c = if n == 0 { theme::TRACK() } else { theme::HEAT()[((n as f32 / busiest as f32) * 3.99) as usize] };
-                    p.rect_filled(cr, 3.0, c);
-                }
-            }
-            let d = start + Duration::days(wk * 7);
-            if d.month() != last_month {
-                if wk > 0 {
-                    p.text(pos2(x + cell / 2.0, r.bottom() - 4.0), Align2::CENTER_CENTER, d.format("%b").to_string(), FontId::proportional(9.0), theme::MUTED());
-                }
-                last_month = d.month();
-            }
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(t("Less", 12.0, theme::MUTED()));
-            for c in theme::HEAT() {
-                let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                ui.painter().rect_filled(r, 2.0, c);
-            }
-            ui.label(t("More", 12.0, theme::MUTED()));
-        });
-    });
-}
-
-fn personalization_card(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
-    let words = app.s.dictionary.len();
-    theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
-        ui.set_width(w - 32.0);
-        ui.set_min_height(210.0);
-        let top = ui.min_rect();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-            ui.painter().rect_filled(r, 5.0, theme::TRACK());
-            draw_icon(ui.painter(), "spark", r.center(), theme::MUTED());
-            ui.label(d(words.to_string(), 25.0, theme::TEXT()));
-            ui.label(b(if words == 1 { "word" } else { "words" }, 12.5, theme::MUTED()));
-        });
-        ui.label(t(format!("Personalization · {} tone", app.s.tone.label()), 14.0, theme::MUTED()));
-        ui.add_space(10.0);
-        if btn(ui, "Personalize").clicked() {
-            app.settings_tab = Some(SettingsTab::Personalization);
-        }
-        // Radar-style circle with one dot per dictionary word.
-        let c = pos2(top.left() + w - 32.0 - 100.0, top.top() + 105.0);
-        let p = ui.painter();
-        p.circle_filled(c, 100.0, theme::TRACK());
-        for k in 0..5 {
-            let a = k as f32 / 5.0 * std::f32::consts::TAU - 1.2;
-            p.line_segment([c, c + vec2(a.cos(), a.sin()) * 100.0], Stroke::new(1.0, theme::LINE()));
-        }
-        for (i, wd) in app.s.dictionary.iter().enumerate().take(60) {
-            let a = i as f32 * 2.399;
-            let rad = 18.0 + (i as f32 * 13.0) % 74.0;
-            p.circle_filled(c + vec2(a.cos(), a.sin()) * rad, 2.5, if wd.auto { theme::GREEN() } else { theme::HEAT()[3] });
-        }
-        p.circle_filled(c, 6.0, theme::HEAT()[3]);
-        p.circle_stroke(c, 7.5, Stroke::new(1.0, theme::ACCENT()));
-    });
-}
-
-/// The one thing the app is for. It sat third in the right rail, under a card
-/// of keyboard shortcuts, on a page that opens on statistics; it belongs under
-/// the title that invites it.
-fn start_button(app: &mut DictateApp, ui: &mut egui::Ui, min_w: f32) {
-    let rec = app.recording.as_ref().map(|(_, a, _)| *a);
-    let busy = app.busy.is_some();
-    let label = match (rec, busy) {
-        (Some(_), _) => format!("{}  Stop & paste", crate::icon::SQUARE),
-        (None, true) => "Thinking…".to_string(),
-        _ => format!("{}  Start dictating", crate::icon::MIC),
+fn home(app: &mut DictateApp, ui: &mut egui::Ui, _width: f32) {
+    use crate::home_view::{HomeAction, HomeData};
+    if app.meetings_dirty { app.refresh_meetings(); }
+    let (speech_ready, _) = app.speech_ready();
+    let checked = app.health.lock().map(|h| h.checked).unwrap_or(false);
+    let remote_speech = app.s.speech_engine == crate::settings::SpeechEngine::OpenAiCompatible;
+    let speech = crate::home_view::speech_state(remote_speech, speech_ready, checked, &app.s.speech_url);
+    let shortcut = |keys: &[String]| -> Option<String> {
+        let k = keys.iter().find(|k| !k.starts_with('F')).or_else(|| keys.first())?;
+        Some(k.split('+').map(|part| match part.trim().to_lowercase().as_str() {
+            "alt" | "option" => "Option".to_string(), "cmd" | "meta" | "super" => "Command".to_string(),
+            "ctrl" | "control" => "Control".to_string(), "shift" => "Shift".to_string(), _ => part.trim().to_string(),
+        }).collect::<Vec<_>>().join(" + "))
     };
-    // While the text is being cleaned up there is nothing to press, but the
-    // hero must not collapse around the gap, so the button disables in place.
-    if kit_button_on(ui, &label, Btn::Primary, min_w, !busy).clicked() {
-        if rec.is_some() {
-            let ctx = ui.ctx().clone();
-            app.stop_recording(&ctx);
-        } else {
-            app.start_recording(Action::Dictate);
-        }
-    }
-}
-
-fn right_column(app: &mut DictateApp, ui: &mut egui::Ui) {
-    theme::soft(theme::CARD_DIM(), 14, 2.5, 3).inner_margin(Margin::same(18)).show(ui, |ui| {
-        ui.set_width(186.0 - 36.0);
-        for (i, trigger) in Trigger::ALL.iter().enumerate() {
-            ui.label(t(trigger.label(), 12.5, theme::MUTED()));
-            ui.horizontal_wrapped(|ui| {
-                let keys = app.s.trigger_keys(*trigger);
-                if keys.is_empty() {
-                    ui.label(t("Not set", 12.0, theme::FAINT()));
-                }
-                for k in keys.iter().take(2) {
-                    kbd(ui, k);
-                }
-            });
-            if i + 1 < Trigger::ALL.len() {
-                ui.add_space(6.0);
-            }
-        }
-    });
-    ui.add_space(24.0);
-
-    // One card for both models. Four facts each was three too many: once the
-    // dots are green nothing here changes again, and the engine names
-    // (whisper.cpp, Ollama) are detail the user never chose. The card opens
-    // Models, where all of it lives; the chevron says so.
-    let (speech_ok, speech) = app.speech_ready();
-    let (text_ok, text) = app.text_ready();
-    let card = theme::soft(theme::CARD_DIM(), 14, 2.5, 3).inner_margin(Margin::same(12)).show(ui, |ui| {
-        ui.set_width(186.0 - 24.0);
-        ui.horizontal(|ui| {
-            let all_ok = speech_ok && text_ok;
-            let (r, _) = ui.allocate_exact_size(vec2(17.0, 17.0), Sense::hover());
-            kit_icon_at(ui.painter(), if all_ok { "check" } else { "x" }, r.center(),
-                        if all_ok { theme::GREEN() } else if speech_ok { theme::WARN() } else { theme::RED() }, 16.0);
-            ui.add_space(3.0);
-            ui.label(b(if speech_ok { "Ready" } else { "Not ready" }, 16.0, theme::TEXT()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(13.0, 13.0), Sense::hover());
-                kit_icon(ui.painter(), "chev", r.center(), theme::FAINT());
-            });
-        });
-        ui.add_space(4.0);
-        // A tick is a stronger claim than a dot: it says set up, not present.
-        // Speech is required, so a gap there is wrong; text clean-up is
-        // optional, so a gap there has only been noticed.
-        for (ok, name, missing) in [(speech_ok, speech, theme::RED()), (text_ok, text, theme::WARN())] {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
-                kit_icon_at(ui.painter(), if ok { "check" } else { "x" }, r.center(),
-                            if ok { theme::GREEN() } else { missing }, 13.0);
-                ui.add_space(2.0);
-                ui.add(egui::Label::new(t(name, 13.0, theme::MUTED())).truncate());
-            });
-        }
-    });
-    let click = ui.interact(card.response.rect, ui.id().with("models"), Sense::click());
-    if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-        app.settings_tab = Some(SettingsTab::Models);
-        app.refresh_health(ui.ctx());
+    let attention = app.home_attention.as_ref().filter(|_| app.meeting.is_none()).map(|(_, failed_audio)| if *failed_audio {
+        "Some speech could not be transcribed. The audio was kept for retry.".to_string()
+    } else { "The meeting summary could not be generated. You can review and retry it.".to_string() });
+    let data = HomeData { speech, remote_speech, dictation_key: shortcut(&app.s.dictate_keys),
+        meeting_key: shortcut(&app.s.meeting_keys), dictating: app.recording.is_some(), busy: app.busy.is_some(),
+        meeting_active: app.meeting.is_some(), attention, stats: app.stats.clone(), typing_wpm: app.s.typing_wpm };
+    match crate::home_view::draw(ui, &data) {
+        Some(HomeAction::Dictate) => if app.recording.is_some() { app.stop_recording_from_home(ui.ctx()); } else { app.start_recording(Action::Dictate); },
+        Some(HomeAction::Meeting) => if app.meeting.is_some() { app.page = Page::Meetings; } else { app.toggle_meeting(); },
+        Some(HomeAction::Setup) => { app.settings_tab = None; app.setup_open = true; app.refresh_health(ui.ctx()); },
+        Some(HomeAction::Models) => { app.settings_tab = Some(SettingsTab::Models); app.refresh_health(ui.ctx()); },
+        Some(HomeAction::ReviewMeeting) => if let Some((id, _)) = app.home_attention.clone() { app.page = Page::Meetings; app.open_meeting(id); },
+        None => {}
     }
 }
 
 pub fn kbd(ui: &mut egui::Ui, k: &str) {
-    theme::soft(theme::SURFACE(), 14, 2.5, 3)
-        .corner_radius(5)
-        .inner_margin(Margin::symmetric(6, 2))
-        .show(ui, |ui| ui.label(b(pretty_key(k), 13.0, theme::TEXT())));
+    kbd_label(ui, &pretty_key(k));
+}
+
+/// Paper & Ink shortcut keycap for already-formatted, readable shortcut text.
+pub fn kbd_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(label.to_owned(), egui::FontId::new(10.0, theme::bold()), theme::TEXT()).size().x) + 14.0;
+    ui.allocate_ui_with_layout(vec2(width, 22.0), Layout::top_down(Align::Min), |ui| {
+        theme::soft(theme::SURFACE(), 14, 2.0, 0)
+            .shadow(egui::epaint::Shadow::NONE)
+            .corner_radius(5)
+            .inner_margin(Margin::symmetric(5, 2))
+            .show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.label(b(label, 10.0, theme::TEXT()));
+            }).response
+    }).inner
 }
 
 pub fn pretty_key(k: &str) -> String {
@@ -1114,26 +1061,6 @@ pub fn pretty_key(k: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn compact(v: f64) -> String {
-    if v >= 1_000_000.0 {
-        format!("{:.1}M", v / 1_000_000.0)
-    } else if v >= 1000.0 {
-        format!("{:.1}K", v / 1000.0)
-    } else {
-        format!("{v:.0}")
-    }
-}
-
-fn duration_parts(minutes: f64) -> Vec<(String, &'static str)> {
-    let total = minutes.round() as u64;
-    let (h, mi) = (total / 60, total % 60);
-    if h > 0 { vec![(h.to_string(), "hr"), (mi.to_string(), "min")] } else { vec![(mi.to_string(), "min")] }
-}
-
-fn duration_text(minutes: f64) -> String {
-    duration_parts(minutes).iter().map(|(v, u)| format!("{v} {u}")).collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,6 +1094,7 @@ pub fn pill_tabs<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, items:
         let seg = Rect::from_min_size(pos2(x, track.top() + 4.0), vec2(w, H - 8.0));
         let resp = ui.interact(seg, ui.id().with(("segment", *label)), Sense::click());
         let on = *current == *v;
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, on, *label));
         let p = ui.painter();
         if on {
             p.rect_filled(seg, (H - 8.0) / 2.0, theme::INK());
@@ -1194,7 +1122,13 @@ enum RowAction {
     SaveEdit,
 }
 
+fn reserve_scrollbar_gutter(ui: &mut egui::Ui) {
+    ui.style_mut().spacing.scroll.floating_allocated_width = 16.0;
+}
+
 fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
+    // Keep the floating scroll handle in its own gutter beside the rows.
+    reserve_scrollbar_gutter(ui);
     ui.horizontal(|ui| {
         ui.label(b("History", 38.0, theme::TEXT()));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1205,8 +1139,12 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
                     ui.ctx().copy_text(all);
                     ui.close();
                 }
+                if crate::data_safety::latest_backup().is_some() && ui.button("Restore last history backup").clicked() {
+                    app.pending_data_action = Some(PendingDataAction::RestoreHistory);
+                    ui.close();
+                }
                 if ui.button(t("Clear all history", 14.0, theme::RED())).clicked() {
-                    app.clear_history();
+                    if !app.history.is_empty() { app.pending_data_action = Some(PendingDataAction::ClearHistory); }
                     ui.close();
                 }
             });
@@ -1229,7 +1167,11 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
                     }
                 });
                 if k != app.s.keep_history {
-                    app.set_keep_history(k);
+                    if crate::data_safety::shortens_history(app.s.keep_history, k) {
+                        app.pending_data_action = Some(PendingDataAction::ChangeRetention(k));
+                    } else if let Err(e) = app.set_keep_history(k) {
+                        app.notify(e, true);
+                    }
                 }
             });
         });
@@ -1239,12 +1181,23 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(m(format!("{} Your data stays yours", crate::icon::LOCK), 14.0, theme::TEXT()));
         ui.label(para(
-            "Recordings and text are kept only on this Mac. Your voice goes only to the speech and text models you chose in Models.",
+            "History is stored on this Mac. Your selected speech and text providers may process audio or text on another server; see Settings › Privacy & data.",
             14.0,
             theme::MUTED(),
         ));
     });
     ui.add_space(14.0);
+    if crate::data_safety::latest_backup().is_some() {
+        ui.horizontal(|ui| {
+            ui.label(t("A history backup is in Trash.", 13.0, theme::MUTED()));
+            let restore = btn(ui, "Restore last backup");
+            restore.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Restore last backup"));
+            if restore.clicked() {
+                app.pending_data_action = Some(PendingDataAction::RestoreHistory);
+            }
+        });
+        ui.add_space(14.0);
+    }
     pill_tabs(
         ui,
         &mut app.hist_filter,
@@ -1296,7 +1249,7 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
     });
     match action {
         Some((RowAction::Retry, w)) => app.retry(&ctx, w),
-        Some((RowAction::Delete, w)) => app.delete_entry(w),
+        Some((RowAction::Delete, w)) => app.pending_data_action = Some(PendingDataAction::DeleteHistoryEntry { when: w }),
         Some((RowAction::Details, w)) => app.expanded = if app.expanded == Some(w) { None } else { Some(w) },
         Some((RowAction::SaveEdit, w)) => {
             if let Some((_, text)) = app.editing.take() {
@@ -1406,23 +1359,306 @@ pub fn hhmmss(secs: f32) -> String {
     }
 }
 
-fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
+fn reviewed_items(ui: &mut egui::Ui, app: &mut DictateApp, section: &str, items: &[String], empty: &str) {
+    ui.add_space(14.0);
+    ui.label(m(section, 13.0, theme::MUTED()));
+    ui.add_space(4.0);
+    if items.is_empty() { ui.label(t(empty, 13.0, theme::FAINT())); return; }
+    for (index, item) in items.iter().enumerate() {
+        ui.push_id((section, index), |ui| {
+            let mut source_action = None;
+            let row = ui.horizontal_top(|ui| {
+                let width = (ui.available_width() - 40.0).max(40.0);
+                ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(width);
+                    ui.add(egui::Label::new(para(format!("• {item}"), 14.0, theme::TEXT())).wrap());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    let same = app.review_source.as_ref().is_some_and(|(s, i)| s == section && *i == index);
+                    let (_, source) = ui.allocate_exact_size(vec2(30.0, 26.0), Sense::click());
+                    source.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} possible source for {item}", if same { "Hide" } else { "Find" })));
+                    source_action = Some((source, same));
+                });
+            });
+            if let Some((source, same)) = source_action {
+                let hovered = ui.input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pos| row.response.rect.contains(pos) && ui.clip_rect().contains(pos));
+                if hovered || source.has_focus() {
+                    kit_icon_at(ui.painter(), if same { "chev-up" } else { "chev-down" }, source.rect.center(), theme::TEXT(), 18.0);
+                }
+                if source.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if same { "Hide possible source" } else { "Find possible source" }).clicked() {
+                    app.review_source = (!same).then(|| (section.to_string(), index));
+                }
+            }
+            if app.review_source.as_ref().is_some_and(|(s, i)| s == section && *i == index) {
+                if let Some(i) = crate::meeting::possible_source(item, &app.open_segments) {
+                    let seg = app.open_segments[i].clone();
+                    ui.label(t(format!("Possible match · {} · Check the context; this may not support the claim.", hhmmss(seg.at_ms as f32 / 1000.0)), 12.0, theme::MUTED()));
+                    ui.label(para(&seg.text, 13.0, theme::TEXT()));
+                    if let Some(clip) = app.saved_audio.iter().find(|c| c.at_ms == seg.at_ms).cloned() {
+                        let label = if app.audio_player.is_some() { "Stop audio" } else { "Play this clip" };
+                        if btn(ui, label).clicked() {
+                            if app.audio_player.is_some() { app.audio_player = None; }
+                            else {
+                                match crate::playback::Player::start_at(app.saved_audio.clone(), clip.at_ms) {
+                                    Ok(player) => { app.audio_player = Some(player); app.meeting_follow_playback = true; app.meeting_last_playing_segment = None; },
+                                    Err(error) => app.notify(error, true),
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label(t("Audio for this passage was not saved.", 12.0, theme::FAINT()));
+                    }
+                } else {
+                    ui.label(t("No close transcript match found. Check the transcript below.", 12.0, theme::MUTED()));
+                }
+            }
+            ui.add_space(6.0);
+        });
+    }
+}
+
+fn edit_summary_items(ui: &mut egui::Ui, label: &str, items: &mut Vec<String>) {
+    ui.add_space(12.0);
+    ui.label(m(label, 13.0, theme::MUTED()));
+    let mut remove = None;
+    for (index, item) in items.iter_mut().enumerate() {
+        ui.push_id((label, index), |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::multiline(item).desired_width((ui.available_width() - 100.0).max(150.0)).desired_rows(2));
+                if btn(ui, "Remove").clicked() { remove = Some(index); }
+            });
+        });
+    }
+    if let Some(index) = remove { items.remove(index); }
+    if btn(ui, &format!("Add {label}")).clicked() { items.push(String::new()); }
+}
+
+fn capture_status(ui: &mut egui::Ui, live: &crate::meeting::Live) {
+    ui.label(m("Audio capture", 13.0, theme::MUTED()));
+    let Some(monitor) = &live.capture else {
+        status(ui, State::Warn, "Audio capture paused while reconnecting the microphone.");
+        return;
+    };
+    capture_status_detail(ui, &monitor.snapshot(), live.elapsed, crate::tap::clock_ms());
+}
+
+fn capture_status_detail(ui: &mut egui::Ui, sample: &crate::tap::CaptureSnapshot, elapsed: f32, now: u64) {
+    use crate::meeting::{capture_activity, CaptureActivity};
+    let is_separated = sample.separated || !sample.has_mic;
+    let mic = capture_activity(sample.frames_ms, sample.microphone_ms, now, sample.has_mic, is_separated);
+    let system = capture_activity(sample.frames_ms, sample.system_ms, now, true, is_separated);
+    let label = |state| match state {
+        CaptureActivity::Starting => "Starting…",
+        CaptureActivity::Sound => "Sound detected",
+        CaptureActivity::Quiet => "No sound right now",
+        CaptureActivity::Stalled => "No audio data arriving",
+        CaptureActivity::Unavailable => "Unavailable",
+        CaptureActivity::Mixed => "Sources cannot be separated",
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t(format!("Microphone · {}", label(mic)), 13.0, theme::TEXT()));
+        ui.add_space(16.0);
+        ui.label(t(format!("System audio · {}", label(system)), 13.0, theme::TEXT()));
+    });
+    if mic == CaptureActivity::Unavailable {
+        ui.label(para("Microphone unavailable. Check the selected input and microphone permission in Settings › Audio.", 12.5, theme::MUTED()));
+    } else if mic == CaptureActivity::Stalled || system == CaptureActivity::Stalled || (sample.frames_ms == 0 && elapsed > 5.0) {
+        ui.label(para("No audio data is reaching the recorder. Check microphone and system audio permissions in Settings › Audio.", 12.5, theme::MUTED()));
+    } else if mic == CaptureActivity::Mixed || system == CaptureActivity::Mixed {
+        ui.label(para("The audio sources cannot be separated. Speaker labels may be mixed.", 12.5, theme::MUTED()));
+    } else if elapsed > 10.0 && (mic == CaptureActivity::Quiet || system == CaptureActivity::Quiet) {
+        ui.label(para("No sound right now can be normal. Speak or play call audio to check each source.", 12.5, theme::MUTED()));
+    }
+    ui.label(t("Sound levels show activity, not who is speaking.", 12.0, theme::FAINT()));
+}
+
+fn meeting_matches(title: &str, subtitle: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || title.to_lowercase().contains(&query) || subtitle.to_lowercase().contains(&query)
+}
+
+fn play_meeting_from(app: &mut DictateApp, at_ms: u64) {
+    if let Some(player) = app.audio_player.as_mut() {
+        player.seek(at_ms);
+        if let Err(error) = player.resume() { app.notify(error, true); }
+    } else {
+        match crate::playback::Player::start_at(app.saved_audio.clone(), at_ms) {
+            Ok(player) => app.audio_player = Some(player),
+            Err(error) => app.notify(error, true),
+        }
+    }
+    app.meeting_follow_playback = true;
+    app.meeting_last_playing_segment = None;
+}
+
+fn meeting_player(ui: &mut egui::Ui, app: &mut DictateApp) {
+    ui.label(b("Meeting audio", 14.0, theme::TEXT()));
+    let ranges = match &app.saved_audio_ranges {
+        Ok(ranges) => ranges.clone(),
+        Err(error) => { ui.label(para(error, 12.0, theme::RED())); return; }
+    };
+    let Some(&(first, _)) = ranges.first() else {
+        ui.label(t("No audio was saved for this meeting.", 12.5, theme::MUTED()));
+        return;
+    };
+    let last = ranges.iter().map(|range| range.1).max().unwrap_or(first).max(first + 1);
+    let mut start = None;
+    let mut seek = None;
+    let mut error = None;
+    ui.horizontal(|ui| {
+        let is_playing = app.audio_player.as_ref().is_some_and(|p| p.playing());
+        let label = if is_playing { "Pause" } else { "Play" };
+        if kit_button_compact_on(ui, label, Btn::Secondary, 75.0, true).clicked() {
+            if let Some(player) = app.audio_player.as_mut() {
+                if is_playing { player.pause(); } else if let Err(e) = player.resume() { error = Some(e); }
+            } else { start = Some(first); }
+        }
+        let position = app.audio_player.as_ref().map_or(first, |p| p.position_ms()).clamp(first, last);
+        ui.label(t(hhmmss(position as f32 / 1000.0), 12.0, theme::MUTED()));
+        let mut value = position as f64 / 1000.0;
+        let slider_width = (ui.available_width() - 65.0).max(50.0);
+        let response = ui.scope(|ui| {
+            ui.spacing_mut().slider_width = slider_width;
+            ui.add(egui::Slider::new(&mut value, first as f64 / 1000.0..=last as f64 / 1000.0).show_value(false))
+        }).inner;
+        response.widget_info(|| egui::WidgetInfo::slider(true, value, "Meeting audio position"));
+        if response.changed() { seek = Some((value * 1000.0).round() as u64); }
+        ui.label(t(hhmmss(last as f32 / 1000.0), 12.0, theme::MUTED()));
+    });
+    if let Some(e) = error { app.notify(e, true); }
+    if let Some(at) = start { play_meeting_from(app, at); }
+    if let Some(at) = seek {
+        if let Some(player) = app.audio_player.as_mut() { player.seek(at); }
+        else { play_meeting_from(app, at); }
+        app.meeting_follow_playback = true;
+        app.meeting_last_playing_segment = None;
+    }
+    let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width().max(1.0), 4.0), Sense::hover());
+    ui.painter().rect_filled(bar, 2.0, theme::TRACK());
+    for &(start, end) in &ranges {
+        let scale = bar.width() / (last - first) as f32;
+        let piece = Rect::from_min_max(pos2(bar.left() + (start - first) as f32 * scale, bar.top()), pos2(bar.left() + (end - first) as f32 * scale, bar.bottom()));
+        ui.painter().rect_filled(piece, 2.0, theme::ACCENT());
+    }
+    let note = if app.audio_player.as_ref().is_some_and(|p| !p.ready()) { "Preparing audio…".into() }
+        else if app.audio_player.as_ref().is_some_and(|p| p.playing() && p.position_ms() < last && !crate::playback::time_has_audio(&ranges, p.position_ms())) { "No saved audio at this point. Playback will continue to the next clip.".into() }
+        else { format!("Saved clips · {}–{} of meeting · Gaps may contain missing audio.", hhmmss(first as f32 / 1000.0), hhmmss(last as f32 / 1000.0)) };
+    ui.label(t(note, 12.0, theme::MUTED()));
+}
+
+fn meeting_more_actions(ui: &mut egui::Ui, title: &str, working: bool) -> bool {
+    let more = icon_button(ui, "more", "More actions");
+    more.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("More actions for {title}")));
+    let mut delete = false;
+    egui::Popup::menu(&more).show(|ui| {
+        if ui.add_enabled(!working, egui::Button::new(t("Delete", 14.0, theme::RED()))).clicked() {
+            delete = true;
+            ui.close();
+        }
+    });
+    delete
+}
+
+fn meeting_header(ui: &mut egui::Ui, query: &mut String, show_search: bool) {
     ui.horizontal(|ui| {
         ui.label(b("Meetings", 38.0, theme::TEXT()));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(t(
-                format!("{} Kept only on this Mac", crate::icon::LOCK),
-                14.0,
-                theme::MUTED(),
-            ));
-        });
+        if show_search {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let width = ui.available_width().min(300.0);
+                let previous = query.clone();
+                let response = ui.add(egui::TextEdit::singleline(query).hint_text("Search meetings").desired_width(width));
+                response.widget_info(|| {
+                    let mut info = egui::WidgetInfo::text_edit(true, &previous, &*query, "Search meetings");
+                    info.label = Some("Search meetings".to_string());
+                    info
+                });
+            });
+        }
     });
-    ui.add_space(16.0);
+}
+
+fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, _w: f32) {
+    reserve_scrollbar_gutter(ui);
+    let detail = app.open_meeting.is_some() && app.meeting.is_none();
+    if !detail {
+        meeting_header(ui, &mut app.meeting_search, app.meeting.is_none());
+        ui.add_space(16.0);
+    }
+
+    // Keep the meeting context and section switcher visible while the
+    // summary or transcript scrolls underneath.
+    if detail {
+        if let (Some(id), Some(meta)) = (app.open_meeting.clone(), app.open_meta.clone()) {
+            let mut delete = false;
+            ui.horizontal(|ui| {
+                let back = link(ui, "←  All meetings");
+                back.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Back to all meetings"));
+                if back.clicked() {
+                    app.audio_player = None;
+                    app.open_meeting = None;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let working = app.retrying_meeting.as_deref() == Some(id.as_str()) || app.title_retrying.as_deref() == Some(id.as_str()) || app.summarising.as_deref() == Some(id.as_str());
+                    let more = icon_button(ui, "more", "Meeting actions");
+                    more.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Meeting actions"));
+                    egui::Popup::menu(&more).show(|ui| {
+                        if ui.add_enabled(!working && app.editing_title.is_none(), egui::Button::new("Rename")).clicked() { app.editing_title = Some(meta.title.clone()); ui.close(); }
+                        if ui.add_enabled(!working, egui::Button::new(t("Delete", 14.0, theme::RED()))).clicked() { delete = true; ui.close(); }
+                    });
+                });
+            });
+            ui.add_space(12.0);
+            if let Some(mut title) = app.editing_title.take() {
+                let mut save = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut title).desired_width(340.0));
+                    save = btn(ui, "Save title").clicked();
+                    cancel = btn(ui, "Cancel").clicked();
+                });
+                if save {
+                    match crate::meeting::rename(&id, &title) {
+                        Ok(()) => { app.refresh_meetings(); app.open_meta = app.meeting_list.iter().find(|m| m.id == id).cloned(); app.notify("Title saved", false); }
+                        Err(error) => { app.editing_title = Some(title); app.notify(error, true); }
+                    }
+                } else if !cancel { app.editing_title = Some(title); }
+            } else {
+                ui.add(egui::Label::new(b(&meta.title, 28.0, theme::TEXT())).wrap());
+            }
+            if let Some(error) = &meta.title_error {
+                ui.label(para(format!("Title not generated: {error}"), 12.5, theme::MUTED()));
+                if app.title_retrying.as_deref() == Some(id.as_str()) { ui.label(t("Retrying title…", 12.5, theme::MUTED())); }
+                else if app.open_summary.is_some() && app.editing_title.is_none() && btn(ui, "Retry title").clicked() { app.retry_meeting_title(id.clone()); }
+            }
+            if !meta.subtitle.is_empty() {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(para(&meta.subtitle, 14.0, theme::MUTED())).wrap());
+            }
+            ui.add_space(5.0);
+            let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
+            ui.label(t(format!("{} · {} · {length}", crate::stats::stamp(meta.started), meta.source), 13.0, theme::MUTED()));
+            ui.add_space(16.0);
+
+            if delete {
+                app.pending_data_action = Some(PendingDataAction::DeleteMeeting { id: id.clone(), title: meta.title.clone() });
+            }
+            pill_tabs(ui, &mut app.meeting_show_transcript, &[(false, "Summary"), (true, "Transcript")]);
+            ui.add_space(14.0);
+        }
+        if app.open_meeting.is_none() { return; }
+    }
 
     // The heading stays; everything under it - a live transcript, an opened
     // meeting, or the list - is what moves. A transcript runs to hundreds of
     // lines, and scrolling it used to take the page's name with it.
-    egui::ScrollArea::vertical().auto_shrink(false).id_salt("meetings_body").show(ui, |ui| {
+    // Each tab retains its own place instead of opening halfway down when
+    // switching from a long summary to a long transcript (or vice versa).
+    let scroll_id = ("meetings_body", app.open_meeting.clone(), detail && app.meeting_show_transcript);
+    egui::ScrollArea::vertical().auto_shrink(false).id_salt(scroll_id).show(ui, |ui| {
+        // The scroll area is narrower when its gutter is visible. All cards,
+        // transcript lines and list rows must fit that actual content width.
+        let w = ui.available_width();
         // While one is running, it is the only thing worth looking at.
         if let Some(session) = &app.meeting {
             let (elapsed, segments, warning) = session
@@ -1431,6 +1667,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 .map(|l| (l.elapsed, l.segments.clone(), l.warning.clone()))
                 .unwrap_or((0.0, Vec::new(), None));
             let mut stop = false;
+            let mut audio_settings = false;
             theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
                 ui.set_width(w - 36.0);
                 ui.horizontal(|ui| {
@@ -1442,6 +1679,9 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                     });
                 });
                 ui.label(t(&session.source, 13.0, theme::MUTED()));
+                ui.add_space(10.0);
+                if let Ok(live) = session.live.lock() { capture_status(ui, &live); }
+                audio_settings = link(ui, "Audio settings").clicked();
                 if let Some(warn) = &warning {
                     ui.add_space(6.0);
                     status(ui, State::Warn, warn);
@@ -1456,11 +1696,12 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ));
             }
             for seg in segments.iter().rev() {
-                transcript_line(app, ui, seg, w, false);
+                transcript_line(app, ui, seg, w, false, false, false, false, &mut None);
             }
             if stop {
                 app.toggle_meeting();
             }
+            if audio_settings { app.settings_tab = Some(SettingsTab::Audio); }
             return;
         }
 
@@ -1470,24 +1711,51 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 app.open_meeting = None;
                 return;
             };
-            let mut delete = false;
-            ui.horizontal(|ui| {
-                if link(ui, "All meetings").clicked() {
-                    app.open_meeting = None;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    delete = btn(ui, "Delete").clicked();
+            if let Some(error) = &meta.summary_error {
+                theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                    ui.set_width(w - 32.0);
+                    ui.label(b("Summary could not be generated", 16.0, theme::TEXT()));
+                    ui.label(para(error, 13.0, theme::MUTED()));
+                    if app.open_segments.is_empty() {
+                        ui.label(t(if app.open_failed_count > 0 { "Recover the speech below before retrying the summary." } else { "There is no transcript available to summarise." }, 12.5, theme::MUTED()));
+                    } else {
+                        ui.label(t("Your transcript is still saved. Check the text model in Models, then try again.", 12.5, theme::MUTED()));
+                    }
+                    if !app.open_segments.is_empty() && app.summarising.as_deref() != Some(id.as_str()) && btn(ui, "Retry summary").clicked() {
+                        if app.open_summary.as_ref().is_some_and(|s| s.user_edited) { app.pending_data_action = Some(PendingDataAction::RegenerateSummary { id: id.clone() }); }
+                        else { app.start_summary(id.clone()); }
+                    }
                 });
-            });
-            ui.add_space(12.0);
-            ui.label(b(&meta.title, 24.0, theme::TEXT()));
-            if !meta.subtitle.is_empty() {
-                ui.label(t(&meta.subtitle, 14.0, theme::MUTED()));
+                ui.add_space(14.0);
             }
-            let length = meta.ended.map(|e| hhmmss((e - meta.started) as f32)).unwrap_or_else(|| "unfinished".into());
-            ui.label(t(format!("{} · {} · {length}", crate::stats::stamp(meta.started), meta.source), 13.0, theme::MUTED()));
-            ui.add_space(16.0);
 
+            if app.open_failed_count > 0 {
+                theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                    ui.set_width(w - 32.0);
+                    ui.label(b("Some speech needs transcription", 16.0, theme::TEXT()));
+                    let noun = if app.open_failed_count == 1 { "speech clip could" } else { "speech clips could" };
+                    ui.label(para(format!("{} {noun} not be transcribed. The audio stays on this Mac until recovery succeeds or you move it to Trash.", app.open_failed_count), 13.0, theme::MUTED()));
+                    ui.label(para("Retry uses your current speech provider. Review the recovered transcript and update any summary.", 12.5, theme::MUTED()));
+                    let retrying = app.retrying_meeting.as_deref() == Some(id.as_str());
+                    if retrying { ui.label(t("Recovering speech…", 13.0, theme::MUTED())); }
+                    else {
+                        ui.horizontal(|ui| {
+                            if btn(ui, "Retry transcription").clicked() { app.retry_meeting_audio(id.clone()); }
+                            ui.add_enabled_ui(app.summarising.as_deref() != Some(id.as_str()) && app.title_retrying.as_deref() != Some(id.as_str()), |ui| {
+                                if btn(ui, "Discard audio…").clicked() { app.pending_data_action = Some(PendingDataAction::DiscardRecoveryAudio { id: id.clone(), count: app.open_failed_count }); }
+                            });
+                        });
+                    }
+                });
+                ui.add_space(14.0);
+            }
+
+            if meta.discarded_failed_clips > 0 {
+                ui.label(para(format!("{} untranscribed {} moved to Trash. The transcript may be incomplete.", meta.discarded_failed_clips, if meta.discarded_failed_clips == 1 { "clip was" } else { "clips were" }), 12.5, theme::MUTED()));
+                ui.add_space(10.0);
+            }
+
+            if !app.meeting_show_transcript {
             // What it came to, before what was said.
             if app.summarising.as_deref() == Some(id.as_str()) {
                 let step = app.summary_progress.lock().map(|p| p.clone()).unwrap_or_default();
@@ -1498,49 +1766,63 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ui.add_space(14.0);
             } else if let Some(sum) = app.open_summary.clone() {
                 theme::ink_card().inner_margin(Margin::same(18)).show(ui, |ui| {
-                    ui.set_width(w - 36.0);
-                    ui.label(b("Summary", 19.0, theme::TEXT()));
-                    ui.add_space(6.0);
-                    ui.label(para(&sum.overview, 14.0, theme::TEXT()));
-                    // A talk settles nothing and assigns nothing, and saying
-                    // so three times over is not a summary of it. When all
-                    // three headings are empty the key points are the whole
-                    // answer, so they are shown on their own.
-                    let a_discussion = sum.decisions.is_empty() && sum.actions.is_empty() && sum.questions.is_empty();
-                    if !a_discussion {
-                        for (title, items, empty) in [
-                            ("Decided", &sum.decisions, "Nothing was settled."),
-                            ("To do", &sum.actions, "Nobody took anything on."),
-                            ("Still open", &sum.questions, "Nothing was left hanging."),
-                        ] {
-                            ui.add_space(14.0);
-                            ui.label(m(title, 13.0, theme::MUTED()));
-                            ui.add_space(4.0);
-                            if items.is_empty() {
-                                ui.label(t(empty, 13.0, theme::FAINT()));
-                            } else {
-                                let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-                                bullets(ui, &refs, 14.0, theme::TEXT());
-                            }
+                    ui.set_width((w - 36.0).min(700.0));
+                    ui.horizontal(|ui| {
+                        ui.label(b(if app.editing_summary.is_some() { "Edit summary" } else { "Summary" }, 19.0, theme::TEXT()));
+                        if app.editing_summary.is_none() {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let edit = btn(ui, "Edit");
+                                edit.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Edit summary"));
+                                if edit.clicked() { app.editing_summary = Some(sum.clone()); }
+                            });
                         }
+                    });
+                    ui.label(t("Generated suggestions can be wrong. Check the transcript before relying on them.", 12.5, theme::MUTED()));
+                    if let Some(mut draft) = app.editing_summary.take() {
+                        ui.add_space(8.0);
+                        ui.label(m("Overview", 13.0, theme::MUTED()));
+                        ui.add(egui::TextEdit::multiline(&mut draft.overview).desired_width(ui.available_width()).desired_rows(4));
+                        edit_summary_items(ui, "Decisions", &mut draft.decisions);
+                        edit_summary_items(ui, "Actions", &mut draft.actions);
+                        edit_summary_items(ui, "Questions", &mut draft.questions);
+                        edit_summary_items(ui, "Key points", &mut draft.points);
+                        ui.add_space(12.0);
+                        let mut save = false;
+                        let mut cancel = false;
+                        ui.horizontal(|ui| { save = btn(ui, "Save edits").clicked(); cancel = btn(ui, "Cancel").clicked(); });
+                        if save {
+                            for items in [&mut draft.decisions, &mut draft.actions, &mut draft.questions, &mut draft.points] {
+                                items.retain(|s| !s.trim().is_empty());
+                            }
+                            draft.user_edited = true;
+                            match crate::meeting::save_reviewed_summary(&id, &draft) {
+                                Ok(()) => { app.open_summary = Some(draft); app.review_source = None; app.notify("Summary saved", false); }
+                                Err(error) => { app.editing_summary = Some(draft); app.notify(error, true); }
+                            }
+                        } else if !cancel { app.editing_summary = Some(draft); }
+                    } else {
+                        ui.add_space(6.0);
+                        ui.label(para(&sum.overview, 14.0, theme::TEXT()));
+                        ui.label(t("Review the overview against the transcript.", 12.0, theme::FAINT()));
+                            for (title, items, empty) in [
+                                ("Decided", &sum.decisions, "Nothing was settled."),
+                                ("To do", &sum.actions, "Nobody took anything on."),
+                                ("Still open", &sum.questions, "Nothing was left hanging."),
+                            ] { if !items.is_empty() { reviewed_items(ui, app, title, items, empty); } }
+                        if !sum.points.is_empty() { reviewed_items(ui, app, "Key points", &sum.points, ""); }
+                        ui.add_space(12.0);
+                        ui.label(t(if sum.user_edited { format!("Generated by {} · edited", sum.model) } else { format!("Generated by {}", sum.model) }, 12.0, theme::FAINT()));
                     }
-                    if !sum.points.is_empty() {
-                        ui.add_space(14.0);
-                        ui.label(m("Key points", 13.0, theme::MUTED()));
-                        ui.add_space(4.0);
-                        let refs: Vec<&str> = sum.points.iter().map(String::as_str).collect();
-                        bullets(ui, &refs, 14.0, theme::TEXT());
-                    }
-                    ui.add_space(12.0);
-                    ui.label(t(format!("Written by {}", sum.model), 12.0, theme::FAINT()));
                 });
                 ui.add_space(8.0);
                 // A summary written from text that has since been corrected
                 // is quietly wrong, and the person who corrected it is the
                 // one who would never know.
                 ui.horizontal(|ui| {
-                    if btn(ui, "Summarise again").clicked() {
-                        app.start_summary(id.clone());
+                    if app.editing_summary.is_none() && btn(ui, "Summarise again").clicked() {
+                        if sum.user_edited {
+                            app.pending_data_action = Some(PendingDataAction::RegenerateSummary { id: id.clone() });
+                        } else { app.start_summary(id.clone()); }
                     }
                     if crate::meeting::summary_is_stale(&id) {
                         status(ui, State::Warn, "The transcript was corrected after this was written");
@@ -1548,15 +1830,46 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 });
                 ui.add_space(14.0);
             } else if !app.open_segments.is_empty() {
+                ui.label(b("No summary yet", 17.0, theme::TEXT()));
+                ui.label(para("Generate a summary from the transcript.", 13.0, theme::MUTED()));
+                ui.add_space(8.0);
                 if btn(ui, "Summarise").clicked() {
                     app.start_summary(id.clone());
                 }
                 ui.add_space(14.0);
+            } else {
+                ui.label(para("No summary is available for this meeting.", 14.0, theme::MUTED()));
             }
 
+            }
+
+            if app.meeting_show_transcript {
+            if !app.saved_audio.is_empty() {
+                ui.label(t("Select a timestamp to play its saved audio. Use Edit to correct the transcript.", 12.0, theme::MUTED()));
+                ui.add_space(6.0);
+            }
+            let manually_scrolling = ui.ctx().input(|input| {
+                let clip = ui.clip_rect();
+                let wheel = input.smooth_scroll_delta.y != 0.0 && input.pointer.hover_pos().is_some_and(|pos| clip.contains(pos));
+                let drag_scrollbar = input.pointer.primary_down() && input.pointer.hover_pos().is_some_and(|pos| pos.x >= clip.right() - 4.0 && pos.x <= clip.right() + 20.0 && (clip.top()..=clip.bottom()).contains(&pos.y));
+                let key = app.editing_line.is_none() && [egui::Key::PageUp, egui::Key::PageDown, egui::Key::Home, egui::Key::End].into_iter().any(|key| input.key_pressed(key));
+                wheel || drag_scrollbar || key
+            });
+            if manually_scrolling { app.meeting_follow_playback = false; }
+            if !app.meeting_follow_playback && app.audio_player.as_ref().is_some_and(|player| player.playing()) {
+                if link(ui, "Follow playback").clicked() { app.meeting_follow_playback = true; app.meeting_last_playing_segment = None; }
+                ui.add_space(8.0);
+            }
             let segs = app.open_segments.clone();
+            let active = app.audio_player.as_ref().filter(|p| p.ready()).and_then(|player| crate::playback::active_segment(&segs, &player.ranges, player.position_ms()));
+            let follow = app.meeting_follow_playback && active != app.meeting_last_playing_segment && app.editing_line.is_none();
+            app.meeting_last_playing_segment = active;
             if segs.is_empty() {
-                let why = if meta.peak < 0.001 {
+                let why = if app.open_failed_count > 0 {
+                    "The transcript is incomplete because speech could not be transcribed. Retry the saved audio above.".to_string()
+                } else if meta.discarded_failed_clips > 0 {
+                    "Some speech could not be transcribed, and its recovery audio was moved to Trash.".to_string()
+                } else if meta.peak < 0.001 {
                     "Nothing reached the recorder at all. The meeting may have been on a device Open Dictate could not tap.".to_string()
                 } else {
                     format!(
@@ -1569,27 +1882,26 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ui.label(t("Levels for every chunk are in levels.log beside this transcript.", 12.5, theme::FAINT()));
             }
             let mut correction = None;
-            for seg in &segs {
-                if transcript_line(app, ui, seg, w, true) {
+            let mut seek = None;
+            for (index, seg) in segs.iter().enumerate() {
+                let can_edit = app.retrying_meeting.as_deref() != Some(id.as_str());
+                let has_audio = app.saved_audio.iter().any(|clip| clip.at_ms == seg.at_ms);
+                if transcript_line(app, ui, seg, w, can_edit, active == Some(index), has_audio, follow && active == Some(index), &mut seek) {
                     correction = app.editing_line.take();
                 }
             }
+            if let Some(at) = seek { play_meeting_from(app, at); }
             if let Some((at, text)) = correction {
+                let before = app.open_segments.iter().find(|segment| segment.at_ms == at).map(|segment| segment.text.clone()).unwrap_or_default();
                 match crate::meeting::edit_segment(&id, at, text.trim()) {
                     Ok(()) => {
                         app.open_segments = crate::meeting::transcript(&id);
-                        app.notify("Line corrected", false);
+                        let learned = app.learn_transcript_correction(&before, text.trim());
+                        app.notify(if learned > 0 { format!("Line corrected · learned {learned} {} in Dictionary", if learned == 1 { "term" } else { "terms" }) } else { "Line corrected".into() }, false);
                     }
                     Err(e) => app.notify(e, true),
                 }
             }
-            if delete {
-                crate::meeting::delete(&id);
-                app.open_meeting = None;
-                app.open_segments.clear();
-                app.open_meta = None;
-                app.meetings_dirty = true;
-                app.notify("Meeting deleted", false);
             }
             return;
         }
@@ -1604,41 +1916,42 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, w: f32) {
                 ui.set_width(w - 36.0);
                 ui.label(b("No meetings yet", 19.0, theme::TEXT()));
                 ui.add_space(4.0);
-                let key = app.s.meeting_keys.first().cloned().unwrap_or_else(|| "F16".into());
-                ui.label(para(
-                    format!(
-                        "Press {} to start one. Open Dictate records what your Mac is playing along with your microphone, so everyone on the call is in the transcript, and writes it down as the meeting runs.",
-                        pretty_key(&key)
-                    ),
-                    14.0,
-                    theme::MUTED(),
-                ));
+                ui.label(para("Start a meeting from Home. Your meetings and transcripts will appear here.", 14.0, theme::MUTED()));
+                if link(ui, "Go to Home").clicked() { app.page = Page::Home; }
             });
             return;
         }
-        for m in all {
-            let resp = theme::ink_card().inner_margin(Margin::same(16)).show(ui, |ui| {
-                ui.set_width(w - 32.0);
+        let filtered: Vec<_> = all.into_iter().filter(|m| meeting_matches(&m.title, &m.subtitle, &app.meeting_search)).collect();
+        if filtered.is_empty() {
+            ui.label(para("No meetings match your search.", 14.0, theme::MUTED()));
+        }
+        for m in filtered {
+            let working = app.retrying_meeting.as_deref() == Some(m.id.as_str()) || app.title_retrying.as_deref() == Some(m.id.as_str()) || app.summarising.as_deref() == Some(m.id.as_str());
+            let mut delete = false;
+            let row = ui.push_id(&m.id, |ui| ui.allocate_ui_with_layout(vec2(w, 76.0), Layout::top_down(Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(b(&m.title, 17.0, theme::TEXT()));
+                    ui.allocate_ui_with_layout(vec2((w - 165.0).max(100.0), 25.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(b(&m.title, 16.0, theme::TEXT())).truncate());
+                    });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let length = m.ended.map(|e| hhmmss((e - m.started) as f32)).unwrap_or_else(|| "unfinished".into());
+                        delete = meeting_more_actions(ui, &m.title, working);
+                        let length = m.ended.map(|e| hhmmss((e - m.started) as f32)).unwrap_or_else(|| "Unfinished".into());
                         ui.label(t(length, 13.0, theme::MUTED()));
                     });
                 });
-                // The title says what it was about and no longer says when,
-                // so the when goes here - in full, with the year, because
-                // this line is now the only record of it on the page.
-                if !m.subtitle.is_empty() {
-                    ui.label(t(&m.subtitle, 13.0, theme::MUTED()));
-                }
-                ui.label(t(format!("{} · {}", crate::stats::stamp(m.started), m.source), 12.5, theme::FAINT()));
-            });
-            let click = ui.interact(resp.response.rect, ui.id().with(&m.id), Sense::click());
+                if !m.subtitle.is_empty() { ui.add(egui::Label::new(t(&m.subtitle, 13.0, theme::MUTED())).truncate()); }
+                ui.label(t(crate::stats::stamp(m.started), 12.5, theme::FAINT()));
+            })).inner;
+            let mut open_rect = row.response.rect;
+            open_rect.max.x -= 45.0;
+            let click = ui.interact(open_rect, ui.id().with(&m.id), Sense::click());
+            click.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Open meeting: {}", m.title)));
             if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 app.open_meeting(m.id.clone());
             }
-            ui.add_space(10.0);
+            if delete { app.pending_data_action = Some(PendingDataAction::DeleteMeeting { id: m.id, title: m.title }); }
+            ui.separator();
+            ui.add_space(8.0);
         }
         ui.add_space(28.0);
     });
@@ -1658,30 +1971,40 @@ fn transcript_line(
     seg: &crate::meeting::Segment,
     w: f32,
     editable: bool,
+    highlighted: bool,
+    can_seek: bool,
+    follow: bool,
+    seek: &mut Option<u64>,
 ) -> bool {
     let mut saved = false;
-    ui.horizontal_top(|ui| {
+    let mut edit_action = None;
+    let row = egui::Frame::new().fill(if highlighted { theme::HOVER() } else { Color32::TRANSPARENT }).corner_radius(6).inner_margin(Margin::same(6)).show(ui, |ui| { ui.horizontal_top(|ui| {
         ui.add_space(2.0);
-        let gutter = 88.0;
-        let (r, _) = ui.allocate_exact_size(vec2(gutter, 20.0), Sense::hover());
+        let (r, stamp_response) = ui.allocate_exact_size(vec2(60.0, 20.0), if can_seek { Sense::click() } else { Sense::hover() });
+        if can_seek {
+            stamp_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Play from {}", hhmmss(seg.at_ms as f32 / 1000.0))));
+            if stamp_response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Play from this passage").clicked() { *seek = Some(seg.at_ms); }
+        }
         let p = ui.painter();
         p.text(
             pos2(r.left(), r.top()),
             Align2::LEFT_TOP,
             hhmmss(seg.at_ms as f32 / 1000.0),
             FontId::new(12.0, theme::medium()),
-            theme::FAINT(),
+            if can_seek { theme::ACCENT() } else { theme::FAINT() },
         );
         // Who was talking, from which side of the call was louder.
         let (who, colour) = match seg.voice.as_str() {
-            "you" => ("you", theme::GREEN()),
-            "them" => ("them", theme::ACCENT()),
-            "both" => ("both", theme::FAINT()),
+            "you" => ("You", theme::GREEN()),
+            "them" => ("Other voices", theme::ACCENT()),
+            "both" => ("Both", theme::FAINT()),
+            "mixed" => ("Mixed", theme::FAINT()),
             _ => ("", theme::FAINT()),
         };
-        if !who.is_empty() {
-            p.text(pos2(r.left() + 46.0, r.top()), Align2::LEFT_TOP, who, FontId::new(11.5, theme::medium()), colour);
-        }
+        ui.allocate_ui_with_layout(vec2(90.0, 20.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_min_width(90.0);
+            if !who.is_empty() { ui.label(t(who, 11.5, colour)); }
+        });
         let editing = app.editing_line.as_ref().is_some_and(|(at, _)| *at == seg.at_ms);
         if editing {
             ui.vertical(|ui| {
@@ -1709,17 +2032,35 @@ fn transcript_line(
                 }
             });
         } else {
-            let label = egui::Label::new(para(&seg.text, 14.0, theme::TEXT())).wrap();
-            let r = ui.add(if editable { label.sense(Sense::click()) } else { label });
-            if editable
-                && r.on_hover_cursor(egui::CursorIcon::Text)
-                    .on_hover_text("Click to correct this line")
-                    .clicked()
-            {
-                app.editing_line = Some((seg.at_ms, seg.text.clone()));
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - if editable { 55.0 } else { 0.0 }).max(80.0));
+                ui.add(egui::Label::new(para(&seg.text, 14.0, theme::TEXT())).wrap());
+            });
+            if editable {
+                // Keep a stable, focusable target even while the label is
+                // hidden, so keyboard and assistive-technology users can edit.
+                let (_, edit) = ui.allocate_exact_size(vec2(36.0, 24.0), Sense::click());
+                edit.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Edit transcript passage at {}", hhmmss(seg.at_ms as f32 / 1000.0))));
+                edit_action = Some(edit);
             }
         }
-    });
+    }); });
+    if let Some(edit) = edit_action {
+        let hovered_row = ui.input(|input| input.pointer.hover_pos())
+            .is_some_and(|pos| row.response.rect.contains(pos) && ui.clip_rect().contains(pos));
+        if hovered_row || edit.has_focus() {
+            let font = FontId::new(12.5, theme::medium());
+            let g = ui.painter().layout_no_wrap("Edit".to_owned(), font.clone(), theme::TEXT());
+            let origin = edit.rect.left_top();
+            ui.painter().text(origin, Align2::LEFT_TOP, "Edit", font, theme::TEXT());
+            let y = origin.y + g.rect.height() + 1.0;
+            ui.painter().line_segment([pos2(origin.x, y), pos2(origin.x + g.rect.width(), y)], Stroke::new(if edit.hovered() || edit.has_focus() { 3.0 } else { 2.0 }, theme::TEXT()));
+        }
+        if edit.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Correct this transcript passage").clicked() {
+            app.editing_line = Some((seg.at_ms, seg.text.clone()));
+        }
+    }
+    if follow { row.response.scroll_to_me(None); }
     ui.add_space(10.0);
     let _ = w;
     saved

@@ -4,7 +4,7 @@ use crate::{meeting, talking};
 use eframe::egui::{self, FontFamily, FontId, Frame, Label, Margin, Sense, Stroke, text::LayoutJob, text::TextFormat, vec2};
 
 const NO_KEY: &str = "Add a Brave Search key in Models to search";
-const LABELS: [&str; 3] = ["YOU", "THEM", "BOTH"];
+const LABELS: [&str; 4] = ["YOU", "THEM", "BOTH", "MIXED"];
 
 #[derive(Default)]
 pub struct ViewState {
@@ -15,6 +15,8 @@ pub struct ViewState {
     transcribed: usize,
     galley: Option<(GalleyKey, std::sync::Arc<egui::Galley>)>,
     cursor: Option<egui::text_selection::CCursorRange>,
+    segments: Vec<meeting::Segment>,
+    review_source: Option<String>,
 }
 
 type GalleyKey = (usize, bool, f32);
@@ -25,6 +27,7 @@ impl ViewState {
         if count == self.transcribed {
             return false;
         }
+        self.segments = meeting.segments.clone();
         if count < self.transcribed {
             self.transcript.clear();
             self.transcribed = 0;
@@ -222,10 +225,20 @@ fn notes(ui: &mut egui::Ui, talking: &talking::Live, vs: &mut ViewState) -> Opti
         ui.label(para(status, 13.5, theme::MUTED()));
         ui.add_space(6.0);
     }
+    ui.label(para("Generated notes may be wrong. Check the transcript; you can edit the saved summary after the meeting.", 12.0, theme::MUTED()));
+    ui.add_space(8.0);
     heading(ui, "So far");
     let summary = if talking.summary.is_empty() { "Nothing yet." } else { &talking.summary };
     ui.label(para(summary, 13.5, theme::TEXT()));
     ui.add_space(12.0);
+    if !talking.decisions.is_empty() {
+        heading(ui, "Decisions");
+        for decision in &talking.decisions {
+            ui.label(para(decision, 13.5, theme::TEXT()));
+            live_source(ui, decision, vs);
+        }
+        ui.add_space(12.0);
+    }
     heading(ui, "Action points");
     for tracked in &talking.actions {
         ui.horizontal_wrapped(|ui| {
@@ -234,6 +247,7 @@ fn notes(ui: &mut egui::Ui, talking: &talking::Live, vs: &mut ViewState) -> Opti
                 ui.label(b("NEW", 10.0, theme::ACCENT()));
             }
         });
+        live_source(ui, &tracked.action.what, vs);
     }
     ui.add_space(12.0);
     let suggestions = talking.suggestions.as_ref().filter(|s| !s.items.is_empty())?;
@@ -287,6 +301,23 @@ fn notes(ui: &mut egui::Ui, talking: &talking::Live, vs: &mut ViewState) -> Opti
         }
     });
     action
+}
+
+fn live_source(ui: &mut egui::Ui, text: &str, vs: &mut ViewState) {
+    ui.push_id(text, |ui| {
+        let open = vs.review_source.as_deref() == Some(text);
+        if ui.link(if open { "Hide possible source" } else { "Find possible source" }).clicked() {
+            vs.review_source = (!open).then(|| text.to_owned());
+        }
+        if open {
+            if let Some(index) = meeting::possible_source(text, &vs.segments) {
+                let segment = &vs.segments[index];
+                ui.label(para(format!("Possible match · {} · Check the context; this may not support the claim.\n{}", crate::views::hhmmss(segment.at_ms as f32 / 1000.0), segment.text), 12.0, theme::MUTED()));
+            } else {
+                ui.label(t("No close transcript match found.", 12.0, theme::MUTED()));
+            }
+        }
+    });
 }
 
 fn chips(ui: &mut egui::Ui, chips: &[talking::Chip]) -> Option<ViewAction> {
@@ -452,10 +483,14 @@ mod tests {
         assert_eq!(h.get_all_by_label("ASK").count(), 1);
         h.get_by_label("Should it include the annual customers?");
 
+        h.get_by_label("Copy question: Should it include the annual customers?").scroll_to_me();
+        h.run();
         h.get_by_label("Copy question: Should it include the annual customers?").click();
         h.run();
         assert_eq!(h.state().actions, vec![ViewAction::Copy("Should it include the annual customers?".into())]);
 
+        h.get_by_label("Close suggestions").scroll_to_me();
+        h.run();
         h.get_by_label("Close suggestions").click();
         h.run();
         assert!(!h.state().vs.panel_open);
@@ -657,6 +692,30 @@ mod tests {
         h.get_by_label(unreadable);
         h.get_by_label("So far");
         h.get_by_label("Usage-based pricing for Q3; annual-contract migration unresolved.");
+    }
+
+    #[test]
+    fn supported_decisions_are_visible_in_live_notes() {
+        let talking = talking::Live {
+            decisions: vec!["The team agreed to launch the pilot.".into()],
+            ..ready()
+        };
+        let h = harness(talking, ViewState::default());
+        h.get_by_label("Decisions");
+        h.get_by_label("The team agreed to launch the pilot.");
+    }
+
+    #[test]
+    fn live_notes_offer_a_cautious_transcript_match() {
+        let talking = talking::Live {
+            actions: vec![talking::Tracked { action: talking::Action { who: "You".into(), what: "send the cost estimate by Friday".into() }, new: false }],
+            ..ready()
+        };
+        let mut h = harness(talking, ViewState::default());
+        h.get_by_label("Find possible source").click();
+        h.run();
+        h.get_by_label_contains("Possible match");
+        h.get_by_label_contains("this may not support the claim");
     }
 
     #[test]
