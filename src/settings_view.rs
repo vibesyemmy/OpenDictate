@@ -398,7 +398,7 @@ fn row(ui: &mut egui::Ui, title: &str, desc: &str, control_w: f32, control: impl
 
 fn models_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     ui.add_space(12.0);
-    ui.label(para(format!("Speech audio: {}. Text: {}.", crate::privacy::speech_destination(&app.s), crate::privacy::text_destination(&app.s)), 12.5, theme::MUTED()));
+    ui.label(para(format!("Voice to text: {}. Text clean-up and summaries: {}.", crate::privacy::speech_place(&app.s), crate::privacy::text_place(&app.s)), 12.5, theme::MUTED()));
     if crate::views::link(ui, "Privacy & data details").clicked() { app.settings_tab = Some(SettingsTab::Privacy); }
     egui::Frame::new()
         .fill(theme::SURFACE())
