@@ -16,6 +16,7 @@ mod privacy;
 mod macos_look;
 mod search;
 mod setup_guide;
+mod right_option;
 mod settings;
 mod settings_view;
 mod stats;

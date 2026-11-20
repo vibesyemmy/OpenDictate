@@ -181,19 +181,66 @@ pub mod mac {
     use super::{ChordState, Outcome};
     use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
     use core_graphics::event::{CallbackResult, CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType, EventField};
-    use std::{cell::RefCell, rc::Rc, sync::mpsc::Sender};
+    use crate::right_option::{RightOption, Signal};
+    use std::{cell::RefCell, rc::Rc, sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::Sender}, time::Instant};
 
-    struct Inner { state: ChordState, pending: Vec<CGEvent>, tx: Sender<(usize, bool)>, ctx: eframe::egui::Context }
+    /// Right Option shortcuts and what the tap needs to drive them.
+    pub struct RightOptionSetup {
+        pub state: RightOption,
+        pub tx: Sender<Signal>,
+        /// Whether the app is still recording a dictation, so a tap that
+        /// left it running knows if the next press should stop it.
+        pub dictating: Arc<AtomicBool>,
+    }
+
+    /// The device-specific flag macOS sets while the right Option key is down.
+    const RIGHT_OPTION_DOWN: u64 = 0x40;
+
+    struct Inner { state: ChordState, pending: Vec<CGEvent>, tx: Sender<(usize, bool)>, ctx: eframe::egui::Context, ro: Option<RightOptionSetup>, began: Instant }
+    impl Inner {
+        fn send(&self, signals: Vec<Signal>) {
+            let Some(ro) = &self.ro else { return };
+            if signals.is_empty() { return; }
+            for s in signals { let _ = ro.tx.send(s); }
+            self.ctx.request_repaint();
+        }
+    }
     pub struct Listener { tap: Option<CGEventTap<'static>>, source: CFRunLoopSource, inner: Rc<RefCell<Inner>> }
     impl Listener {
-        pub fn new(shortcuts: Vec<(u16,u16,usize)>, tx: Sender<(usize,bool)>, ctx: eframe::egui::Context) -> Result<Self, String> {
-            let inner = Rc::new(RefCell::new(Inner { state: ChordState::new(shortcuts), pending: Vec::new(), tx, ctx }));
+        pub fn new(shortcuts: Vec<(u16,u16,usize)>, tx: Sender<(usize,bool)>, ctx: eframe::egui::Context, ro: Option<RightOptionSetup>) -> Result<Self, String> {
+            let inner = Rc::new(RefCell::new(Inner { state: ChordState::new(shortcuts), pending: Vec::new(), tx, ctx, ro, began: Instant::now() }));
             let listener = inner.clone();
             // The tap is only attached to the current (main) thread's run loop.
             let tap = unsafe { CGEventTap::new_unchecked(CGEventTapLocation::Session, CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default, vec![CGEventType::KeyDown, CGEventType::KeyUp, CGEventType::FlagsChanged, CGEventType::LeftMouseDown, CGEventType::RightMouseDown, CGEventType::OtherMouseDown],
                 move |proxy, kind, event| {
                     let mut inner = listener.borrow_mut();
+                    // Right Option first: its own presses, then anything that
+                    // shows it was being used as a modifier.
+                    if inner.ro.is_some() {
+                        let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                        let signals = match kind {
+                            CGEventType::FlagsChanged if keycode == crate::right_option::KEY => {
+                                let down = event.get_flags().bits() & RIGHT_OPTION_DOWN != 0;
+                                let now = inner.began.elapsed().as_millis() as u64;
+                                let ro = inner.ro.as_mut().unwrap();
+                                let dictating = ro.dictating.load(Ordering::Relaxed);
+                                ro.state.option(down, now, dictating)
+                            }
+                            CGEventType::FlagsChanged | CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+                                inner.ro.as_mut().unwrap().state.other_input()
+                            }
+                            CGEventType::KeyDown | CGEventType::KeyUp => {
+                                let others = CGEventFlags::CGEventFlagShift | CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagCommand;
+                                let other_modifiers = event.get_flags().intersects(others);
+                                let (swallow, signals) = inner.ro.as_mut().unwrap().state.key(keycode, matches!(kind, CGEventType::KeyDown), other_modifiers);
+                                if swallow { inner.send(signals); return CallbackResult::Drop; }
+                                signals
+                            }
+                            _ => Vec::new(),
+                        };
+                        inner.send(signals);
+                    }
                     if matches!(kind, CGEventType::FlagsChanged | CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown) {
                         for saved in inner.pending.drain(..) { saved.post_from_tap(proxy); }
                         inner.state.cancel_pending();
@@ -223,7 +270,7 @@ pub mod mac {
                         Outcome::Release(id) => { let _ = inner.tx.send((id,false)); inner.ctx.request_repaint(); CallbackResult::Drop },
                         Outcome::Suppress => CallbackResult::Drop,
                     }
-                }) }.map_err(|_| "Two-key shortcuts need Accessibility and Input Monitoring permissions.".to_string())?;
+                }) }.map_err(|_| "Right Option and two-key shortcuts need Accessibility and Input Monitoring permissions.".to_string())?;
             let source = tap.mach_port().create_runloop_source(0).map_err(|_| "Could not start the keyboard listener.".to_string())?;
             CFRunLoop::get_current().add_source(&source, unsafe { kCFRunLoopCommonModes });
             tap.enable();

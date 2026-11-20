@@ -913,6 +913,11 @@ fn general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             Trigger::Meeting => {
                 "Press to start recording a meeting, press again to stop. Hold to talk does not apply.".to_string()
             }
+            // Right Option alone does both: hold to talk, or tap to go
+            // hands-free. The press/hold switch above doesn't change it.
+            Trigger::Act(a) if app.s.trigger_keys(trigger).iter().any(|k| k.trim().eq_ignore_ascii_case("RightOption")) => {
+                format!("Hold Right Option and speak, or tap it to start {} and tap again to stop.", a.verb())
+            }
             Trigger::Act(a) => {
                 let mut d = if app.s.hold_to_talk {
                     format!("Hold to keep {}, let go to finish.", a.verb())
@@ -957,6 +962,19 @@ fn general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     }
     for e in app.hotkey_errors.clone() {
         crate::views::status(ui, crate::views::State::Bad, format!("{e}"));
+    }
+    let uses_right_option = Trigger::ALL.iter().any(|t| app.s.trigger_keys(*t).iter().any(|k| crate::right_option::is_right_option(k)));
+    if uses_right_option {
+        ui.add_space(10.0);
+        ui.label(para("On some keyboard layouts, such as Polish or German, Right Option types letters. If you use it that way, choose other shortcuts.", 12.5, theme::MUTED()));
+    }
+    ui.add_space(10.0);
+    let defaults = crate::settings::Settings::default();
+    let at_defaults = Trigger::ALL.iter().all(|t| app.s.trigger_keys(*t) == defaults.trigger_keys(*t));
+    if !at_defaults && crate::views::btn(ui, "Reset to defaults").clicked() {
+        for t in Trigger::ALL { *app.s.trigger_keys_mut(t) = defaults.trigger_keys(t).clone(); }
+        keys_changed = true;
+        app.notify("Shortcuts reset to the defaults.", false);
     }
     if keys_changed {
         app.changed();
@@ -1276,7 +1294,18 @@ fn shortcut_with_modifiers(key: egui::Key, modifiers: egui::Modifiers) -> Option
 pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
     let Some(trigger) = app.capturing_key else { return };
     let mut done: Option<Option<String>> = None;
-    ctx.input(|i| {
+    // Right Option is read from macOS directly: the window's key events
+    // can't tell it from left Option, and report nothing for it on its own.
+    // Pressed and released with nothing else means Right Option alone.
+    let right_held = crate::right_option::held();
+    if right_held && !app.capture_right_option && app.capture_first_key.is_none() {
+        app.capture_right_option = true;
+    } else if !right_held && app.capture_right_option {
+        app.capture_right_option = false;
+        done = Some(Some("RightOption".into()));
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    if done.is_none() { ctx.input(|i| {
         for e in &i.events {
             if let egui::Event::Key { key, physical_key, pressed, repeat, modifiers, .. } = e {
                 if *repeat { continue; }
@@ -1292,7 +1321,14 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
                     }
                     continue;
                 }
+                // Right Option plus one key, with no other modifier.
+                if right_held && modifiers.alt && !modifiers.ctrl && !modifiers.shift && !modifiers.mac_cmd {
+                    app.capture_right_option = false;
+                    done = Some(Some(format!("RightOption+{}", physical.name())));
+                    break;
+                }
                 if let Some(shortcut) = shortcut_with_modifiers(physical, *modifiers) {
+                    app.capture_right_option = false;
                     done = Some(Some(shortcut));
                     break;
                 }
@@ -1306,7 +1342,7 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
                 }
             }
         }
-    });
+    }); }
     egui::Area::new(egui::Id::new("capture")).order(egui::Order::Tooltip).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
         egui::Frame::new()
             .fill(theme::SURFACE())
@@ -1316,24 +1352,27 @@ pub fn capture_shortcut(app: &mut DictateApp, ctx: &egui::Context) {
             .inner_margin(Margin::same(20))
             .show(ui, |ui| {
                 ui.label(b(format!("Press the shortcut for {}", trigger.label()), 16.0, theme::TEXT()));
-                ui.label(para("Hold one or more modifiers, such as Option + Command, and press a key. You can also press two ordinary keys together or one function key. Esc cancels.", 13.0, theme::MUTED()));
+                ui.label(para("Press Right Option on its own, or Right Option and a letter. You can also hold modifiers such as Option + Command and press a key, press two ordinary keys together, or press one function key. Esc cancels.", 13.0, theme::MUTED()));
             });
     });
     if let Some(r) = done {
         app.capturing_key = None;
         app.capture_first_key = None;
+        app.capture_right_option = false;
         if let Some(k) = r {
-            match (crate::chords::parse(&k), k.parse::<global_hotkey::hotkey::HotKey>()) {
-                (Some(_), _) | (_, Ok(_)) => {
+            let readable = crate::views::pretty_key(&k);
+            let usable = crate::right_option::is_right_option(&k) || crate::chords::parse(&k).is_some() || k.parse::<global_hotkey::hotkey::HotKey>().is_ok();
+            match usable {
+                true => {
                     let conflict = Trigger::ALL.iter().flat_map(|t| app.s.trigger_keys(*t)).any(|existing| crate::chords::conflicts(&k, existing));
                     if conflict {
-                        app.notify(format!("{k} conflicts with an existing shortcut."), true);
+                        app.notify(format!("{readable} conflicts with an existing shortcut."), true);
                     } else {
                         app.s.trigger_keys_mut(trigger).push(k);
                         app.changed();
                     }
                 }
-                _ => app.notify(format!("{k} can't be used as a shortcut"), true),
+                false => app.notify(format!("{readable} can't be used as a shortcut"), true),
             }
         }
         app.register_hotkeys();
