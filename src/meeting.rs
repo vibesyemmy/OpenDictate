@@ -307,9 +307,9 @@ pub fn retry_title(s: &Settings, id: &str) -> Result<(), String> {
 
 pub fn delete(id: &str) -> Result<(), String> {
     if !crate::data_safety::valid_meeting_id(id) {
-        return Err("That meeting cannot be moved to Trash.".into());
+        return Err("That meeting cannot be deleted.".into());
     }
-    crate::data_safety::trash(&root().join(id))
+    crate::data_safety::delete_permanently(&root().join(id))
 }
 
 /// Average every `ratio` samples. The tap runs at 48k and whisper wants 16k,
@@ -447,18 +447,20 @@ pub fn retry_failed(id: &str, settings: &Settings) -> Result<usize, String> {
     retry_failed_in(&dir, &|wav| crate::engines::transcribe(settings, wav))
 }
 
-pub fn trash_failed_audio(id: &str) -> Result<(), String> {
+pub fn discard_failed_audio(id: &str) -> Result<(), String> {
     if !crate::data_safety::valid_meeting_id(id) { return Err("Invalid meeting.".into()); }
-    trash_failed_audio_in(&root().join(id), &crate::data_safety::trash)
+    discard_failed_audio_in(&root().join(id))
 }
 
-fn trash_failed_audio_in(dir: &Path, trash: &dyn Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+/// Deletes the meeting's untranscribed audio for good and records how many
+/// clips were discarded, so the transcript can say it is incomplete.
+fn discard_failed_audio_in(dir: &Path) -> Result<(), String> {
     let path = dir.join("meta.json");
     let mut meta: Meta = serde_json::from_slice(&std::fs::read(&path).map_err(|e| format!("Could not read meeting: {e}"))?).map_err(|e| format!("Could not read meeting: {e}"))?;
     let count = failed_clips_in(dir).len();
-    trash(&dir.join("failed_audio"))?;
+    crate::data_safety::delete_permanently(&dir.join("failed_audio"))?;
     meta.discarded_failed_clips += count;
-    atomic_json(&path, &meta).map_err(|e| format!("Audio moved to Trash, but the meeting could not be updated: {e}"))
+    atomic_json(&path, &meta).map_err(|e| format!("Audio deleted, but the meeting could not be updated: {e}"))
 }
 
 pub fn mark_transcript_recovered(id: &str) {
@@ -1710,9 +1712,9 @@ mod tests {
         std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
         let st = crate::cut::Stretch { voice: "mixed", samples: vec![0.2; 32000], secs: 2.0, voiced_secs: 2.0, start_secs: 3.0 };
         assert!(handle_stretch(&dir, 0, &st, 16000.0, &|_| Err("offline".into()), false).is_err());
-        let trash = dir.join("example-trash");
-        trash_failed_audio_in(&dir, &|p| std::fs::rename(p, &trash).map_err(|e| e.to_string())).unwrap();
-        assert!(trash.join(stretch_file(3000)).exists());
+        assert!(dir.join("failed_audio").exists());
+        discard_failed_audio_in(&dir).unwrap();
+        assert!(!dir.join("failed_audio").exists(), "discarded audio is deleted, not kept anywhere");
         let saved: Meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
         assert_eq!(saved.discarded_failed_clips, 1);
         assert!(failed_clips_in(&dir).is_empty());

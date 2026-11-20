@@ -85,28 +85,23 @@ fn data_confirmation_content(ui: &mut egui::Ui, action: &PendingDataAction, coun
     let (title, body, confirm) = match action {
         PendingDataAction::DeleteMeeting { title, .. } => (
             "Delete meeting?",
-            format!("“{title}” and its transcript, notes and saved audio will be removed from Open Dictate. This can’t be undone in the app."),
+            format!("“{title}” and its transcript, notes and saved audio will be permanently deleted. This can’t be undone."),
             "Delete meeting",
         ),
         PendingDataAction::DeleteHistoryEntry { .. } => (
-            "Remove history entry?",
-            format!("{count} matching {} will be removed. A backup of the text and any saved audio will be placed in macOS Trash. You can restore the most recent backup from History until Trash is emptied.", if count == 1 { "entry" } else { "entries" }),
-            "Remove",
+            "Delete history entry?",
+            format!("{count} matching {} and any saved audio will be permanently deleted. This can’t be undone.", if count == 1 { "entry" } else { "entries" }),
+            "Delete",
         ),
         PendingDataAction::ClearHistory => (
             "Clear all history?",
-            format!("This removes {count} {} from History. A backup of the text and any saved audio will be placed in macOS Trash. You can restore the most recent backup from History until Trash is emptied.", if count == 1 { "entry" } else { "entries" }),
+            format!("This permanently deletes {count} {} and any saved audio from History. This can’t be undone.", if count == 1 { "entry" } else { "entries" }),
             "Clear history",
         ),
         PendingDataAction::ChangeRetention(keep) => (
             "Change history retention?",
-            format!("Changing to {} removes {count} existing {} now and applies to future entries. Backups of removed text and saved audio go to macOS Trash. You can restore the most recent backup from History until Trash is emptied.", keep.label(), if count == 1 { "entry" } else { "entries" }),
+            format!("Changing to {} permanently deletes {count} existing {} now and applies to future entries. This can’t be undone.", keep.label(), if count == 1 { "entry" } else { "entries" }),
             "Change retention",
-        ),
-        PendingDataAction::RestoreHistory => (
-            "Restore history backup?",
-            "The most recent backup in Trash will be merged with your current history. History retention will be set to Forever so restored entries are kept. The backup will remain in Trash.".into(),
-            "Restore history",
         ),
         PendingDataAction::RegenerateSummary { .. } => (
             "Replace your edited summary?",
@@ -115,8 +110,8 @@ fn data_confirmation_content(ui: &mut egui::Ui, action: &PendingDataAction, coun
         ),
         PendingDataAction::DiscardRecoveryAudio { count, .. } => (
             "Discard recovery audio?",
-            format!("Move {count} untranscribed {} to Trash? Those portions will remain missing from the transcript. The audio stays in Trash until it is emptied.", if *count == 1 { "clip" } else { "clips" }),
-            "Move to Trash",
+            format!("Permanently delete {count} untranscribed {}? Those portions will stay missing from the transcript. This can’t be undone.", if *count == 1 { "clip" } else { "clips" }),
+            "Delete audio",
         ),
     };
     ui.set_max_width(440.0);
@@ -144,7 +139,6 @@ fn confirm_data_action(app: &mut DictateApp, ctx: &egui::Context) {
         PendingDataAction::DeleteHistoryEntry { when } => app.history.iter().filter(|e| e.when == *when).count(),
         PendingDataAction::ClearHistory => app.history.len(),
         PendingDataAction::ChangeRetention(keep) => crate::data_safety::expired_count(&app.history, *keep, crate::settings::now_secs()),
-        PendingDataAction::RestoreHistory => 0,
         PendingDataAction::RegenerateSummary { .. } => 0,
         PendingDataAction::DiscardRecoveryAudio { count, .. } => *count,
     };
@@ -173,20 +167,19 @@ fn confirm_data_action(app: &mut DictateApp, ctx: &egui::Context) {
                 Err(e) => Err(e),
             }
         }
-        PendingDataAction::DeleteHistoryEntry { when } => app.delete_entry(when).map(|_| "History removed; backup is in Trash."),
-        PendingDataAction::ClearHistory => app.clear_history().map(|_| "History cleared; backup is in Trash."),
+        PendingDataAction::DeleteHistoryEntry { when } => app.delete_entry(when).map(|_| "History entry deleted."),
+        PendingDataAction::ClearHistory => app.clear_history().map(|_| "History cleared."),
         PendingDataAction::ChangeRetention(keep) => app.set_keep_history(keep).map(|_| "History retention updated."),
-        PendingDataAction::RestoreHistory => app.restore_history().map(|_| "History restored. Retention is set to Forever."),
         PendingDataAction::RegenerateSummary { id } => { app.start_summary(id); return; }
         PendingDataAction::DiscardRecoveryAudio { id, .. } => {
-            let result = crate::meeting::trash_failed_audio(&id);
+            let result = crate::meeting::discard_failed_audio(&id);
             app.refresh_meetings();
             if app.open_meeting.as_deref() == Some(id.as_str()) {
                 app.open_failed_count = crate::meeting::failed_clip_count(&id);
                 app.open_meta = app.meeting_list.iter().find(|m| m.id == id).cloned();
             }
             match result {
-                Ok(()) => Ok("Recovery audio moved to Trash."),
+                Ok(()) => Ok("Recovery audio deleted."),
                 Err(e) => Err(e),
             }
         }
@@ -296,7 +289,7 @@ mod data_confirmation_tests {
                 }
             }, None::<ConfirmChoice>);
         h.get_by_label("Change history retention?");
-        h.get_by_label_contains("removes 3 existing entries now");
+        h.get_by_label_contains("permanently deletes 3 existing entries now");
         h.get_by_label("CANCEL").click();
         h.run();
         assert!(h.state() == &Some(ConfirmChoice::Cancel));
@@ -311,19 +304,37 @@ mod data_confirmation_tests {
             });
         h.get_by_label("Delete meeting?");
         h.get_by_label_contains("Project review");
-        h.get_by_label_contains("can’t be undone in the app");
+        h.get_by_label_contains("permanently deleted. This can’t be undone.");
         h.get_by_label("DELETE MEETING");
     }
 
     #[test]
-    fn recovery_audio_discard_confirmation_explains_missing_speech_and_trash() {
+    fn recovery_audio_discard_confirmation_explains_missing_speech_and_permanence() {
         let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
             .with_context_setup(theme::install)
             .build_ui(|ui| { data_confirmation_content(ui, &PendingDataAction::DiscardRecoveryAudio { id: "meeting".into(), count: 2 }, 2); });
         h.get_by_label("Discard recovery audio?");
-        h.get_by_label_contains("portions will remain missing");
-        h.get_by_label_contains("stays in Trash");
-        h.get_by_label("CANCEL");
+        h.get_by_label_contains("portions will stay missing");
+        h.get_by_label_contains("can’t be undone");
+        h.get_by_label("DELETE AUDIO");
+    }
+
+    #[test]
+    fn history_dialogs_say_deletion_is_permanent_and_never_mention_trash() {
+        let actions = [
+            (PendingDataAction::DeleteHistoryEntry { when: 1 }, 1),
+            (PendingDataAction::ClearHistory, 2),
+            (PendingDataAction::ChangeRetention(crate::settings::KeepHistory::Day1), 3),
+        ];
+        for (action, count) in actions {
+            let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
+                .with_context_setup(theme::install)
+                .build_ui(|ui| { data_confirmation_content(ui, &action, count); });
+            h.get_by_label_contains("permanently delete");
+            h.get_by_label_contains("can’t be undone");
+            assert!(h.query_by_label_contains("Trash").is_none());
+            assert!(h.query_by_label_contains("restore").is_none());
+        }
     }
 
     #[test]
@@ -335,19 +346,10 @@ mod data_confirmation_tests {
                     *choice = Some(result);
                 }
             }, None::<ConfirmChoice>);
-        h.get_by_label_contains("removes 2 entries from History");
+        h.get_by_label_contains("permanently deletes 2 entries");
         h.get_by_label("CLEAR HISTORY").click();
         h.run();
         assert!(h.state() == &Some(ConfirmChoice::Confirm));
-    }
-
-    #[test]
-    fn restore_dialog_explains_retention_change() {
-        let h = egui_kittest::Harness::builder().with_size(vec2(600.0, 300.0))
-            .with_context_setup(theme::install)
-            .build_ui(|ui| { data_confirmation_content(ui, &PendingDataAction::RestoreHistory, 0); });
-        h.get_by_label_contains("retention will be set to Forever");
-        h.get_by_label("RESTORE HISTORY");
     }
 }
 
@@ -1139,10 +1141,6 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
                     ui.ctx().copy_text(all);
                     ui.close();
                 }
-                if crate::data_safety::latest_backup().is_some() && ui.button("Restore last history backup").clicked() {
-                    app.pending_data_action = Some(PendingDataAction::RestoreHistory);
-                    ui.close();
-                }
                 if ui.button(t("Clear all history", 14.0, theme::RED())).clicked() {
                     if !app.history.is_empty() { app.pending_data_action = Some(PendingDataAction::ClearHistory); }
                     ui.close();
@@ -1187,17 +1185,6 @@ fn history(app: &mut DictateApp, ui: &mut egui::Ui) {
         ));
     });
     ui.add_space(14.0);
-    if crate::data_safety::latest_backup().is_some() {
-        ui.horizontal(|ui| {
-            ui.label(t("A history backup is in Trash.", 13.0, theme::MUTED()));
-            let restore = btn(ui, "Restore last backup");
-            restore.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Restore last backup"));
-            if restore.clicked() {
-                app.pending_data_action = Some(PendingDataAction::RestoreHistory);
-            }
-        });
-        ui.add_space(14.0);
-    }
     pill_tabs(
         ui,
         &mut app.hist_filter,
@@ -1734,7 +1721,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, _w: f32) {
                     ui.set_width(w - 32.0);
                     ui.label(b("Some speech needs transcription", 16.0, theme::TEXT()));
                     let noun = if app.open_failed_count == 1 { "speech clip could" } else { "speech clips could" };
-                    ui.label(para(format!("{} {noun} not be transcribed. The audio stays on this Mac until recovery succeeds or you move it to Trash.", app.open_failed_count), 13.0, theme::MUTED()));
+                    ui.label(para(format!("{} {noun} not be transcribed. The audio stays on this Mac until recovery succeeds or you delete it.", app.open_failed_count), 13.0, theme::MUTED()));
                     ui.label(para("Retry uses your current speech provider. Review the recovered transcript and update any summary.", 12.5, theme::MUTED()));
                     let retrying = app.retrying_meeting.as_deref() == Some(id.as_str());
                     if retrying { ui.label(t("Recovering speech…", 13.0, theme::MUTED())); }
@@ -1751,7 +1738,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, _w: f32) {
             }
 
             if meta.discarded_failed_clips > 0 {
-                ui.label(para(format!("{} untranscribed {} moved to Trash. The transcript may be incomplete.", meta.discarded_failed_clips, if meta.discarded_failed_clips == 1 { "clip was" } else { "clips were" }), 12.5, theme::MUTED()));
+                ui.label(para(format!("{} untranscribed {} deleted. The transcript may be incomplete.", meta.discarded_failed_clips, if meta.discarded_failed_clips == 1 { "clip was" } else { "clips were" }), 12.5, theme::MUTED()));
                 ui.add_space(10.0);
             }
 
@@ -1868,7 +1855,7 @@ fn meetings(app: &mut DictateApp, ui: &mut egui::Ui, _w: f32) {
                 let why = if app.open_failed_count > 0 {
                     "The transcript is incomplete because speech could not be transcribed. Retry the saved audio above.".to_string()
                 } else if meta.discarded_failed_clips > 0 {
-                    "Some speech could not be transcribed, and its recovery audio was moved to Trash.".to_string()
+                    "Some speech could not be transcribed, and its recovery audio was deleted.".to_string()
                 } else if meta.peak < 0.001 {
                     "Nothing reached the recorder at all. The meeting may have been on a device Open Dictate could not tap.".to_string()
                 } else {

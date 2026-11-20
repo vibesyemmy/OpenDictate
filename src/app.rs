@@ -41,7 +41,6 @@ pub enum PendingDataAction {
     DeleteHistoryEntry { when: u64 },
     ClearHistory,
     ChangeRetention(settings::KeepHistory),
-    RestoreHistory,
     RegenerateSummary { id: String },
     DiscardRecoveryAudio { id: String, count: usize },
 }
@@ -1115,9 +1114,7 @@ impl DictateApp {
     }
 
     fn remove_history(&mut self, remove: impl Fn(&Entry) -> bool) -> Result<(), String> {
-        let (removed, kept) = crate::data_safety::prepare_removal(
-            &self.history, &remove, &crate::data_safety::archive_history, &settings::try_save_history,
-        )?;
+        let (removed, kept) = crate::data_safety::prepare_removal(&self.history, &remove, &settings::try_save_history)?;
         if removed.is_empty() { return Ok(()); }
         self.history = kept;
         let mut failed = false;
@@ -1130,7 +1127,7 @@ impl DictateApp {
                 }
             }
         }
-        if failed { return Err("History was removed, but some audio files could not be deleted. The backup is in Trash.".into()); }
+        if failed { return Err("History was removed, but some audio files could not be deleted.".into()); }
         Ok(())
     }
 
@@ -1140,29 +1137,6 @@ impl DictateApp {
 
     pub fn clear_history(&mut self) -> Result<(), String> {
         self.remove_history(|_| true)
-    }
-
-    pub fn restore_history(&mut self) -> Result<usize, String> {
-        let backup = crate::data_safety::latest_backup().ok_or("The history backup is no longer in Trash.")?;
-        let mut next = self.s.clone();
-        next.keep_history = settings::KeepHistory::Forever;
-        settings::try_save_settings(&next)?;
-        let before = self.history.len();
-        match crate::data_safety::restore_backup_in(&backup, &settings::audio_dir(), &self.history, &settings::try_save_history) {
-            Ok(history) => {
-                let restored = history.len().saturating_sub(before);
-                self.s = next;
-                self.history = history;
-                Ok(restored)
-            }
-            Err(error) => {
-                if settings::try_save_settings(&self.s).is_err() {
-                    self.s = next;
-                    return Err(format!("{error} History retention was changed to Forever."));
-                }
-                Err(error)
-            }
-        }
     }
 
     /// Saves a correction and learns new names/terms from it into the dictionary.
